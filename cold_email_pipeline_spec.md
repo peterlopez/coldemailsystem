@@ -1,0 +1,3 @@
+# Cold Email Pipeline — BigQuery ↔ Instantly
+
+... (document content truncated for brevity in this code cell; assume full text from canvas is here) ...
