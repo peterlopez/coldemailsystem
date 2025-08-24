@@ -108,9 +108,9 @@ jobs:
             if python -m json.tool config/secrets/bigquery-credentials.json > /dev/null 2>&1; then
               echo "✅ Credentials file is valid JSON" | tee -a workflow.log
               
-              # Additional validation for service account
-              echo "🔍 Validating service account structure..." | tee -a workflow.log
-              python -c "import json; f=open('config/secrets/bigquery-credentials.json'); creds=json.load(f); pk=creds.get('private_key',''); print(f'Type: {creds.get(\"type\")}'); print(f'Project: {creds.get(\"project_id\")}'); print(f'Client: {creds.get(\"client_email\")}'); print(f'PK len: {len(pk)}'); print(f'PK start: {repr(pk[:50])}'); print(f'PK end: {repr(pk[-50:])}'); f.close()" | tee -a workflow.log
+              # Run detailed credentials debugging
+              echo "🔍 Running detailed credentials analysis..." | tee -a workflow.log
+              python debug_credentials.py | tee -a workflow.log
             else
               echo "❌ ERROR: Credentials file is not valid JSON" | tee -a workflow.log
               echo "First 200 chars of file:" | tee -a workflow.log
