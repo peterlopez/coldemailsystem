@@ -13,7 +13,7 @@ on:
       dry_run:
         description: 'Run in dry mode (no actual changes)'
         required: false
-        default: 'false'
+        default: 'true'
         type: choice
         options:
           - 'true'
@@ -21,9 +21,7 @@ on:
       target_leads:
         description: 'Number of new leads to process'
         required: false
-        default: '100'
-  push:  # Temporary: trigger on push for testing
-    branches: [ main ]
+        default: '10'
 
 permissions:
   contents: read
