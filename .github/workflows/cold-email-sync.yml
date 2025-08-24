@@ -67,45 +67,51 @@ jobs:
       - name: Create credentials file
         env:
           BIGQUERY_CREDS: ${{ secrets.BIGQUERY_CREDENTIALS_JSON }}
+          INSTANTLY_KEY: ${{ secrets.INSTANTLY_API_KEY }}
         run: |
-          # Create directory structure
+          echo "📁 Creating directory structure..." | tee -a workflow.log
           mkdir -p config/secrets
           
           # Debug: Check if secrets are available (without exposing them)
-          echo "🔍 Checking secrets availability..."
-          if [ -n "${BIGQUERY_CREDS}" ]; then
-            echo "✅ BIGQUERY_CREDENTIALS_JSON secret is available (${#BIGQUERY_CREDS} chars)"
-          else
-            echo "❌ ERROR: BIGQUERY_CREDENTIALS_JSON secret not set"
+          echo "🔍 Checking secrets availability..." | tee -a workflow.log
+          
+          # Check BigQuery credentials
+          if [ -z "${BIGQUERY_CREDS}" ]; then
+            echo "❌ ERROR: BIGQUERY_CREDENTIALS_JSON secret not set" | tee -a workflow.log
             exit 1
+          else
+            echo "✅ BIGQUERY_CREDENTIALS_JSON secret is available (${#BIGQUERY_CREDS} chars)" | tee -a workflow.log
           fi
           
-          if [ -n "${{ secrets.INSTANTLY_API_KEY }}" ]; then
-            echo "✅ INSTANTLY_API_KEY secret is available" 
-          else
-            echo "❌ ERROR: INSTANTLY_API_KEY secret not set"
+          # Check Instantly API key
+          if [ -z "${INSTANTLY_KEY}" ]; then
+            echo "❌ ERROR: INSTANTLY_API_KEY secret not set" | tee -a workflow.log
             exit 1
+          else
+            echo "✅ INSTANTLY_API_KEY secret is available" | tee -a workflow.log
           fi
           
           # Create credentials file using environment variable
-          echo "📝 Creating credentials file..."
+          echo "📝 Creating credentials file..." | tee -a workflow.log
           echo "${BIGQUERY_CREDS}" > config/secrets/bigquery-credentials.json
           chmod 600 config/secrets/bigquery-credentials.json
           
           # Verify file was created
           if [ -f "config/secrets/bigquery-credentials.json" ]; then
             file_size=$(stat -c%s "config/secrets/bigquery-credentials.json" 2>/dev/null || stat -f%z "config/secrets/bigquery-credentials.json" 2>/dev/null || echo "unknown")
-            echo "✅ Credentials file created successfully ($file_size bytes)"
+            echo "✅ Credentials file created successfully ($file_size bytes)" | tee -a workflow.log
             
             # Validate JSON format
             if python -m json.tool config/secrets/bigquery-credentials.json > /dev/null 2>&1; then
-              echo "✅ Credentials file is valid JSON"
+              echo "✅ Credentials file is valid JSON" | tee -a workflow.log
             else
-              echo "❌ ERROR: Credentials file is not valid JSON"
+              echo "❌ ERROR: Credentials file is not valid JSON" | tee -a workflow.log
+              echo "First 100 chars of file:" | tee -a workflow.log
+              head -c 100 config/secrets/bigquery-credentials.json | tee -a workflow.log
               exit 1
             fi
           else
-            echo "❌ ERROR: Failed to create credentials file"
+            echo "❌ ERROR: Failed to create credentials file" | tee -a workflow.log
             exit 1
           fi
       
