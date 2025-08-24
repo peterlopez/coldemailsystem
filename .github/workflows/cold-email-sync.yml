@@ -22,10 +22,6 @@ on:
         description: 'Number of new leads to process'
         required: false
         default: '100'
-  push:  # Trigger on push to make workflow visible
-    branches: [ main ]
-    paths:
-      - '.github/workflows/cold-email-sync.yml'
 
 permissions:
   contents: read
@@ -106,6 +102,13 @@ jobs:
           echo "Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
           echo ""
           
+          # Ensure we have the API key
+          if [ -z "$INSTANTLY_API_KEY" ]; then
+            echo "❌ INSTANTLY_API_KEY not available in environment"
+            exit 1
+          fi
+          
+          echo "✅ Environment variables validated"
           python sync_once.py
       
       - name: Cleanup credentials
