@@ -161,3 +161,87 @@ CREATE TABLE pipeline_errors (
 - Advanced analytics dashboard
 - Multi-campaign support
 - A/B testing integration
+
+## Development Best Practices - Using Serena MCP
+
+### Objective
+Prefer Serena's symbolic tools (via MCP) for finding/editing code. Avoid reading entire files or regex/grep when a symbol-aware action exists. Keep context small, do edits safely, and verify with tests.
+
+### Golden Rules
+
+#### Always use Serena tools first
+- `get_symbols_overview` → quick map of classes/functions in a file
+- `find_symbol` → locate definitions by (partial) name
+- `find_referencing_symbols` → find callsites/usages
+- `insert_after_symbol`, `insert_before_symbol`, `replace_symbol_body` → edit precisely
+- Do NOT read whole files unless needed. Ask for `get_symbols_overview` first, then read only targeted snippets
+
+#### Stay project-aware
+- If tools aren't responding, activate the project and (if first time) onboard
+- Use the repo's venv interpreter for Python (so the LSP is alive)
+
+#### Be frugal with tokens
+- Don't dump large file bodies; prefer symbol lists and small diffs
+- Summarize when you must review multiple files
+
+#### Validate changes
+- After edits, run tests/lint via shell commands
+- Always run `black .` and `flake8 .` before committing
+
+### Tooling Cheatsheet (MCP)
+
+#### Activation & Onboarding (first time per repo)
+- "Check if onboarding was performed; if not, perform it."
+
+#### Discover & Navigate
+- "Give me a symbols overview of path/to/file.py."
+- "Find symbols containing EmailSender (any kind)."
+- "Find all references to send_message."
+- "List files matching *email* under src/ (don't read bodies)."
+
+#### Edit Safely
+- "Insert the following after the definition of EmailSender: …code…"
+- "Replace the full body of function build_payload with: …code…"
+- "Insert before the definition of main a new import block: …code…"
+
+#### Verify
+- "Run tests with pytest -q and show the summary."
+- "Show me the diff for files you changed."
+
+### Policy & Style for Edits
+- **Symbol-first editing**: Prefer `replace_symbol_body` / `insert_*_symbol` over line-based edits
+- **Small, reversible steps**: Make one logically complete change, then verify
+- **No blind refactors**: When renaming/moving symbols, gather references first
+- **Respect excludes**: Don't traverse node_modules, .git, build dirs, or .serena/cache
+
+### When Things Break
+- **Tools missing?**: "Activate the project at <ABSOLUTE_PATH>."
+- **LSP can't find Python?**: Use Python at `/Users/peterlopez/Documents/Cold Email System/venv/bin/python` for the LSP
+- **Too much context?**: "Summarize changes so far." → then continue in a fresh turn
+
+### Examples
+
+#### Add a parameter to a function and update callsites
+1. `find_symbol "EmailSender"`
+2. `find_symbol "send"` (limit to class EmailSender)
+3. `replace_symbol_body "EmailSender.send"` with updated signature & logic
+4. `find_referencing_symbols "EmailSender.send"` and show exact callsites to adjust
+5. Provide targeted patches for each callsite (no full-file reads)
+6. Run tests
+
+#### Safely inject logging before main
+1. `find_symbol "main"`
+2. `insert_before_symbol "main"` with:
+   ```python
+   import logging
+   logging.basicConfig(level=logging.INFO)
+   ```
+3. Provide a snippet of the exact surrounding code to verify placement
+
+### Do/Don't Quicklist
+- ✅ Do: `get_symbols_overview` → `find_symbol` → precise edit
+- ✅ Do: confirm placement with a 5–20 line context excerpt (not the whole file)
+- ✅ Do: summarize reasoning & next steps after each change
+- ❌ Don't: open large files in full
+- ❌ Don't: use grep-like scans when a symbol tool exists
+- ❌ Don't: perform multi-file edits without listing affected symbols/callsites first

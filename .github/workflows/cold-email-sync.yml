@@ -1,0 +1,88 @@
+name: Cold Email Sync
+
+on:
+  schedule:
+    # Run every 30 minutes during business hours (9 AM - 6 PM EST, Mon-Fri)
+    - cron: '*/30 13-23 * * 1-5'  # UTC times for EST business hours
+    # Also run every 2 hours on weekends (lighter schedule)  
+    - cron: '0 */2 * * 0,6'
+  workflow_dispatch:  # Allow manual triggers
+    inputs:
+      dry_run:
+        description: 'Run in dry mode (no actual changes)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      target_leads:
+        description: 'Number of new leads to process'
+        required: false
+        default: '100'
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install google-cloud-bigquery requests tenacity
+      
+      - name: Create credentials file
+        run: |
+          echo '${{ secrets.BIGQUERY_CREDENTIALS_JSON }}' > config/secrets/bigquery-credentials.json
+          chmod 600 config/secrets/bigquery-credentials.json
+      
+      - name: Run sync
+        env:
+          # Required secrets
+          INSTANTLY_API_KEY: ${{ secrets.INSTANTLY_API_KEY }}
+          
+          # Configuration
+          TARGET_NEW_LEADS_PER_RUN: ${{ github.event.inputs.target_leads || '100' }}
+          INSTANTLY_CAP_GUARD: '24000'
+          BATCH_SIZE: '50'  # Conservative for startup
+          BATCH_SLEEP_SECONDS: '10'
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          
+          # Python path
+          PYTHONPATH: .
+        
+        run: |
+          echo "🚀 Starting Cold Email Sync"
+          echo "Target leads: $TARGET_NEW_LEADS_PER_RUN"
+          echo "Dry run: $DRY_RUN"
+          echo "Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          echo ""
+          
+          python sync_once.py
+      
+      - name: Cleanup credentials
+        if: always()
+        run: |
+          rm -f config/secrets/bigquery-credentials.json
+      
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-logs-${{ github.run_number }}
+          path: |
+            *.log
+          retention-days: 7

@@ -1,0 +1,44 @@
+# Serena project configuration for Cold Email System
+
+project_name: "Cold Email System"
+
+# Primary language of the project
+language: python
+
+# Use .gitignore to automatically exclude files
+ignore_all_files_in_gitignore: true
+
+# Additional paths/patterns to ignore
+ignored_paths:
+  - "**/__pycache__"
+  - "**/.venv"
+  - "**/.env"
+  - "**/.git"
+  - "**/dist"
+  - "**/build"
+  - "**/node_modules"
+
+# Allow editing by default (set to true to make read-only)
+read_only: false
+
+# List of tools to exclude (leave empty for full functionality)
+excluded_tools: []
+
+# Optional initial prompt (can stay empty, memories handle most project-specific context)
+initial_prompt: ""
+
+# Language server configuration
+languages:
+  python:
+    lsp: pyright
+    # Adjust pythonPath if `which python3` on your system points elsewhere
+    pythonPath: /opt/homebrew/bin/python3
+    initialization_options:
+      exclude:
+        - "**/__pycache__"
+        - "**/.venv"
+        - "**/.env"
+        - "**/.git"
+        - "**/dist"
+        - "**/build"
+        - "**/node_modules"
