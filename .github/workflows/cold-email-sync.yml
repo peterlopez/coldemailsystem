@@ -105,6 +105,19 @@ jobs:
             # Validate JSON format
             if python -m json.tool config/secrets/bigquery-credentials.json > /dev/null 2>&1; then
               echo "✅ Credentials file is valid JSON" | tee -a workflow.log
+              
+              # Additional validation for service account
+              echo "🔍 Validating service account structure..." | tee -a workflow.log
+              python -c "
+import json
+with open('config/secrets/bigquery-credentials.json', 'r') as f:
+    creds = json.load(f)
+    print(f'  Type: {creds.get(\"type\", \"missing\")}')
+    print(f'  Project ID: {creds.get(\"project_id\", \"missing\")}')
+    print(f'  Client email: {creds.get(\"client_email\", \"missing\")}')
+    print(f'  Private key length: {len(creds.get(\"private_key\", \"\"))} chars')
+    print(f'  Private key starts with: {creds.get(\"private_key\", \"\")[:50]}...')
+              " | tee -a workflow.log
             else
               echo "❌ ERROR: Credentials file is not valid JSON" | tee -a workflow.log
               echo "First 200 chars of file:" | tee -a workflow.log
