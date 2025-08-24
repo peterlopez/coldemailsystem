@@ -93,7 +93,8 @@ jobs:
           
           # Create credentials file using environment variable
           echo "📝 Creating credentials file..." | tee -a workflow.log
-          echo "${BIGQUERY_CREDS}" > config/secrets/bigquery-credentials.json
+          # Use printf to properly handle escaped characters in JSON
+          printf '%s' "${BIGQUERY_CREDS}" > config/secrets/bigquery-credentials.json
           chmod 600 config/secrets/bigquery-credentials.json
           
           # Verify file was created
@@ -106,8 +107,11 @@ jobs:
               echo "✅ Credentials file is valid JSON" | tee -a workflow.log
             else
               echo "❌ ERROR: Credentials file is not valid JSON" | tee -a workflow.log
-              echo "First 100 chars of file:" | tee -a workflow.log
-              head -c 100 config/secrets/bigquery-credentials.json | tee -a workflow.log
+              echo "First 200 chars of file:" | tee -a workflow.log
+              head -c 200 config/secrets/bigquery-credentials.json | tee -a workflow.log
+              echo "" | tee -a workflow.log
+              echo "JSON validation error:" | tee -a workflow.log
+              python -m json.tool config/secrets/bigquery-credentials.json 2>&1 | tee -a workflow.log
               exit 1
             fi
           else
