@@ -460,7 +460,7 @@ def create_lead_in_instantly(lead: Lead, campaign_id: str) -> Optional[str]:
             'first_name': '',  # Not available in our data
             'last_name': '',   # Not available in our data
             'company_name': lead.merchant_name,
-            'campaign_id': campaign_id,  # Specify which campaign to add to
+            'campaign': campaign_id,  # Correct parameter for campaign assignment
             'custom_variables': {
                 'company': lead.merchant_name,
                 'domain': lead.platform_domain,
