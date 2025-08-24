@@ -52,9 +52,38 @@ jobs:
       
       - name: Create credentials file
         run: |
+          # Create directory structure
+          mkdir -p config/secrets
+          
+          # Check if secrets exist
+          if [ -z "${{ secrets.BIGQUERY_CREDENTIALS_JSON }}" ]; then
+            echo "❌ ERROR: BIGQUERY_CREDENTIALS_JSON secret not set"
+            exit 1
+          fi
+          
+          if [ -z "${{ secrets.INSTANTLY_API_KEY }}" ]; then
+            echo "❌ ERROR: INSTANTLY_API_KEY secret not set" 
+            exit 1
+          fi
+          
+          # Create credentials file
           echo '${{ secrets.BIGQUERY_CREDENTIALS_JSON }}' > config/secrets/bigquery-credentials.json
           chmod 600 config/secrets/bigquery-credentials.json
+          
+          echo "✅ Credentials file created successfully"
       
+      - name: Debug environment
+        run: |
+          echo "🔍 Environment Debug:"
+          echo "Working directory: $(pwd)"
+          echo "Directory contents:"
+          ls -la
+          echo "Config directory:"
+          ls -la config/ || echo "config/ not found"
+          echo "Python version: $(python --version)"
+          echo "Installed packages:"
+          pip list | grep -E "(google|requests|tenacity)" || echo "Required packages not found"
+          
       - name: Run sync
         env:
           # Required secrets
