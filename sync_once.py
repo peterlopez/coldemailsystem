@@ -52,6 +52,9 @@ DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
 SMB_CAMPAIGN_ID = '8c46e0c9-c1f9-4201-a8d6-6221bafeada6'
 MIDSIZE_CAMPAIGN_ID = '5ffbe8c3-dc0e-41e4-9999-48f00d2015df'
 
+# Mailbox capacity management
+LEAD_INVENTORY_MULTIPLIER = float(os.getenv('LEAD_INVENTORY_MULTIPLIER', '3.5'))  # Conservative start
+
 # Instantly API configuration
 INSTANTLY_API_KEY = os.getenv('INSTANTLY_API_KEY')
 logger.info(f"Environment INSTANTLY_API_KEY present: {bool(INSTANTLY_API_KEY)}")
@@ -302,6 +305,38 @@ def drain_finished_leads() -> int:
     logger.info(f"Drained {len(finished_leads)} finished leads")
     return len(finished_leads)
 
+def get_mailbox_capacity() -> Tuple[int, int]:
+    """Get current mailbox capacity from Instantly API."""
+    try:
+        # Get mailbox information from Instantly
+        response = call_instantly_api('/api/v1/account/emails', method='GET')
+        
+        if DRY_RUN:
+            # For dry run, simulate 68 mailboxes at 10 emails/day each
+            logger.info("DRY RUN: Simulating 68 mailboxes at 10 emails/day capacity")
+            return 68, 680
+        
+        if not response or 'emails' not in response:
+            logger.warning("Could not get mailbox data from API, using fallback estimate")
+            # Fallback: assume 68 mailboxes at 10 emails/day (early warmup)
+            return 68, 680
+        
+        mailboxes = response['emails']
+        total_mailboxes = len(mailboxes)
+        
+        # Calculate total daily capacity
+        # Each mailbox: assume 10 emails/day initially (warmup), scaling to 30
+        # For now, use conservative estimate of 10 emails/day per mailbox
+        daily_capacity = total_mailboxes * 10  # Will enhance this to read actual limits
+        
+        logger.info(f"Mailbox capacity: {total_mailboxes} mailboxes, {daily_capacity} emails/day")
+        return total_mailboxes, daily_capacity
+        
+    except Exception as e:
+        logger.error(f"Failed to get mailbox capacity: {e}")
+        logger.info("Using fallback capacity estimate")
+        return 68, 680  # Fallback estimate
+
 def get_current_instantly_inventory() -> int:
     """Get current lead count in Instantly (both campaigns)."""
     try:
@@ -315,6 +350,42 @@ def get_current_instantly_inventory() -> int:
     except Exception as e:
         logger.error(f"Failed to get inventory: {e}")
         return 0
+
+def calculate_smart_lead_target() -> int:
+    """Calculate optimal number of leads to add based on mailbox capacity."""
+    try:
+        # Get mailbox capacity
+        mailbox_count, daily_capacity = get_mailbox_capacity()
+        
+        # Calculate safe total inventory limit
+        safe_inventory_limit = int(daily_capacity * LEAD_INVENTORY_MULTIPLIER)
+        
+        # Get current inventory
+        current_inventory = get_current_instantly_inventory()
+        
+        # Calculate available capacity
+        available_capacity = safe_inventory_limit - current_inventory
+        
+        # Don't exceed the configured target per run
+        target_leads = min(available_capacity, TARGET_NEW_LEADS_PER_RUN)
+        
+        # Never go negative
+        target_leads = max(0, target_leads)
+        
+        logger.info(f"Capacity calculation:")
+        logger.info(f"  - Mailboxes: {mailbox_count}")
+        logger.info(f"  - Daily capacity: {daily_capacity} emails")
+        logger.info(f"  - Safe inventory limit: {safe_inventory_limit} leads (multiplier: {LEAD_INVENTORY_MULTIPLIER})")
+        logger.info(f"  - Current inventory: {current_inventory} leads")
+        logger.info(f"  - Available capacity: {available_capacity} leads")
+        logger.info(f"  - Target for this run: {target_leads} leads")
+        
+        return target_leads
+        
+    except Exception as e:
+        logger.error(f"Failed to calculate smart lead target: {e}")
+        # Fallback to original logic
+        return min(TARGET_NEW_LEADS_PER_RUN, 50)  # Conservative fallback
 
 def get_eligible_leads(limit: int) -> List[Lead]:
     """Get leads ready for Instantly from BigQuery."""
@@ -485,17 +556,26 @@ def process_lead_batch(leads: List[Lead], campaign_id: str) -> int:
     return successful_count
 
 def top_up_campaigns() -> Tuple[int, int]:
-    """Add new eligible leads to campaigns."""
+    """Add new eligible leads to campaigns using smart capacity management."""
     logger.info("=== TOPPING UP CAMPAIGNS ===")
     
-    # Check inventory guard
-    current_inventory = get_current_instantly_inventory()
-    if current_inventory >= INSTANTLY_CAP_GUARD:
-        logger.warning(f"Inventory at {current_inventory}, skipping top-up (guard: {INSTANTLY_CAP_GUARD})")
+    # Calculate smart lead target based on mailbox capacity
+    target_leads = calculate_smart_lead_target()
+    
+    if target_leads == 0:
+        logger.info("Smart capacity management: No leads to add this run")
         return 0, 0
     
-    # Get eligible leads
-    leads = get_eligible_leads(TARGET_NEW_LEADS_PER_RUN)
+    # Check legacy inventory guard as backup safety
+    current_inventory = get_current_instantly_inventory()
+    if current_inventory >= INSTANTLY_CAP_GUARD:
+        logger.warning(f"Legacy safety guard triggered: Inventory at {current_inventory}, skipping top-up (guard: {INSTANTLY_CAP_GUARD})")
+        return 0, 0
+    
+    # Get eligible leads using smart target
+    logger.info(f"Smart targeting: requesting {target_leads} leads for this run")
+    leads = get_eligible_leads(target_leads)
+    
     if not leads:
         logger.info("No eligible leads found")
         return 0, 0
@@ -519,21 +599,37 @@ def housekeeping() -> Dict:
     try:
         # Get current counts
         inventory = get_current_instantly_inventory()
+        mailbox_count, daily_capacity = get_mailbox_capacity()
+        safe_inventory_limit = int(daily_capacity * LEAD_INVENTORY_MULTIPLIER)
         
         # Get eligible count
         query = f"SELECT COUNT(*) as count FROM `{PROJECT_ID}.{DATASET_ID}.v_ready_for_instantly`"
         result = bq_client.query(query).result()
         eligible_count = next(result).count
         
+        # Calculate utilization metrics
+        capacity_utilization = (inventory / safe_inventory_limit * 100) if safe_inventory_limit > 0 else 0
+        
         metrics = {
             'timestamp': datetime.now().isoformat(),
             'instantly_inventory': inventory,
             'eligible_leads': eligible_count,
+            'mailbox_count': mailbox_count,
+            'daily_email_capacity': daily_capacity,
+            'safe_inventory_limit': safe_inventory_limit,
+            'capacity_utilization_pct': round(capacity_utilization, 1),
+            'lead_multiplier': LEAD_INVENTORY_MULTIPLIER,
             'cap_guard': INSTANTLY_CAP_GUARD,
             'dry_run': DRY_RUN
         }
         
-        logger.info(f"Summary - Inventory: {inventory:,}, Eligible: {eligible_count:,}, Cap: {INSTANTLY_CAP_GUARD:,}")
+        logger.info(f"Summary:")
+        logger.info(f"  - Current inventory: {inventory:,} leads")
+        logger.info(f"  - Eligible leads: {eligible_count:,}")  
+        logger.info(f"  - Mailboxes: {mailbox_count} ({daily_capacity} emails/day)")
+        logger.info(f"  - Safe capacity: {safe_inventory_limit:,} leads (utilization: {capacity_utilization:.1f}%)")
+        logger.info(f"  - Legacy cap guard: {INSTANTLY_CAP_GUARD:,}")
+        
         return metrics
     
     except Exception as e:
@@ -543,7 +639,7 @@ def housekeeping() -> Dict:
 def main():
     """Main synchronization function."""
     logger.info("🚀 STARTING COLD EMAIL SYNC")
-    logger.info(f"Config - Target: {TARGET_NEW_LEADS_PER_RUN}, Cap: {INSTANTLY_CAP_GUARD}, Dry Run: {DRY_RUN}")
+    logger.info(f"Config - Target: {TARGET_NEW_LEADS_PER_RUN}, Cap: {INSTANTLY_CAP_GUARD}, Multiplier: {LEAD_INVENTORY_MULTIPLIER}, Dry Run: {DRY_RUN}")
     
     try:
         # Step 1: Drain finished leads first
