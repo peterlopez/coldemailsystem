@@ -37,6 +37,16 @@ MIDSIZE_CAMPAIGN_ID = '5ffbe8c3-dc0e-41e4-9999-48f00d2015df'
 
 # Instantly API configuration
 INSTANTLY_API_KEY = os.getenv('INSTANTLY_API_KEY')
+if not INSTANTLY_API_KEY:
+    # Fallback to config file if environment variable not set
+    try:
+        from config.config import Config
+        config = Config()
+        INSTANTLY_API_KEY = config.instantly_api_key
+        logger.info("Loaded INSTANTLY_API_KEY from config file")
+    except Exception as e:
+        logger.error(f"Failed to load API key from config: {e}")
+
 INSTANTLY_BASE_URL = 'https://api.instantly.ai'
 
 # BigQuery client
@@ -97,8 +107,8 @@ def log_dead_letter(phase: str, email: Optional[str], payload: str, status_code:
     try:
         query = f"""
         INSERT INTO `{PROJECT_ID}.{DATASET_ID}.ops_dead_letters`
-        (id, occurred_at, phase, email, payload, http_status, error_text, retry_count)
-        VALUES (@id, CURRENT_TIMESTAMP(), @phase, @email, PARSE_JSON(@payload), @status, @error, 1)
+        (id, occurred_at, phase, email, http_status, error_text, retry_count)
+        VALUES (@id, CURRENT_TIMESTAMP(), @phase, @email, @status, @error, 1)
         """
         
         job_config = bigquery.QueryJobConfig(
@@ -106,9 +116,8 @@ def log_dead_letter(phase: str, email: Optional[str], payload: str, status_code:
                 bigquery.ScalarQueryParameter("id", "STRING", str(uuid.uuid4())),
                 bigquery.ScalarQueryParameter("phase", "STRING", phase),
                 bigquery.ScalarQueryParameter("email", "STRING", email),
-                bigquery.ScalarQueryParameter("payload", "STRING", payload),
                 bigquery.ScalarQueryParameter("status", "INT64", status_code),
-                bigquery.ScalarQueryParameter("error", "STRING", error_text),
+                bigquery.ScalarQueryParameter("error", "STRING", f"{error_text[:500]} | Payload: {payload[:500]}"),
             ]
         )
         
@@ -120,26 +129,11 @@ def log_dead_letter(phase: str, email: Optional[str], payload: str, status_code:
 def get_finished_leads() -> List[InstantlyLead]:
     """Get leads with terminal status from Instantly."""
     try:
-        # Get leads from both campaigns with terminal statuses
-        all_leads = []
-        
-        for campaign_id in [SMB_CAMPAIGN_ID, MIDSIZE_CAMPAIGN_ID]:
-            response = call_instantly_api(f'/api/v2/campaigns/{campaign_id}/leads')
-            # Handle both direct array and {"items": [...]} format
-            leads_data = response.get('items', response) if isinstance(response, dict) else response
-            if isinstance(leads_data, list):
-                for lead_data in leads_data:
-                    status = lead_data.get('status', '').lower()
-                    if status in ['completed', 'unsubscribed', 'bounced']:
-                        all_leads.append(InstantlyLead(
-                            id=lead_data['id'],
-                            email=lead_data['email'],
-                            campaign_id=campaign_id,
-                            status=status
-                        ))
-        
-        logger.info(f"Found {len(all_leads)} finished leads to drain")
-        return all_leads
+        # For now, return empty list since we need to implement lead status tracking differently
+        # The API doesn't have a direct "get leads by campaign" endpoint
+        # We'll track status through our own BigQuery tables
+        logger.info("Skipping drain - will be implemented with lead status tracking")
+        return []
     
     except Exception as e:
         logger.error(f"Failed to get finished leads: {e}")
@@ -266,16 +260,12 @@ def drain_finished_leads() -> int:
 def get_current_instantly_inventory() -> int:
     """Get current lead count in Instantly (both campaigns)."""
     try:
-        total = 0
-        for campaign_id in [SMB_CAMPAIGN_ID, MIDSIZE_CAMPAIGN_ID]:
-            response = call_instantly_api(f'/api/v2/campaigns/{campaign_id}/analytics')
-            # Check for total_leads in response or in nested structure
-            if 'total_leads' in response:
-                total += response['total_leads']
-            elif isinstance(response, dict) and 'data' in response:
-                total += response['data'].get('total_leads', 0)
+        # For now, use our BigQuery tracking instead of Instantly API
+        query = f"SELECT COUNT(*) as count FROM `{PROJECT_ID}.{DATASET_ID}.ops_inst_state` WHERE status = 'active'"
+        result = bq_client.query(query).result()
+        total = next(result).count
         
-        logger.info(f"Current Instantly inventory: {total}")
+        logger.info(f"Current Instantly inventory (tracked): {total}")
         return total
     except Exception as e:
         logger.error(f"Failed to get inventory: {e}")
@@ -334,7 +324,8 @@ def create_lead_in_instantly(lead: Lead, campaign_id: str) -> Optional[str]:
             'first_name': '',  # Not available in our data
             'last_name': '',   # Not available in our data
             'company_name': lead.merchant_name,
-            'personalization': {
+            'campaign_id': campaign_id,  # Specify which campaign to add to
+            'custom_variables': {
                 'company': lead.merchant_name,
                 'domain': lead.platform_domain,
                 'location': lead.state,
@@ -342,13 +333,16 @@ def create_lead_in_instantly(lead: Lead, campaign_id: str) -> Optional[str]:
             }
         }
         
-        response = call_instantly_api(f'/api/v2/campaigns/{campaign_id}/leads', method='POST', data=data)
+        # Use the correct V2 endpoint
+        response = call_instantly_api('/api/v2/leads', method='POST', data=data)
         
         if DRY_RUN:
             return 'dry-run-id'
         
-        if response.get('success'):
-            return response.get('lead_id')
+        # Check for success in the response
+        if response.get('id'):  # V2 API returns the lead ID directly
+            logger.info(f"✅ Created lead {lead.email} with ID {response['id']}")
+            return response['id']
         else:
             logger.error(f"Failed to create lead {lead.email}: {response}")
             return None
@@ -360,7 +354,6 @@ def create_lead_in_instantly(lead: Lead, campaign_id: str) -> Optional[str]:
             return move_lead_to_campaign(lead, campaign_id)
         else:
             logger.error(f"Failed to create lead {lead.email}: {e}")
-            log_dead_letter('create_lead', lead.email, json.dumps(data), 0, str(e))
             return None
 
 def move_lead_to_campaign(lead: Lead, campaign_id: str) -> Optional[str]:
