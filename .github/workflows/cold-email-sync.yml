@@ -81,10 +81,36 @@ jobs:
             exit 1
           fi
       
+      - name: Debug Python environment
+        run: |
+          echo "🐍 Python version:"
+          python --version
+          echo ""
+          echo "📦 Installed packages:"
+          pip list
+          echo ""
+          echo "📁 Current directory contents:"
+          ls -la
+          echo ""
+          echo "📂 Config directory:"
+          ls -la config/secrets/ || echo "config/secrets not found"
+          
       - name: Validate environment
         run: |
           echo "🔍 Validating GitHub Actions environment..."
-          python validate_environment.py
+          python validate_environment.py || {
+            echo "❌ Environment validation failed with exit code $?"
+            exit 1
+          }
+          
+      - name: Test imports
+        run: |
+          echo "🧪 Testing Python imports..."
+          python -c "import os; print('✅ os module OK')"
+          python -c "import logging; print('✅ logging module OK')"
+          python -c "from google.cloud import bigquery; print('✅ google.cloud.bigquery OK')" || echo "❌ Failed to import bigquery"
+          python -c "import requests; print('✅ requests OK')" || echo "❌ Failed to import requests"
+          python -c "import tenacity; print('✅ tenacity OK')" || echo "❌ Failed to import tenacity"
           
       - name: Run sync
         env:
@@ -115,7 +141,22 @@ jobs:
           fi
           
           echo "✅ Environment variables validated"
-          python sync_once.py
+          
+          # Run the sync script
+          python sync_once.py || {
+            exit_code=$?
+            echo "❌ sync_once.py failed with exit code $exit_code"
+            
+            # If sync fails, try debug script
+            echo "🔍 Running debug script..."
+            python debug_sync.py || echo "Debug script also failed"
+            
+            # List any log files created
+            echo "📄 Log files in directory:"
+            ls -la *.log || echo "No .log files found"
+            
+            exit $exit_code
+          }
       
       - name: Cleanup credentials
         if: always()
