@@ -215,6 +215,15 @@ jobs:
             exit $exit_code
           }
       
+      - name: Send logs to external service
+        if: always()
+        env:
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          TARGET_NEW_LEADS_PER_RUN: ${{ github.event.inputs.target_leads || '100' }}
+        run: |
+          echo "📤 Sending logs for remote analysis..."
+          python send_logs.py || echo "⚠️ Log transmission failed, continuing..."
+          
       - name: Cleanup credentials
         if: always()
         run: |
