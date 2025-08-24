@@ -34,6 +34,13 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        
+      - name: Create initial log file
+        run: |
+          echo "GitHub Actions workflow started at $(date)" > workflow.log
+          echo "Runner: ${{ runner.os }}" >> workflow.log
+          echo "GitHub ref: ${{ github.ref }}" >> workflow.log
+          ls -la >> workflow.log 2>&1
       
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -43,25 +50,31 @@ jobs:
       
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
+          echo "📦 Installing dependencies..." | tee -a workflow.log
+          pip install --upgrade pip 2>&1 | tee -a workflow.log
+          
           # Install from requirements.txt to ensure all dependencies are included
           if [ -f requirements.txt ]; then
-            echo "📦 Installing from requirements.txt..."
-            pip install -r requirements.txt
+            echo "📦 Installing from requirements.txt..." | tee -a workflow.log
+            pip install -r requirements.txt 2>&1 | tee -a workflow.log
           else
-            echo "⚠️ requirements.txt not found, installing minimal dependencies..."
-            pip install google-cloud-bigquery requests tenacity
+            echo "⚠️ requirements.txt not found, installing minimal dependencies..." | tee -a workflow.log
+            pip install google-cloud-bigquery requests tenacity 2>&1 | tee -a workflow.log
           fi
+          
+          echo "✅ Dependencies installed" | tee -a workflow.log
       
       - name: Create credentials file
+        env:
+          BIGQUERY_CREDS: ${{ secrets.BIGQUERY_CREDENTIALS_JSON }}
         run: |
           # Create directory structure
           mkdir -p config/secrets
           
           # Debug: Check if secrets are available (without exposing them)
           echo "🔍 Checking secrets availability..."
-          if [ -n "${{ secrets.BIGQUERY_CREDENTIALS_JSON }}" ]; then
-            echo "✅ BIGQUERY_CREDENTIALS_JSON secret is available"
+          if [ -n "${BIGQUERY_CREDS}" ]; then
+            echo "✅ BIGQUERY_CREDENTIALS_JSON secret is available (${#BIGQUERY_CREDS} chars)"
           else
             echo "❌ ERROR: BIGQUERY_CREDENTIALS_JSON secret not set"
             exit 1
@@ -74,15 +87,23 @@ jobs:
             exit 1
           fi
           
-          # Create credentials file
+          # Create credentials file using environment variable
           echo "📝 Creating credentials file..."
-          echo '${{ secrets.BIGQUERY_CREDENTIALS_JSON }}' > config/secrets/bigquery-credentials.json
+          echo "${BIGQUERY_CREDS}" > config/secrets/bigquery-credentials.json
           chmod 600 config/secrets/bigquery-credentials.json
           
           # Verify file was created
           if [ -f "config/secrets/bigquery-credentials.json" ]; then
             file_size=$(stat -c%s "config/secrets/bigquery-credentials.json" 2>/dev/null || stat -f%z "config/secrets/bigquery-credentials.json" 2>/dev/null || echo "unknown")
             echo "✅ Credentials file created successfully ($file_size bytes)"
+            
+            # Validate JSON format
+            if python -m json.tool config/secrets/bigquery-credentials.json > /dev/null 2>&1; then
+              echo "✅ Credentials file is valid JSON"
+            else
+              echo "❌ ERROR: Credentials file is not valid JSON"
+              exit 1
+            fi
           else
             echo "❌ ERROR: Failed to create credentials file"
             exit 1
@@ -145,32 +166,33 @@ jobs:
           PYTHONPATH: .
         
         run: |
-          echo "🚀 Starting Cold Email Sync"
-          echo "Target leads: $TARGET_NEW_LEADS_PER_RUN"
-          echo "Dry run: $DRY_RUN"
-          echo "Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
-          echo ""
+          echo "🚀 Starting Cold Email Sync" | tee -a workflow.log
+          echo "Target leads: $TARGET_NEW_LEADS_PER_RUN" | tee -a workflow.log
+          echo "Dry run: $DRY_RUN" | tee -a workflow.log
+          echo "Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" | tee -a workflow.log
+          echo "" | tee -a workflow.log
           
           # Ensure we have the API key
           if [ -z "$INSTANTLY_API_KEY" ]; then
-            echo "❌ INSTANTLY_API_KEY not available in environment"
+            echo "❌ INSTANTLY_API_KEY not available in environment" | tee -a workflow.log
             exit 1
           fi
           
-          echo "✅ Environment variables validated"
+          echo "✅ Environment variables validated" | tee -a workflow.log
           
-          # Run the sync script
-          python sync_once.py || {
+          # Run the sync script with full output capture
+          echo "📝 Running sync_once.py..." | tee -a workflow.log
+          python sync_once.py 2>&1 | tee -a workflow.log || {
             exit_code=$?
-            echo "❌ sync_once.py failed with exit code $exit_code"
+            echo "❌ sync_once.py failed with exit code $exit_code" | tee -a workflow.log
             
             # If sync fails, try debug script
-            echo "🔍 Running debug script..."
-            python debug_sync.py || echo "Debug script also failed"
+            echo "🔍 Running debug script..." | tee -a workflow.log
+            python debug_sync.py 2>&1 | tee -a workflow.log || echo "Debug script also failed" | tee -a workflow.log
             
             # List any log files created
-            echo "📄 Log files in directory:"
-            ls -la *.log || echo "No .log files found"
+            echo "📄 Log files in directory:" | tee -a workflow.log
+            ls -la *.log 2>&1 | tee -a workflow.log || echo "No .log files found" | tee -a workflow.log
             
             exit $exit_code
           }
@@ -189,5 +211,6 @@ jobs:
             *.log
             cold-email-sync.log
             test.log
+            workflow.log
           if-no-files-found: warn
           retention-days: 7
