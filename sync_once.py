@@ -125,8 +125,10 @@ def get_finished_leads() -> List[InstantlyLead]:
         
         for campaign_id in [SMB_CAMPAIGN_ID, MIDSIZE_CAMPAIGN_ID]:
             response = call_instantly_api(f'/api/v2/campaigns/{campaign_id}/leads')
-            if 'leads' in response:
-                for lead_data in response['leads']:
+            # Handle both direct array and {"items": [...]} format
+            leads_data = response.get('items', response) if isinstance(response, dict) else response
+            if isinstance(leads_data, list):
+                for lead_data in leads_data:
                     status = lead_data.get('status', '').lower()
                     if status in ['completed', 'unsubscribed', 'bounced']:
                         all_leads.append(InstantlyLead(
@@ -267,8 +269,11 @@ def get_current_instantly_inventory() -> int:
         total = 0
         for campaign_id in [SMB_CAMPAIGN_ID, MIDSIZE_CAMPAIGN_ID]:
             response = call_instantly_api(f'/api/v2/campaigns/{campaign_id}/analytics')
+            # Check for total_leads in response or in nested structure
             if 'total_leads' in response:
                 total += response['total_leads']
+            elif isinstance(response, dict) and 'data' in response:
+                total += response['data'].get('total_leads', 0)
         
         logger.info(f"Current Instantly inventory: {total}")
         return total
