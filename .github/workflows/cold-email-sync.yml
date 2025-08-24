@@ -112,11 +112,16 @@ jobs:
 import json
 with open('config/secrets/bigquery-credentials.json', 'r') as f:
     creds = json.load(f)
+    private_key = creds.get('private_key', '')
     print(f'  Type: {creds.get(\"type\", \"missing\")}')
     print(f'  Project ID: {creds.get(\"project_id\", \"missing\")}')
     print(f'  Client email: {creds.get(\"client_email\", \"missing\")}')
-    print(f'  Private key length: {len(creds.get(\"private_key\", \"\"))} chars')
-    print(f'  Private key starts with: {creds.get(\"private_key\", \"\")[:50]}...')
+    print(f'  Private key length: {len(private_key)} chars')
+    print(f'  Private key starts with: {repr(private_key[:50])}')
+    print(f'  Private key ends with: {repr(private_key[-50:])}')
+    print(f'  Contains newlines: {chr(10) in private_key}')
+    print(f'  Starts with BEGIN: {private_key.startswith(\"-----BEGIN\")}')
+    print(f'  Ends with END: {private_key.endswith(\"-----\\n\")}')
               " | tee -a workflow.log
             else
               echo "❌ ERROR: Credentials file is not valid JSON" | tee -a workflow.log
