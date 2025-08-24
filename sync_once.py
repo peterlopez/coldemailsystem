@@ -19,7 +19,23 @@ from google.cloud import bigquery
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+log_format = '%(asctime)s - %(levelname)s - %(message)s'
+
+# Configure logging to both console and file
+log_handlers = [logging.StreamHandler()]
+
+# Add file handler if we're in GitHub Actions or if log file is requested
+if os.environ.get('GITHUB_ACTIONS') or os.environ.get('LOG_TO_FILE'):
+    log_file = 'cold-email-sync.log'
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(logging.Formatter(log_format))
+    log_handlers.append(file_handler)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format=log_format,
+    handlers=log_handlers
+)
 logger = logging.getLogger(__name__)
 
 # Configuration from environment
@@ -37,8 +53,11 @@ MIDSIZE_CAMPAIGN_ID = '5ffbe8c3-dc0e-41e4-9999-48f00d2015df'
 
 # Instantly API configuration
 INSTANTLY_API_KEY = os.getenv('INSTANTLY_API_KEY')
+logger.info(f"Environment INSTANTLY_API_KEY present: {bool(INSTANTLY_API_KEY)}")
+
 if not INSTANTLY_API_KEY:
     # Fallback to config file if environment variable not set (local development)
+    logger.info("INSTANTLY_API_KEY not found in environment, attempting to load from config file")
     try:
         from config.config import Config
         config = Config()
@@ -47,6 +66,7 @@ if not INSTANTLY_API_KEY:
     except Exception as e:
         logger.error(f"Failed to load API key from config: {e}")
         logger.error("INSTANTLY_API_KEY must be set as environment variable or in config file")
+        raise RuntimeError("INSTANTLY_API_KEY not configured")
 
 # Validate API key is available
 if not INSTANTLY_API_KEY:
@@ -57,8 +77,22 @@ if not INSTANTLY_API_KEY:
 INSTANTLY_BASE_URL = 'https://api.instantly.ai'
 
 # BigQuery client
-os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = './config/secrets/bigquery-credentials.json'
-bq_client = bigquery.Client(project=PROJECT_ID)
+try:
+    logger.info("Initializing BigQuery client...")
+    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = './config/secrets/bigquery-credentials.json'
+    
+    # Check if credentials file exists
+    creds_path = os.environ['GOOGLE_APPLICATION_CREDENTIALS']
+    if not os.path.exists(creds_path):
+        logger.error(f"BigQuery credentials file not found at: {creds_path}")
+        raise FileNotFoundError(f"Credentials file not found: {creds_path}")
+    
+    logger.info(f"Using credentials file: {creds_path}")
+    bq_client = bigquery.Client(project=PROJECT_ID)
+    logger.info("✅ BigQuery client initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize BigQuery client: {e}")
+    raise
 
 @dataclass
 class Lead:
@@ -523,7 +557,27 @@ def main():
         
     except Exception as e:
         logger.error(f"❌ SYNC FAILED: {e}")
+        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Error details: {str(e)}")
+        
+        # Log stack trace
+        import traceback
+        logger.error("Stack trace:")
+        logger.error(traceback.format_exc())
+        
+        # Ensure logs are flushed
+        for handler in logger.handlers:
+            handler.flush()
+        
+        # Exit with error code
         raise
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        # Exit with error code 1
+        import sys
+        sys.exit(1)
