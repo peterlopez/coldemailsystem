@@ -134,6 +134,8 @@ jobs:
           ls -la config/secrets/ || echo "config/secrets not found"
           
       - name: Validate environment
+        env:
+          INSTANTLY_API_KEY: ${{ secrets.INSTANTLY_API_KEY }}
         run: |
           echo "🔍 Validating GitHub Actions environment..."
           python validate_environment.py || {
@@ -151,6 +153,8 @@ jobs:
           python -c "import tenacity; print('✅ tenacity OK')" || echo "❌ Failed to import tenacity"
           
       - name: Run minimal test
+        env:
+          INSTANTLY_API_KEY: ${{ secrets.INSTANTLY_API_KEY }}
         run: |
           echo "🧪 Running minimal test..."
           python test_minimal.py || {
