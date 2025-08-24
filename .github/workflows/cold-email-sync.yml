@@ -68,17 +68,10 @@ jobs:
           
           echo "✅ Credentials file created successfully"
       
-      - name: Debug environment
+      - name: Validate environment
         run: |
-          echo "🔍 Environment Debug:"
-          echo "Working directory: $(pwd)"
-          echo "Directory contents:"
-          ls -la
-          echo "Config directory:"
-          ls -la config/ || echo "config/ not found"
-          echo "Python version: $(python --version)"
-          echo "Installed packages:"
-          pip list | grep -E "(google|requests|tenacity)" || echo "Required packages not found"
+          echo "🔍 Validating GitHub Actions environment..."
+          python validate_environment.py
           
       - name: Run sync
         env:

@@ -38,7 +38,7 @@ MIDSIZE_CAMPAIGN_ID = '5ffbe8c3-dc0e-41e4-9999-48f00d2015df'
 # Instantly API configuration
 INSTANTLY_API_KEY = os.getenv('INSTANTLY_API_KEY')
 if not INSTANTLY_API_KEY:
-    # Fallback to config file if environment variable not set
+    # Fallback to config file if environment variable not set (local development)
     try:
         from config.config import Config
         config = Config()
@@ -46,6 +46,13 @@ if not INSTANTLY_API_KEY:
         logger.info("Loaded INSTANTLY_API_KEY from config file")
     except Exception as e:
         logger.error(f"Failed to load API key from config: {e}")
+        logger.error("INSTANTLY_API_KEY must be set as environment variable or in config file")
+
+# Validate API key is available
+if not INSTANTLY_API_KEY:
+    logger.error("❌ INSTANTLY_API_KEY is not configured!")
+    logger.error("Set INSTANTLY_API_KEY environment variable or configure config/secrets/instantly-config.json")
+    exit(1)
 
 INSTANTLY_BASE_URL = 'https://api.instantly.ai'
 
