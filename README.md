@@ -1,4 +1,4 @@
-# Cold Email Pipeline
+# Cold Email System
 
 Automated pipeline for syncing leads between BigQuery and Instantly.ai for cold email campaigns.
 
@@ -6,8 +6,8 @@ Automated pipeline for syncing leads between BigQuery and Instantly.ai for cold 
 
 ### 1. Clone the repository
 ```bash
-git clone [your-repo-url]
-cd "Cold Email System"
+git clone https://github.com/peterlopez/coldemailsystem.git
+cd coldemailsystem
 ```
 
 ### 2. Set up credentials
