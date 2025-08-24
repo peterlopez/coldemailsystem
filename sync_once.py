@@ -110,6 +110,7 @@ class Lead:
     country_code: str
     estimated_sales_yearly: Optional[int]
     sequence_target: str
+    klaviyo_installed_at: Optional[str]
 
 @dataclass
 class InstantlyLead:
@@ -388,14 +389,22 @@ def calculate_smart_lead_target() -> int:
         return min(TARGET_NEW_LEADS_PER_RUN, 50)  # Conservative fallback
 
 def get_eligible_leads(limit: int) -> List[Lead]:
-    """Get leads ready for Instantly from BigQuery."""
+    """Get leads ready for Instantly from BigQuery, prioritized by Klaviyo install date."""
     try:
         query = f"""
         SELECT email, merchant_name, platform_domain, state, country_code, 
-               estimated_sales_yearly, sequence_target
+               estimated_sales_yearly, sequence_target, klaviyo_installed_at,
+               -- Add priority tiers for analysis
+               CASE 
+                 WHEN DATE(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', klaviyo_installed_at)) >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY) THEN 'HOT'
+                 WHEN DATE(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', klaviyo_installed_at)) >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY) THEN 'WARM' 
+                 ELSE 'COLD'
+               END as klaviyo_priority
         FROM `{PROJECT_ID}.{DATASET_ID}.v_ready_for_instantly`
         WHERE email IS NOT NULL AND email != ''
-        ORDER BY RAND()
+        ORDER BY 
+          PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', klaviyo_installed_at) DESC NULLS LAST,
+          RAND()  -- Secondary randomization for same-day installs
         LIMIT @limit
         """
         
@@ -408,7 +417,13 @@ def get_eligible_leads(limit: int) -> List[Lead]:
         result = bq_client.query(query, job_config=job_config).result()
         leads = []
         
+        # Track priority distribution for logging
+        priority_counts = {'HOT': 0, 'WARM': 0, 'COLD': 0}
+        
         for row in result:
+            if hasattr(row, 'klaviyo_priority'):
+                priority_counts[row.klaviyo_priority] = priority_counts.get(row.klaviyo_priority, 0) + 1
+                
             leads.append(Lead(
                 email=row.email,
                 merchant_name=row.merchant_name or '',
@@ -416,10 +431,15 @@ def get_eligible_leads(limit: int) -> List[Lead]:
                 state=row.state or '',
                 country_code=row.country_code or '',
                 estimated_sales_yearly=row.estimated_sales_yearly,
-                sequence_target=row.sequence_target
+                sequence_target=row.sequence_target,
+                klaviyo_installed_at=row.klaviyo_installed_at
             ))
         
-        logger.info(f"Retrieved {len(leads)} eligible leads")
+        logger.info(f"Retrieved {len(leads)} eligible leads with Klaviyo prioritization:")
+        logger.info(f"  - HOT (90-day): {priority_counts['HOT']} leads")
+        logger.info(f"  - WARM (1-year): {priority_counts['WARM']} leads") 
+        logger.info(f"  - COLD (1+ year): {priority_counts['COLD']} leads")
+        
         return leads
     
     except Exception as e:

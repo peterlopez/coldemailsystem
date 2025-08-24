@@ -139,6 +139,7 @@ def setup_bigquery_tables():
       e.employee_count,
       e.product_count,
       e.avg_price,
+      e.klaviyo_installed_at,
       CASE 
         WHEN e.estimated_sales_yearly < c.smb_threshold THEN 'SMB' 
         ELSE 'Midsize' 
