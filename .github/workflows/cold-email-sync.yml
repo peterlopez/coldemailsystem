@@ -22,6 +22,8 @@ on:
         description: 'Number of new leads to process'
         required: false
         default: '100'
+  push:  # Temporary: trigger on push for testing
+    branches: [ main ]
 
 permissions:
   contents: read
