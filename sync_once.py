@@ -5,6 +5,7 @@ Synchronizes leads between BigQuery and Instantly.ai campaigns.
 """
 
 import os
+import sys
 import re
 import json
 import time
@@ -59,20 +60,23 @@ if not INSTANTLY_API_KEY:
     # Fallback to config file if environment variable not set (local development)
     logger.info("INSTANTLY_API_KEY not found in environment, attempting to load from config file")
     try:
+        # Add current directory to Python path to help with imports
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from config.config import Config
         config = Config()
         INSTANTLY_API_KEY = config.instantly_api_key
         logger.info("Loaded INSTANTLY_API_KEY from config file")
+    except ImportError as e:
+        logger.warning(f"Could not import config module: {e}")
+        logger.info("This is expected in GitHub Actions where config module is not needed")
     except Exception as e:
         logger.error(f"Failed to load API key from config: {e}")
         logger.error("INSTANTLY_API_KEY must be set as environment variable or in config file")
-        raise RuntimeError("INSTANTLY_API_KEY not configured")
-
-# Validate API key is available
+        
 if not INSTANTLY_API_KEY:
     logger.error("❌ INSTANTLY_API_KEY is not configured!")
-    logger.error("Set INSTANTLY_API_KEY environment variable or configure config/secrets/instantly-config.json")
-    exit(1)
+    raise RuntimeError("INSTANTLY_API_KEY not configured")
+
 
 INSTANTLY_BASE_URL = 'https://api.instantly.ai'
 

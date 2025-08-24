@@ -44,7 +44,14 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install google-cloud-bigquery requests tenacity
+          # Install from requirements.txt to ensure all dependencies are included
+          if [ -f requirements.txt ]; then
+            echo "📦 Installing from requirements.txt..."
+            pip install -r requirements.txt
+          else
+            echo "⚠️ requirements.txt not found, installing minimal dependencies..."
+            pip install google-cloud-bigquery requests tenacity
+          fi
       
       - name: Create credentials file
         run: |
@@ -112,6 +119,16 @@ jobs:
           python -c "import requests; print('✅ requests OK')" || echo "❌ Failed to import requests"
           python -c "import tenacity; print('✅ tenacity OK')" || echo "❌ Failed to import tenacity"
           
+      - name: Run minimal test
+        run: |
+          echo "🧪 Running minimal test..."
+          python test_minimal.py || {
+            echo "❌ Minimal test failed"
+            echo "📄 Test log contents:"
+            cat test.log || echo "No test.log file found"
+            exit 1
+          }
+          
       - name: Run sync
         env:
           # Required secrets
@@ -171,5 +188,6 @@ jobs:
           path: |
             *.log
             cold-email-sync.log
+            test.log
           if-no-files-found: warn
           retention-days: 7
