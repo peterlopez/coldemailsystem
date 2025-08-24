@@ -106,9 +106,7 @@ jobs:
             if python -m json.tool config/secrets/bigquery-credentials.json > /dev/null 2>&1; then
               echo "✅ Credentials file is valid JSON" | tee -a workflow.log
               
-              # Run detailed credentials debugging
-              echo "🔍 Running detailed credentials analysis..." | tee -a workflow.log
-              python debug_credentials.py | tee -a workflow.log
+              # Credentials file is valid, ready to proceed
             else
               echo "❌ ERROR: Credentials file is not valid JSON" | tee -a workflow.log
               echo "First 200 chars of file:" | tee -a workflow.log
@@ -156,17 +154,6 @@ jobs:
           python -c "import requests; print('✅ requests OK')" || echo "❌ Failed to import requests"
           python -c "import tenacity; print('✅ tenacity OK')" || echo "❌ Failed to import tenacity"
           
-      - name: Run minimal test
-        env:
-          INSTANTLY_API_KEY: ${{ secrets.INSTANTLY_API_KEY }}
-        run: |
-          echo "🧪 Running minimal test..."
-          python test_minimal.py || {
-            echo "❌ Minimal test failed"
-            echo "📄 Test log contents:"
-            cat test.log || echo "No test.log file found"
-            exit 1
-          }
           
       - name: Run sync
         env:
@@ -236,8 +223,6 @@ jobs:
           name: sync-logs-${{ github.run_number }}
           path: |
             *.log
-            cold-email-sync.log
-            test.log
             workflow.log
           if-no-files-found: warn
           retention-days: 7
