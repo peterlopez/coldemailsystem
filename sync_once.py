@@ -55,6 +55,11 @@ MIDSIZE_CAMPAIGN_ID = '5ffbe8c3-dc0e-41e4-9999-48f00d2015df'
 # Mailbox capacity management
 LEAD_INVENTORY_MULTIPLIER = float(os.getenv('LEAD_INVENTORY_MULTIPLIER', '3.5'))  # Conservative start
 
+# Email verification settings
+VERIFY_EMAILS_BEFORE_CREATION = os.getenv('VERIFY_EMAILS_BEFORE_CREATION', 'true').lower() == 'true'
+VERIFICATION_VALID_STATUSES = ['valid', 'accept_all']  # Configurable valid statuses
+VERIFICATION_TIMEOUT = int(os.getenv('VERIFICATION_TIMEOUT', '10'))  # Max wait for pending
+
 # Instantly API configuration
 INSTANTLY_API_KEY = os.getenv('INSTANTLY_API_KEY')
 logger.info(f"Environment INSTANTLY_API_KEY present: {bool(INSTANTLY_API_KEY)}")
@@ -175,27 +180,212 @@ def log_dead_letter(phase: str, email: Optional[str], payload: str, status_code:
     except Exception as e:
         logger.error(f"Failed to log dead letter: {e}")
 
-def get_finished_leads() -> List[InstantlyLead]:
-    """Get leads with terminal status from Instantly."""
-    try:
-        # For now, return empty list since we need to implement lead status tracking differently
-        # The API doesn't have a direct "get leads by campaign" endpoint
-        # We'll track status through our own BigQuery tables
-        logger.info("Skipping drain - will be implemented with lead status tracking")
-        return []
+def get_instantly_headers() -> dict:
+    """Get standard Instantly API headers."""
+    return {
+        'Authorization': f'Bearer {INSTANTLY_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+
+def classify_lead_for_drain(lead: dict, campaign_name: str) -> dict:
+    """
+    Classify a lead from Instantly API to determine if it should be drained.
     
+    Based on approved drain logic:
+    - Trust Instantly's OOO detection (stop_on_auto_reply=false)
+    - Use status codes to differentiate replies 
+    - 7-day grace period for delivery issues
+    - Allow bounced emails to retry later
+    """
+    try:
+        email = lead.get('email', 'unknown')
+        status = lead.get('status', 0)  # Status code from Instantly
+        esp_code = lead.get('esp_code', 0)  # Email service provider code
+        email_reply_count = lead.get('email_reply_count', 0)
+        created_at = lead.get('created_at')
+        
+        # Parse creation date for time-based decisions
+        days_since_created = 0
+        if created_at:
+            try:
+                from datetime import datetime
+                created_date = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                days_since_created = (datetime.now().astimezone() - created_date).days
+            except:
+                days_since_created = 0
+        
+        # DRAIN DECISION LOGIC (based on approved plan)
+        
+        # 1. Status 3 = Processed/Finished leads
+        if status == 3:
+            if email_reply_count > 0:
+                # Trust Instantly's reply detection (they handle OOO filtering)
+                return {
+                    'should_drain': True,
+                    'drain_reason': 'replied',
+                    'details': f'Status 3 with {email_reply_count} replies - genuine engagement'
+                }
+            else:
+                # Sequence completed without replies
+                return {
+                    'should_drain': True,
+                    'drain_reason': 'completed',
+                    'details': 'Sequence completed without replies'
+                }
+        
+        # 2. ESP Code analysis for email delivery issues
+        if esp_code in [550, 551, 553]:  # Hard bounces
+            if days_since_created >= 7:  # 7-day grace period
+                return {
+                    'should_drain': True,
+                    'drain_reason': 'bounced_hard',
+                    'details': f'Hard bounce (ESP {esp_code}) after {days_since_created} days'
+                }
+            else:
+                return {
+                    'should_drain': False,
+                    'keep_reason': f'Recent hard bounce (ESP {esp_code}), within 7-day grace period'
+                }
+        
+        if esp_code in [421, 450, 451]:  # Soft bounces
+            if days_since_created >= 7:  # Allow retry period
+                return {
+                    'should_drain': False,
+                    'keep_reason': f'Soft bounce (ESP {esp_code}) - keeping for retry'
+                }
+        
+        # 3. Unsubscribes (if available in API data)
+        if 'unsubscribed' in str(lead.get('status_text', '')).lower():
+            return {
+                'should_drain': True,
+                'drain_reason': 'unsubscribed',
+                'details': 'Lead unsubscribed from campaign'
+            }
+        
+        # 4. Very old active leads (90+ days) - potential stuck leads
+        if status == 1 and days_since_created >= 90:
+            return {
+                'should_drain': True,
+                'drain_reason': 'stale_active',
+                'details': f'Active lead stuck for {days_since_created} days'
+            }
+        
+        # DEFAULT: Keep active leads (Status 1) and recent leads
+        return {
+            'should_drain': False,
+            'keep_reason': f'Active lead (Status {status}) - {days_since_created} days old'
+        }
+        
     except Exception as e:
-        logger.error(f"Failed to get finished leads: {e}")
+        logger.error(f"Error classifying lead {lead.get('email', 'unknown')}: {e}")
+        # Conservative approach: don't drain on error
+        return {
+            'should_drain': False,
+            'keep_reason': f'Classification error - keeping safely: {str(e)}'
+        }
+
+def get_finished_leads() -> List[InstantlyLead]:
+    """Get leads with terminal status from Instantly using working API endpoint with pagination."""
+    try:
+        logger.info("🔄 DRAIN: Fetching finished leads from Instantly campaigns...")
+        
+        finished_leads = []
+        
+        # Get leads from both campaigns using the working POST endpoint
+        campaigns_to_check = [
+            ("SMB", SMB_CAMPAIGN_ID),
+            ("Midsize", MIDSIZE_CAMPAIGN_ID)
+        ]
+        
+        for campaign_name, campaign_id in campaigns_to_check:
+            logger.info(f"🔍 Checking {campaign_name} campaign for finished leads...")
+            
+            # Paginate through all leads in the campaign
+            offset = 0
+            limit = 100  # API max limit per call
+            total_leads_processed = 0
+            
+            while True:
+                # Use the working POST /api/v2/leads/list endpoint
+                url = f"{INSTANTLY_BASE_URL}/api/v2/leads/list"
+                payload = {
+                    "campaign_id": campaign_id,
+                    "offset": offset,
+                    "limit": limit
+                }
+                
+                response = requests.post(
+                    url,
+                    headers=get_instantly_headers(),
+                    json=payload,
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    leads = data.get('data', [])
+                    
+                    if not leads:
+                        # No more leads to process
+                        break
+                    
+                    logger.info(f"📄 Processing page {offset // limit + 1}: {len(leads)} leads")
+                    total_leads_processed += len(leads)
+                    
+                    # Classify each lead according to our approved drain logic
+                    for lead in leads:
+                        classification = classify_lead_for_drain(lead, campaign_name)
+                        
+                        if classification['should_drain']:
+                            instantly_lead = InstantlyLead(
+                                id=lead.get('id', ''),
+                                email=lead.get('email', ''),
+                                campaign_id=campaign_id,
+                                status=classification['drain_reason']
+                            )
+                            finished_leads.append(instantly_lead)
+                            
+                            logger.info(f"🗑️ Marking for drain: {lead.get('email')} - {classification['drain_reason']}")
+                        else:
+                            logger.debug(f"⏸️ Keeping: {lead.get('email')} - {classification['keep_reason']}")
+                    
+                    # Move to next page
+                    offset += limit
+                    
+                    # Safety check to prevent infinite loops
+                    if offset > 10000:  # Don't process more than 10,000 leads
+                        logger.warning(f"Reached safety limit of 10,000 leads for {campaign_name}")
+                        break
+                
+                else:
+                    logger.error(f"❌ Failed to get leads from {campaign_name} campaign (offset {offset}): {response.status_code} - {response.text}")
+                    break
+            
+            logger.info(f"📊 {campaign_name} campaign: processed {total_leads_processed} total leads")
+        
+        logger.info(f"✅ DRAIN: Found {len(finished_leads)} leads to drain across all campaigns")
+        return finished_leads
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to get finished leads: {e}")
         return []
 
 def update_bigquery_state(leads: List[InstantlyLead]) -> None:
-    """Update BigQuery with lead status and history."""
+    """Update BigQuery with lead status and history - enhanced for new drain logic."""
     if not leads or DRY_RUN:
         return
     
     try:
-        # Update ops_inst_state
+        logger.info(f"📊 Updating BigQuery state for {len(leads)} drained leads...")
+        
+        # Track drain reasons for reporting
+        drain_reasons = {}
+        
         for lead in leads:
+            # Count drain reasons for summary
+            drain_reasons[lead.status] = drain_reasons.get(lead.status, 0) + 1
+            
+            # Update ops_inst_state with new status
             query = f"""
             MERGE `{PROJECT_ID}.{DATASET_ID}.ops_inst_state` T
             USING (SELECT @email as email, @campaign_id as campaign_id, @status as status) S
@@ -218,12 +408,12 @@ def update_bigquery_state(leads: List[InstantlyLead]) -> None:
             
             bq_client.query(query, job_config=job_config).result()
             
-            # Add to history if completed
-            if lead.status == 'completed':
+            # Add to history for completed/replied leads (90-day cooldown)
+            if lead.status in ['completed', 'replied']:
                 history_query = f"""
                 INSERT INTO `{PROJECT_ID}.{DATASET_ID}.ops_lead_history`
-                (email, campaign_id, sequence_name, status_final, completed_at)
-                VALUES (@email, @campaign_id, @sequence_name, 'completed', CURRENT_TIMESTAMP())
+                (email, campaign_id, sequence_name, status_final, completed_at, attempt_num)
+                VALUES (@email, @campaign_id, @sequence_name, @status, CURRENT_TIMESTAMP(), 1)
                 """
                 
                 sequence_name = 'SMB' if lead.campaign_id == SMB_CAMPAIGN_ID else 'Midsize'
@@ -233,12 +423,14 @@ def update_bigquery_state(leads: List[InstantlyLead]) -> None:
                         bigquery.ScalarQueryParameter("email", "STRING", lead.email),
                         bigquery.ScalarQueryParameter("campaign_id", "STRING", lead.campaign_id),
                         bigquery.ScalarQueryParameter("sequence_name", "STRING", sequence_name),
+                        bigquery.ScalarQueryParameter("status", "STRING", lead.status),
                     ]
                 )
                 
                 bq_client.query(history_query, job_config=job_config).result()
+                logger.debug(f"📝 Added {lead.email} to 90-day cooldown history")
             
-            # Add unsubscribes to DNC list
+            # Add unsubscribes to DNC list (permanent block)
             if lead.status == 'unsubscribed':
                 dnc_query = f"""
                 INSERT INTO `{PROJECT_ID}.{DATASET_ID}.dnc_list`
@@ -247,10 +439,10 @@ def update_bigquery_state(leads: List[InstantlyLead]) -> None:
                     GENERATE_UUID(), 
                     @email, 
                     SPLIT(@email, '@')[OFFSET(1)], 
-                    'instantly', 
-                    'unsubscribe', 
+                    'instantly_drain', 
+                    'unsubscribe_via_api', 
                     CURRENT_TIMESTAMP(), 
-                    'sync_script', 
+                    'sync_script_v2', 
                     TRUE
                 )
                 """
@@ -262,12 +454,16 @@ def update_bigquery_state(leads: List[InstantlyLead]) -> None:
                 )
                 
                 bq_client.query(dnc_query, job_config=job_config).result()
+                logger.info(f"🚫 Added {lead.email} to permanent DNC list")
         
-        logger.info(f"Updated BigQuery state for {len(leads)} leads")
+        # Log summary of drain reasons
+        logger.info(f"✅ Updated BigQuery state - Drain summary:")
+        for reason, count in drain_reasons.items():
+            logger.info(f"  - {reason}: {count} leads")
     
     except Exception as e:
-        logger.error(f"Failed to update BigQuery state: {e}")
-        log_dead_letter('bigquery_update', None, json.dumps([l.__dict__ for l in leads]), 0, str(e))
+        logger.error(f"❌ Failed to update BigQuery state: {e}")
+        log_dead_letter('bigquery_update_drain', None, json.dumps([l.__dict__ for l in leads]), 0, str(e))
 
 def delete_leads_from_instantly(leads: List[InstantlyLead]) -> None:
     """Delete finished leads from Instantly to free inventory."""
@@ -452,6 +648,41 @@ def split_leads_by_segment(leads: List[Lead]) -> Tuple[List[Lead], List[Lead]]:
     midsize_leads = [l for l in leads if l.sequence_target == 'Midsize']
     return smb_leads, midsize_leads
 
+def verify_email(email: str) -> dict:
+    """Verify email using Instantly.ai verification API."""
+    try:
+        # Skip verification in dry run mode
+        if DRY_RUN:
+            return {
+                'email': email,
+                'status': 'valid',
+                'catch_all': False,
+                'credits_used': 0
+            }
+        
+        data = {'email': email}
+        response = call_instantly_api('/api/v2/email-verification', 
+                                    method='POST', 
+                                    data=data)
+        
+        # Handle pending status with polling
+        if response.get('verification_status') == 'pending':
+            logger.info(f"Verification pending for {email}, waiting...")
+            time.sleep(2)  # Wait before checking status
+            response = call_instantly_api(f'/api/v2/email-verification/{email}', 
+                                        method='GET')
+        
+        return {
+            'email': email,
+            'status': response.get('verification_status', 'unknown'),
+            'catch_all': response.get('catch_all', False),
+            'credits_used': response.get('credits_used', 1)
+        }
+    except Exception as e:
+        logger.error(f"Email verification failed for {email}: {e}")
+        log_dead_letter('verification', email, None, None, None, str(e))
+        return {'email': email, 'status': 'error', 'error': str(e)}
+
 def create_lead_in_instantly(lead: Lead, campaign_id: str) -> Optional[str]:
     """Create a single lead in Instantly campaign."""
     try:
@@ -516,27 +747,58 @@ def move_lead_to_campaign(lead: Lead, campaign_id: str) -> Optional[str]:
         log_dead_letter('move_lead', lead.email, json.dumps(data), 0, str(e))
         return None
 
-def update_ops_state(leads: List[Lead], campaign_id: str, lead_ids: List[str]) -> None:
-    """Update ops_inst_state with newly added leads."""
+def update_ops_state(leads: List[Lead], campaign_id: str, lead_ids: List[str], 
+                    verification_results: Optional[List[dict]] = None) -> None:
+    """Update ops_inst_state with newly added leads and verification results."""
     if DRY_RUN:
         return
     
     try:
-        for lead, lead_id in zip(leads, lead_ids):
+        for i, (lead, lead_id) in enumerate(zip(leads, lead_ids)):
             if lead_id:
-                query = f"""
-                INSERT INTO `{PROJECT_ID}.{DATASET_ID}.ops_inst_state`
-                (email, campaign_id, status, instantly_lead_id, added_at, updated_at)
-                VALUES (@email, @campaign_id, 'active', @lead_id, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
-                """
+                # Find matching verification result if available
+                verification = None
+                if verification_results:
+                    for v in verification_results:
+                        if v['email'] == lead.email:
+                            verification = v
+                            break
                 
-                job_config = bigquery.QueryJobConfig(
-                    query_parameters=[
-                        bigquery.ScalarQueryParameter("email", "STRING", lead.email),
-                        bigquery.ScalarQueryParameter("campaign_id", "STRING", campaign_id),
-                        bigquery.ScalarQueryParameter("lead_id", "STRING", lead_id),
-                    ]
-                )
+                # Build insert query with verification fields
+                if verification:
+                    query = f"""
+                    INSERT INTO `{PROJECT_ID}.{DATASET_ID}.ops_inst_state`
+                    (email, campaign_id, status, instantly_lead_id, added_at, updated_at,
+                     verification_status, verification_catch_all, verification_credits_used, verified_at)
+                    VALUES (@email, @campaign_id, 'active', @lead_id, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(),
+                            @verification_status, @verification_catch_all, @verification_credits_used, CURRENT_TIMESTAMP())
+                    """
+                    
+                    job_config = bigquery.QueryJobConfig(
+                        query_parameters=[
+                            bigquery.ScalarQueryParameter("email", "STRING", lead.email),
+                            bigquery.ScalarQueryParameter("campaign_id", "STRING", campaign_id),
+                            bigquery.ScalarQueryParameter("lead_id", "STRING", lead_id),
+                            bigquery.ScalarQueryParameter("verification_status", "STRING", verification.get('status')),
+                            bigquery.ScalarQueryParameter("verification_catch_all", "BOOL", verification.get('catch_all', False)),
+                            bigquery.ScalarQueryParameter("verification_credits_used", "INT64", verification.get('credits_used', 1)),
+                        ]
+                    )
+                else:
+                    # Original query without verification fields
+                    query = f"""
+                    INSERT INTO `{PROJECT_ID}.{DATASET_ID}.ops_inst_state`
+                    (email, campaign_id, status, instantly_lead_id, added_at, updated_at)
+                    VALUES (@email, @campaign_id, 'active', @lead_id, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
+                    """
+                    
+                    job_config = bigquery.QueryJobConfig(
+                        query_parameters=[
+                            bigquery.ScalarQueryParameter("email", "STRING", lead.email),
+                            bigquery.ScalarQueryParameter("campaign_id", "STRING", campaign_id),
+                            bigquery.ScalarQueryParameter("lead_id", "STRING", lead_id),
+                        ]
+                    )
                 
                 bq_client.query(query, job_config=job_config).result()
         
@@ -546,17 +808,39 @@ def update_ops_state(leads: List[Lead], campaign_id: str, lead_ids: List[str]) -
         logger.error(f"Failed to update ops state: {e}")
 
 def process_lead_batch(leads: List[Lead], campaign_id: str) -> int:
-    """Process a batch of leads for a specific campaign."""
+    """Process a batch of leads for a specific campaign with email verification."""
     if not leads:
         return 0
     
     logger.info(f"Processing batch of {len(leads)} leads for campaign {campaign_id}")
     
+    # Verification phase
+    verified_leads = []
+    verification_results = []
+    
+    if VERIFY_EMAILS_BEFORE_CREATION:
+        logger.info(f"Verifying {len(leads)} email addresses...")
+        for lead in leads:
+            verification = verify_email(lead.email)
+            verification_results.append(verification)
+            
+            if verification['status'] in VERIFICATION_VALID_STATUSES:
+                verified_leads.append(lead)
+                logger.debug(f"✅ {lead.email} verified as {verification['status']}")
+            else:
+                logger.info(f"❌ Skipping {lead.email}: {verification['status']}")
+        
+        logger.info(f"Verified {len(verified_leads)}/{len(leads)} leads as valid")
+    else:
+        # Skip verification if disabled
+        verified_leads = leads
+        logger.info("Email verification disabled, processing all leads")
+    
     successful_ids = []
     
     # Process in smaller batches to respect rate limits
-    for i in range(0, len(leads), BATCH_SIZE):
-        batch = leads[i:i + BATCH_SIZE]
+    for i in range(0, len(verified_leads), BATCH_SIZE):
+        batch = verified_leads[i:i + BATCH_SIZE]
         batch_ids = []
         
         for lead in batch:
@@ -565,14 +849,27 @@ def process_lead_batch(leads: List[Lead], campaign_id: str) -> int:
             time.sleep(0.5)  # Rate limiting between individual calls
         
         successful_ids.extend(batch_ids)
-        update_ops_state(batch, campaign_id, batch_ids)
         
-        if i + BATCH_SIZE < len(leads):  # Not the last batch
+        # Update ops_state with verification results
+        if verification_results:
+            # Only pass verification results for the current batch
+            batch_verifications = []
+            for lead in batch:
+                # Find matching verification result
+                for v in verification_results:
+                    if v['email'] == lead.email:
+                        batch_verifications.append(v)
+                        break
+            update_ops_state(batch, campaign_id, batch_ids, batch_verifications)
+        else:
+            update_ops_state(batch, campaign_id, batch_ids)
+        
+        if i + BATCH_SIZE < len(verified_leads):  # Not the last batch
             logger.info(f"Sleeping {BATCH_SLEEP_SECONDS}s between batches...")
             time.sleep(BATCH_SLEEP_SECONDS)
     
     successful_count = len([id for id in successful_ids if id])
-    logger.info(f"Successfully processed {successful_count}/{len(leads)} leads")
+    logger.info(f"Successfully processed {successful_count}/{len(verified_leads)} verified leads")
     return successful_count
 
 def top_up_campaigns() -> Tuple[int, int]:
@@ -627,6 +924,52 @@ def housekeeping() -> Dict:
         result = bq_client.query(query).result()
         eligible_count = next(result).count
         
+        # Get verification metrics if enabled
+        verification_stats = {}
+        if VERIFY_EMAILS_BEFORE_CREATION:
+            try:
+                verification_query = f'''
+                SELECT 
+                    verification_status,
+                    COUNT(*) as count,
+                    COALESCE(SUM(verification_credits_used), 0) as total_credits
+                FROM `{PROJECT_ID}.{DATASET_ID}.ops_inst_state`
+                WHERE verified_at > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+                  AND verification_status IS NOT NULL
+                GROUP BY verification_status
+                '''
+                
+                verification_result = bq_client.query(verification_query).result()
+                
+                logger.info("📊 Verification Stats (Last 24h):")
+                total_verified = 0
+                total_credits = 0
+                
+                for row in verification_result:
+                    status = row.verification_status
+                    count = row.count
+                    credits = row.total_credits
+                    
+                    verification_stats[status] = {
+                        'count': count,
+                        'credits': credits
+                    }
+                    
+                    total_verified += count
+                    total_credits += credits
+                    
+                    logger.info(f"  - {status}: {count} emails, {credits} credits")
+                
+                if total_verified > 0:
+                    valid_count = sum(stats['count'] for status, stats in verification_stats.items() 
+                                    if status in VERIFICATION_VALID_STATUSES)
+                    valid_rate = (valid_count / total_verified * 100) if total_verified > 0 else 0
+                    logger.info(f"  - Total verified: {total_verified}, Valid rate: {valid_rate:.1f}%")
+                    logger.info(f"  - Credits used: {total_credits}")
+                
+            except Exception as e:
+                logger.warning(f"Could not get verification metrics: {e}")
+        
         # Calculate utilization metrics
         capacity_utilization = (inventory / safe_inventory_limit * 100) if safe_inventory_limit > 0 else 0
         
@@ -640,7 +983,9 @@ def housekeeping() -> Dict:
             'capacity_utilization_pct': round(capacity_utilization, 1),
             'lead_multiplier': LEAD_INVENTORY_MULTIPLIER,
             'cap_guard': INSTANTLY_CAP_GUARD,
-            'dry_run': DRY_RUN
+            'dry_run': DRY_RUN,
+            'verification_enabled': VERIFY_EMAILS_BEFORE_CREATION,
+            'verification_stats': verification_stats
         }
         
         logger.info(f"Summary:")
@@ -649,6 +994,7 @@ def housekeeping() -> Dict:
         logger.info(f"  - Mailboxes: {mailbox_count} ({daily_capacity} emails/day)")
         logger.info(f"  - Safe capacity: {safe_inventory_limit:,} leads (utilization: {capacity_utilization:.1f}%)")
         logger.info(f"  - Legacy cap guard: {INSTANTLY_CAP_GUARD:,}")
+        logger.info(f"  - Verification: {'ENABLED' if VERIFY_EMAILS_BEFORE_CREATION else 'DISABLED'}")
         
         return metrics
     
