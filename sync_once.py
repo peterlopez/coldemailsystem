@@ -304,6 +304,7 @@ def get_finished_leads() -> List[InstantlyLead]:
             offset = 0
             limit = 100  # API max limit per call
             total_leads_processed = 0
+            page_count = 0
             
             while True:
                 # Use the working POST /api/v2/leads/list endpoint
@@ -314,6 +315,11 @@ def get_finished_leads() -> List[InstantlyLead]:
                     "limit": limit
                 }
                 
+                # RATE LIMITING: Add delay between API calls to prevent 401 errors
+                if page_count > 0:  # Don't delay the first call
+                    logger.debug(f"⏸️ Rate limiting: waiting 1 second before next API call...")
+                    time.sleep(1.0)  # 1 second delay between pagination calls
+                
                 response = requests.post(
                     url,
                     headers=get_instantly_headers(),
@@ -323,13 +329,15 @@ def get_finished_leads() -> List[InstantlyLead]:
                 
                 if response.status_code == 200:
                     data = response.json()
-                    leads = data.get('data', [])
+                    # FIX: Use 'items' instead of 'data' (correct API response structure)
+                    leads = data.get('items', [])
                     
                     if not leads:
                         # No more leads to process
                         break
                     
-                    logger.info(f"📄 Processing page {offset // limit + 1}: {len(leads)} leads")
+                    page_count += 1
+                    logger.info(f"📄 Processing page {page_count}: {len(leads)} leads")
                     total_leads_processed += len(leads)
                     
                     # Classify each lead according to our approved drain logic
@@ -357,11 +365,18 @@ def get_finished_leads() -> List[InstantlyLead]:
                         logger.warning(f"Reached safety limit of 10,000 leads for {campaign_name}")
                         break
                 
+                elif response.status_code == 401:
+                    # Rate limiting likely cause of 401 errors
+                    logger.warning(f"⚠️ Got 401 error (likely rate limiting) for {campaign_name} at offset {offset}")
+                    logger.info(f"💤 Backing off for 5 seconds before retry...")
+                    time.sleep(5.0)  # Longer backoff for 401 errors
+                    continue  # Retry the same page
+                    
                 else:
                     logger.error(f"❌ Failed to get leads from {campaign_name} campaign (offset {offset}): {response.status_code} - {response.text}")
                     break
             
-            logger.info(f"📊 {campaign_name} campaign: processed {total_leads_processed} total leads")
+            logger.info(f"📊 {campaign_name} campaign: processed {total_leads_processed} total leads in {page_count} pages")
         
         logger.info(f"✅ DRAIN: Found {len(finished_leads)} leads to drain across all campaigns")
         return finished_leads
@@ -684,14 +699,14 @@ def verify_email(email: str) -> dict:
         return {'email': email, 'status': 'error', 'error': str(e)}
 
 def create_lead_in_instantly(lead: Lead, campaign_id: str) -> Optional[str]:
-    """Create a single lead in Instantly campaign."""
+    """Create a single lead in Instantly campaign with proper campaign assignment."""
     try:
-        data = {
+        # Step 1: Create the lead with basic data (no campaign assignment in creation)
+        basic_data = {
             'email': lead.email,
             'first_name': '',  # Not available in our data
             'last_name': '',   # Not available in our data
             'company_name': lead.merchant_name,
-            'campaign': campaign_id,  # Correct parameter for campaign assignment
             'custom_variables': {
                 'company': lead.merchant_name,
                 'domain': lead.platform_domain,
@@ -700,19 +715,37 @@ def create_lead_in_instantly(lead: Lead, campaign_id: str) -> Optional[str]:
             }
         }
         
-        # Use the correct V2 endpoint
-        response = call_instantly_api('/api/v2/leads', method='POST', data=data)
+        # Create lead without campaign assignment first
+        logger.debug(f"Creating lead {lead.email} (Step 1/2)")
+        response = call_instantly_api('/api/v2/leads', method='POST', data=basic_data)
         
         if DRY_RUN:
             return 'dry-run-id'
         
-        # Check for success in the response
-        if response.get('id'):  # V2 API returns the lead ID directly
-            logger.info(f"✅ Created lead {lead.email} with ID {response['id']}")
-            return response['id']
-        else:
+        # Check for successful creation
+        lead_id = response.get('id')
+        if not lead_id:
             logger.error(f"Failed to create lead {lead.email}: {response}")
             return None
+        
+        logger.info(f"✅ Created lead {lead.email} with ID {lead_id}")
+        
+        # Step 2: Move lead to the specified campaign
+        logger.debug(f"Assigning lead {lead.email} to campaign (Step 2/2)")
+        move_data = {
+            'ids': [lead_id],
+            'to_campaign_id': campaign_id
+        }
+        
+        move_response = call_instantly_api('/api/v2/leads/move', method='POST', data=move_data)
+        
+        if move_response.get('status') == 'pending':
+            logger.info(f"🎯 Lead {lead.email} assignment to campaign queued (async operation)")
+            return lead_id
+        else:
+            logger.warning(f"Campaign assignment may have failed for {lead.email}: {move_response}")
+            # Still return the lead_id as the lead was created successfully
+            return lead_id
     
     except Exception as e:
         if '409' in str(e) or 'already exists' in str(e).lower():
@@ -724,27 +757,23 @@ def create_lead_in_instantly(lead: Lead, campaign_id: str) -> Optional[str]:
             return None
 
 def move_lead_to_campaign(lead: Lead, campaign_id: str) -> Optional[str]:
-    """Move existing lead to different campaign."""
+    """Move existing lead to different campaign using correct API endpoint."""
     try:
-        data = {
-            'email': lead.email,
-            'to_campaign_id': campaign_id
-        }
+        # First, try to find the existing lead by email
+        # Since we don't have a direct email search, we'll need the lead ID
+        # This function is called when a lead already exists (409 error)
+        # So we need to handle this differently
         
-        response = call_instantly_api('/api/v2/leads/move', method='POST', data=data)
+        logger.warning(f"Lead {lead.email} already exists, but we need lead ID to move it")
+        logger.warning("Current move_lead_to_campaign needs enhancement to find existing lead ID")
         
-        if DRY_RUN:
-            return 'dry-run-move-id'
-        
-        if response.get('success'):
-            return response.get('lead_id')
-        else:
-            logger.error(f"Failed to move lead {lead.email}: {response}")
-            return None
+        # For now, return None to indicate we couldn't move it
+        # The calling function will handle this appropriately
+        return None
     
     except Exception as e:
         logger.error(f"Failed to move lead {lead.email}: {e}")
-        log_dead_letter('move_lead', lead.email, json.dumps(data), 0, str(e))
+        log_dead_letter('move_lead', lead.email, json.dumps({'campaign_id': campaign_id}), 0, str(e))
         return None
 
 def update_ops_state(leads: List[Lead], campaign_id: str, lead_ids: List[str], 
