@@ -5,7 +5,7 @@ name: Cold Email Sync
 on:
   schedule:
     # Run every 30 minutes during business hours (9 AM - 6 PM EST, Mon-Fri)
-    - cron: '*/30 13-23 * * 1-5'  # UTC times for EST business hours
+    - cron: '0,30 13-23 * * 1-5'  # UTC times for EST business hours
     # Also run every 2 hours on weekends (lighter schedule)  
     - cron: '0 */2 * * 0,6'
   workflow_dispatch:  # Allow manual triggers
