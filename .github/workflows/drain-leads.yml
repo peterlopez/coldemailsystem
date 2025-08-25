@@ -1,0 +1,199 @@
+name: Drain Finished Leads
+
+# Dedicated workflow for processing finished leads with enhanced rate limiting
+# Runs independently from main sync to prevent DELETE rate limiting from blocking new lead acquisition
+
+on:
+  schedule:
+    # Every 2 hours during business hours (9 AM - 6 PM EST, Mon-Fri)
+    - cron: '0 */2 13-23 * * 1-5'  # UTC times for EST business hours
+    # Every 4 hours on weekends (lighter schedule)
+    - cron: '0 */4 * * 0,6'
+  workflow_dispatch:  # Allow manual triggers
+    inputs:
+      dry_run:
+        description: 'Run in dry mode (no actual deletions)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+permissions:
+  contents: read
+
+jobs:
+  drain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25  # Longer timeout for drain operations with enhanced rate limiting
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Create initial log file
+        run: |
+          echo "GitHub Actions drain workflow started at $(date)" > drain-workflow.log
+          echo "Runner: ${{ runner.os }}" >> drain-workflow.log
+          echo "GitHub ref: ${{ github.ref }}" >> drain-workflow.log
+          echo "Workflow: Drain Finished Leads" >> drain-workflow.log
+          ls -la >> drain-workflow.log 2>&1
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          echo "📦 Installing dependencies for drain workflow..." | tee -a drain-workflow.log
+          pip install --upgrade pip 2>&1 | tee -a drain-workflow.log
+          
+          # Install from requirements.txt to ensure all dependencies are included
+          if [ -f requirements.txt ]; then
+            echo "📦 Installing from requirements.txt..." | tee -a drain-workflow.log
+            pip install -r requirements.txt 2>&1 | tee -a drain-workflow.log
+          else
+            echo "⚠️ requirements.txt not found, installing minimal dependencies..." | tee -a drain-workflow.log
+            pip install google-cloud-bigquery requests tenacity 2>&1 | tee -a drain-workflow.log
+          fi
+          
+          echo "✅ Dependencies installed for drain workflow" | tee -a drain-workflow.log
+      
+      - name: Create credentials file
+        env:
+          BIGQUERY_CREDS: ${{ secrets.BIGQUERY_CREDENTIALS_JSON }}
+          INSTANTLY_KEY: ${{ secrets.INSTANTLY_API_KEY }}
+        run: |
+          echo "📁 Creating directory structure for drain workflow..." | tee -a drain-workflow.log
+          mkdir -p config/secrets
+          
+          # Debug: Check if secrets are available (without exposing them)
+          echo "🔍 Checking secrets availability for drain..." | tee -a drain-workflow.log
+          
+          # Check BigQuery credentials
+          if [ -z "${BIGQUERY_CREDS}" ]; then
+            echo "❌ ERROR: BIGQUERY_CREDENTIALS_JSON secret not set" | tee -a drain-workflow.log
+            exit 1
+          else
+            echo "✅ BIGQUERY_CREDENTIALS_JSON secret is available (${#BIGQUERY_CREDS} chars)" | tee -a drain-workflow.log
+          fi
+          
+          # Check Instantly API key
+          if [ -z "${INSTANTLY_KEY}" ]; then
+            echo "❌ ERROR: INSTANTLY_API_KEY secret not set" | tee -a drain-workflow.log
+            exit 1
+          else
+            echo "✅ INSTANTLY_API_KEY secret is available" | tee -a drain-workflow.log
+          fi
+          
+          # Create credentials file using environment variable
+          echo "📝 Creating credentials file for drain workflow..." | tee -a drain-workflow.log
+          # Use printf to properly handle escaped characters in JSON
+          printf '%s' "${BIGQUERY_CREDS}" > config/secrets/bigquery-credentials.json
+          chmod 600 config/secrets/bigquery-credentials.json
+          
+          # Verify file was created
+          if [ -f "config/secrets/bigquery-credentials.json" ]; then
+            file_size=$(stat -c%s "config/secrets/bigquery-credentials.json" 2>/dev/null || stat -f%z "config/secrets/bigquery-credentials.json" 2>/dev/null || echo "unknown")
+            echo "✅ Credentials file created successfully ($file_size bytes)" | tee -a drain-workflow.log
+            
+            # Validate JSON format
+            if python -m json.tool config/secrets/bigquery-credentials.json > /dev/null 2>&1; then
+              echo "✅ Credentials file is valid JSON" | tee -a drain-workflow.log
+            else
+              echo "❌ ERROR: Credentials file is not valid JSON" | tee -a drain-workflow.log
+              exit 1
+            fi
+          else
+            echo "❌ ERROR: Failed to create credentials file" | tee -a drain-workflow.log
+            exit 1
+          fi
+      
+      - name: Validate environment for drain
+        env:
+          INSTANTLY_API_KEY: ${{ secrets.INSTANTLY_API_KEY }}
+        run: |
+          echo "🔍 Validating drain workflow environment..."
+          python validate_environment.py || {
+            echo "❌ Environment validation failed with exit code $?"
+            exit 1
+          }
+          
+      - name: Test imports for drain
+        run: |
+          echo "🧪 Testing Python imports for drain workflow..."
+          python -c "import os; print('✅ os module OK')"
+          python -c "import logging; print('✅ logging module OK')"
+          python -c "from google.cloud import bigquery; print('✅ google.cloud.bigquery OK')" || echo "❌ Failed to import bigquery"
+          python -c "import requests; print('✅ requests OK')" || echo "❌ Failed to import requests"
+          python -c "import tenacity; print('✅ tenacity OK')" || echo "❌ Failed to import tenacity"
+          
+          # Test drain-specific imports
+          echo "🧪 Testing drain-specific imports..."
+          python -c "from sync_once import get_finished_leads, logger; print('✅ drain imports OK')" || echo "❌ Failed to import drain functions"
+          
+      - name: Run drain process
+        env:
+          # Required secrets
+          INSTANTLY_API_KEY: ${{ secrets.INSTANTLY_API_KEY }}
+          
+          # Drain-specific configuration
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          
+          # Python path
+          PYTHONPATH: .
+        
+        run: |
+          echo "🧹 Starting Enhanced Lead Drain Process" | tee -a drain-workflow.log
+          echo "Dry run: $DRY_RUN" | tee -a drain-workflow.log
+          echo "Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" | tee -a drain-workflow.log
+          echo "" | tee -a drain-workflow.log
+          
+          # Ensure we have the API key
+          if [ -z "$INSTANTLY_API_KEY" ]; then
+            echo "❌ INSTANTLY_API_KEY not available in environment" | tee -a drain-workflow.log
+            exit 1
+          fi
+          
+          echo "✅ Environment variables validated for drain" | tee -a drain-workflow.log
+          
+          # Run the drain script with full output capture
+          echo "📝 Running drain_once.py with enhanced rate limiting..." | tee -a drain-workflow.log
+          python drain_once.py 2>&1 | tee -a drain-workflow.log || {
+            exit_code=$?
+            echo "❌ drain_once.py failed with exit code $exit_code" | tee -a drain-workflow.log
+            
+            # List any log files created
+            echo "📄 Log files in directory:" | tee -a drain-workflow.log
+            ls -la *.log 2>&1 | tee -a drain-workflow.log || echo "No .log files found" | tee -a drain-workflow.log
+            
+            exit $exit_code
+          }
+      
+      - name: Send drain logs to external service
+        if: always()
+        env:
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          echo "📤 Sending drain logs for remote analysis..."
+          # Modify send_logs.py to use drain-workflow.log if it exists
+          python send_logs.py || echo "⚠️ Drain log transmission failed, continuing..."
+          
+      - name: Cleanup credentials
+        if: always()
+        run: |
+          rm -f config/secrets/bigquery-credentials.json
+      
+      - name: Upload drain logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drain-logs-${{ github.run_number }}
+          path: |
+            *.log
+            drain-workflow.log
+          if-no-files-found: warn
+          retention-days: 7

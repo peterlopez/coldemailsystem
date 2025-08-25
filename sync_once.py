@@ -1032,23 +1032,25 @@ def housekeeping() -> Dict:
         return {'error': str(e)}
 
 def main():
-    """Main synchronization function."""
-    logger.info("🚀 STARTING COLD EMAIL SYNC")
+    """Main synchronization function - Fast Mode (WITHOUT drain phase)."""
+    logger.info("🚀 STARTING COLD EMAIL SYNC (Fast Mode)")
     logger.info(f"Config - Target: {TARGET_NEW_LEADS_PER_RUN}, Cap: {INSTANTLY_CAP_GUARD}, Multiplier: {LEAD_INVENTORY_MULTIPLIER}, Dry Run: {DRY_RUN}")
+    logger.info("ℹ️ NOTE: Drain phase now handled by separate workflow - this is FAST MODE")
     
     try:
-        # Step 1: Drain finished leads first
-        drained = drain_finished_leads()
+        # REMOVED: Step 1: Drain finished leads (now handled by separate drain workflow)
+        logger.info("⏭️ SKIPPING DRAIN: Handled by separate drain-leads workflow")
         
-        # Step 2: Top up campaigns
+        # Step 1: Top up campaigns (renamed from Step 2)
         smb_added, midsize_added = top_up_campaigns()
         
-        # Step 3: Housekeeping
+        # Step 2: Housekeeping (renamed from Step 3)
         metrics = housekeeping()
         
         # Final summary
-        logger.info("✅ SYNC COMPLETE")
-        logger.info(f"Results - Drained: {drained}, Added: {smb_added + midsize_added} (SMB: {smb_added}, Midsize: {midsize_added})")
+        logger.info("✅ SYNC COMPLETE (Fast Mode)")
+        logger.info(f"Results - Added: {smb_added + midsize_added} (SMB: {smb_added}, Midsize: {midsize_added})")
+        logger.info("ℹ️ Lead cleanup handled by separate drain workflow every 2 hours")
         
     except Exception as e:
         logger.error(f"❌ SYNC FAILED: {e}")
