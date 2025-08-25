@@ -18,10 +18,13 @@ This is a fully automated pipeline that synchronizes lead data between BigQuery 
 ### **3-Phase Sync Process (Runs Every 30 Minutes)**
 
 #### **Phase 1: DRAIN** 
-- Identifies completed/bounced/unsubscribed leads in Instantly
-- Removes them to free inventory space
-- Adds unsubscribes to DNC list automatically
-- Updates BigQuery tracking tables
+- **Intelligent Lead Classification:** Uses working POST `/api/v2/leads/list` endpoint
+- **Smart Decision Logic:** 8 scenarios including OOO handling, bounce grace periods
+- **Removes finished leads** to free inventory space (replied, completed, unsubscribed, stale)
+- **Trusts Instantly's OOO filtering** (stop_on_auto_reply=false configuration)
+- **Grace periods:** 7-day grace for hard bounces, keeps soft bounces for retry
+- **Automatic DNC management** for unsubscribes with enhanced tracking
+- **Enhanced BigQuery updates** with detailed drain reasons and history
 
 #### **Phase 2: TOP-UP**
 - Queries BigQuery for fresh eligible leads (default: 100 per run)
@@ -61,18 +64,24 @@ v_ready_for_instantly -- Combines all filtering logic
 
 ### **Key Features**
 - **Email Verification:** Real-time email validation using Instantly API before campaign creation
+- **Intelligent Drain System:** Working API integration with smart lead classification (8 scenarios)
+- **OOO Problem Solved:** Trusts Instantly's built-in detection, handles automated replies correctly
+- **Grace Period Management:** 7-day grace for hard bounces, keeps soft bounces for retry  
 - **90-Day Cooldown:** Prevents re-contacting leads for 90 days after sequence completion
-- **DNC Protection:** Permanent unsubscribe list (11,726 entries)  
-- **Inventory Management:** Stays under 24,000 lead cap
-- **Error Tracking:** Dead letter logging for all failures
+- **DNC Protection:** Permanent unsubscribe list with enhanced tracking (11,726+ entries)  
+- **Inventory Management:** Automatic lead lifecycle management prevents cap issues
+- **Error Tracking:** Dead letter logging for all failures with conservative fallbacks
 - **Smart Filtering:** Excludes duplicates, active leads, and recent completions
 - **Automatic Retry:** Exponential backoff for API failures
 
 ## 🛠️ System Components
 
 ### **Core Script: sync_once.py**
-- **400+ lines** of production-ready Python code
+- **1000+ lines** of production-ready Python code
 - Handles all API interactions with Instantly.ai V2
+- **Working Drain System:** Uses discovered POST `/api/v2/leads/list` endpoint with pagination
+- **Smart Lead Classification:** Implements 8-scenario logic for drain decisions
+- **OOO-Aware Processing:** Trusts Instantly's automated reply filtering
 - Manages BigQuery connections and transactions  
 - Implements drain-first architecture pattern
 - Comprehensive error handling and logging
@@ -206,14 +215,44 @@ VERIFICATION_VALID_STATUSES=['valid', 'accept_all']
 - **Limit:** Consider disabling verification temporarily if credits low
 - **Control:** Set VERIFY_EMAILS_BEFORE_CREATION=false to disable
 
+#### **"Leads not being drained properly"**
+- **Check API:** Verify POST `/api/v2/leads/list` endpoint is working
+- **Debug:** Use "Drain activity analysis" query above to see drain reasons
+- **Common causes:** Campaign IDs changed, API key issues, classification logic errors
+- **Solution:** Check drain functionality logs for classification details
+
+#### **"OOO responses being counted as replies"**
+- **System behavior:** Now trusts Instantly's built-in OOO detection
+- **Configuration:** stop_on_auto_reply=false (correctly configured)  
+- **Verification:** Check if leads with OOO responses remain active (not drained)
+- **Expected:** Only genuine replies (Status 3 + reply_count > 0) should be drained as "replied"
+
+#### **"Inventory still growing toward cap"**
+- **Root cause:** Drain functionality was previously disabled (returned empty list)
+- **Status:** ✅ Now fixed with working API integration and classification
+- **Monitor:** Use ops_inst_state status breakdown query to track drain activity
+- **Expected:** Should see 'completed', 'replied', 'unsubscribed' statuses in drain analysis
+
 ### **Debug Queries**
 ```sql
 -- Check ready leads count
 SELECT COUNT(*) FROM `instant-ground-394115.email_analytics.v_ready_for_instantly`;
 
--- Check current campaign state
+-- Check current campaign state (enhanced with drain reasons)
 SELECT status, COUNT(*) FROM `instant-ground-394115.email_analytics.ops_inst_state` 
-GROUP BY status;
+GROUP BY status
+ORDER BY count DESC;
+
+-- Drain activity analysis (last 24h)
+SELECT 
+    status as drain_reason,
+    COUNT(*) as leads_drained,
+    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) as percentage
+FROM `instant-ground-394115.email_analytics.ops_inst_state`
+WHERE updated_at > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+    AND status IN ('replied', 'completed', 'unsubscribed', 'bounced_hard', 'stale_active')
+GROUP BY status
+ORDER BY leads_drained DESC;
 
 -- Email verification statistics (last 24h)
 SELECT 
@@ -225,6 +264,17 @@ FROM `instant-ground-394115.email_analytics.ops_inst_state`
 WHERE verified_at > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
 GROUP BY verification_status
 ORDER BY count DESC;
+
+-- 90-day cooldown tracking (recent completions)
+SELECT 
+    status_final,
+    COUNT(*) as leads_in_cooldown,
+    MIN(completed_at) as earliest_completion,
+    MAX(completed_at) as latest_completion
+FROM `instant-ground-394115.email_analytics.ops_lead_history`
+WHERE completed_at > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 90 DAY)
+GROUP BY status_final
+ORDER BY leads_in_cooldown DESC;
 
 -- Check recent errors
 SELECT * FROM `instant-ground-394115.email_analytics.ops_dead_letters`
@@ -320,8 +370,9 @@ The Cold Email System is **fully implemented and tested** with **email verificat
 - Track verification metrics and credit usage
 - Provide comprehensive logging and error tracking
 
-**Total development time:** 4 days + 2 hours (email verification)  
-**Lines of code:** 1000+ (production-ready with verification)  
-**Test coverage:** Comprehensive with multiple validation layers  
+**Total development time:** 4 days + 2 hours (email verification) + 4 hours (drain system)  
+**Lines of code:** 1200+ (production-ready with verification + intelligent drain)  
+**Test coverage:** Comprehensive with multiple validation layers + drain classification tests  
 **Email verification:** ✅ Active and filtering invalid emails  
-**Status:** ✅ Ready for immediate production use
+**Drain functionality:** ✅ Fully operational with smart lead classification  
+**Status:** ✅ Ready for immediate production use with complete lifecycle management
