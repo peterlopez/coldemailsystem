@@ -177,10 +177,15 @@ jobs:
         if: always()
         env:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          GITHUB_WORKFLOW: ${{ github.workflow }}
         run: |
           echo "📤 Sending drain logs for remote analysis..."
-          # Modify send_logs.py to use drain-workflow.log if it exists
-          python send_logs.py || echo "⚠️ Drain log transmission failed, continuing..."
+          # Check if we have the drain-specific logger, else fall back to main logger
+          if [ -f "send_logs_drain.py" ]; then
+            python send_logs_drain.py || echo "⚠️ Drain log transmission failed, trying fallback..."
+          fi
+          # Always try the main logger as fallback (it might capture some logs)
+          python send_logs.py || echo "⚠️ Log transmission failed, continuing..."
           
       - name: Cleanup credentials
         if: always()
