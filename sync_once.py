@@ -187,6 +187,144 @@ def get_instantly_headers() -> dict:
         'Content-Type': 'application/json'
     }
 
+def should_check_lead_for_drain(lead_id: str) -> bool:
+    """
+    Check if a lead needs drain evaluation (24+ hours since last check).
+    
+    Note: This is a simplified version for individual checks.
+    For better performance, use batch_check_leads_for_drain() for multiple leads.
+    
+    Returns:
+        True if lead hasn't been checked in 24+ hours or never checked
+        False if lead was checked recently (within 24 hours)
+    """
+    try:
+        if not lead_id:
+            return True  # Always check leads without IDs (safety)
+        
+        # For individual checks, we'll be conservative and always check
+        # The batch version below is much more efficient
+        logger.debug(f"📝 Individual check for lead {lead_id} - defaulting to check needed")
+        return True
+            
+    except Exception as e:
+        logger.error(f"❌ Error checking drain timestamp for lead {lead_id}: {e}")
+        # Conservative approach: check the lead if we can't determine timestamp
+        return True
+
+
+def batch_check_leads_for_drain(lead_ids: list) -> dict:
+    """
+    Efficiently check multiple leads for drain evaluation in a single BigQuery query.
+    
+    Args:
+        lead_ids: List of Instantly lead IDs to check
+        
+    Returns:
+        Dict mapping lead_id -> boolean (True if needs check, False if recent)
+    """
+    try:
+        if not lead_ids:
+            return {}
+        
+        # Create parameterized query for all lead IDs
+        query = """
+        SELECT 
+            instantly_lead_id,
+            last_drain_check,
+            TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), last_drain_check, HOUR) as hours_since_check
+        FROM `instant-ground-394115.email_analytics.ops_inst_state`
+        WHERE instantly_lead_id IN UNNEST(@lead_ids)
+        """
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ArrayQueryParameter("lead_ids", "STRING", lead_ids),
+            ]
+        )
+        
+        query_job = bq_client.query(query, job_config=job_config)
+        results = list(query_job.result())
+        
+        # Create result mapping
+        needs_check = {}
+        found_lead_ids = set()
+        
+        for row in results:
+            lead_id = row.instantly_lead_id
+            found_lead_ids.add(lead_id)
+            
+            if row.last_drain_check is None:
+                # Never checked before
+                needs_check[lead_id] = True
+                logger.debug(f"📝 Lead {lead_id} has no drain check timestamp - needs check")
+            elif row.hours_since_check >= 24:
+                # 24+ hours since last check
+                needs_check[lead_id] = True
+                logger.debug(f"📝 Lead {lead_id} last checked {row.hours_since_check} hours ago - needs check")
+            else:
+                # Recent check, skip
+                needs_check[lead_id] = False
+                logger.debug(f"⏰ Lead {lead_id} checked {row.hours_since_check} hours ago - skipping")
+        
+        # Any lead IDs not found in the database need first-time check
+        for lead_id in lead_ids:
+            if lead_id not in found_lead_ids:
+                needs_check[lead_id] = True
+                logger.debug(f"📝 Lead {lead_id} not in tracking - needs first drain check")
+        
+        return needs_check
+        
+    except Exception as e:
+        logger.error(f"❌ Error batch checking drain timestamps: {e}")
+        # Conservative approach: check all leads if we can't determine timestamps
+        return {lead_id: True for lead_id in lead_ids}
+
+
+def update_lead_drain_check_timestamp(lead_id: str) -> bool:
+    """
+    Update the last_drain_check timestamp for a lead after evaluation.
+    
+    Args:
+        lead_id: The Instantly lead ID
+        
+    Returns:
+        True if update successful, False otherwise
+    """
+    try:
+        if not lead_id:
+            return False
+        
+        # Update timestamp using MERGE to handle both insert and update cases
+        query = """
+        MERGE `instant-ground-394115.email_analytics.ops_inst_state` AS target
+        USING (
+            SELECT @lead_id as instantly_lead_id, CURRENT_TIMESTAMP() as check_time
+        ) AS source
+        ON target.instantly_lead_id = source.instantly_lead_id
+        WHEN MATCHED THEN
+            UPDATE SET last_drain_check = source.check_time, updated_at = source.check_time
+        WHEN NOT MATCHED THEN
+            INSERT (instantly_lead_id, last_drain_check, added_at, updated_at)
+            VALUES (source.instantly_lead_id, source.check_time, source.check_time, source.check_time)
+        """
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("lead_id", "STRING", lead_id),
+            ]
+        )
+        
+        query_job = bq_client.query(query, job_config=job_config)
+        query_job.result()  # Wait for completion
+        
+        logger.debug(f"✅ Updated drain check timestamp for lead {lead_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to update drain timestamp for lead {lead_id}: {e}")
+        return False
+
 def classify_lead_for_drain(lead: dict, campaign_name: str) -> dict:
     """
     Classify a lead from Instantly API to determine if it should be drained.
@@ -285,13 +423,13 @@ def classify_lead_for_drain(lead: dict, campaign_name: str) -> dict:
         }
 
 def get_finished_leads() -> List[InstantlyLead]:
-    """Get leads with terminal status from Instantly using working API endpoint with pagination."""
+    """Get leads with terminal status from Instantly using proper cursor-based pagination and time filtering."""
     try:
         logger.info("🔄 DRAIN: Fetching finished leads from Instantly campaigns...")
         
         finished_leads = []
         
-        # Get leads from both campaigns using the working POST endpoint
+        # Get leads from both campaigns using proper cursor pagination
         campaigns_to_check = [
             ("SMB", SMB_CAMPAIGN_ID),
             ("Midsize", MIDSIZE_CAMPAIGN_ID)
@@ -300,20 +438,23 @@ def get_finished_leads() -> List[InstantlyLead]:
         for campaign_name, campaign_id in campaigns_to_check:
             logger.info(f"🔍 Checking {campaign_name} campaign for finished leads...")
             
-            # Paginate through all leads in the campaign
-            offset = 0
-            limit = 100  # API max limit per call
-            total_leads_processed = 0
+            # CURSOR-BASED PAGINATION (proper method)
+            starting_after = None  # Start from beginning
             page_count = 0
+            total_leads_accessed = 0
+            leads_needing_check = 0
+            
+            # Deduplication safety net
+            seen_lead_ids = set()
+            consecutive_duplicate_pages = 0
             
             while True:
-                # Use the working POST /api/v2/leads/list endpoint
+                # Use proper cursor-based pagination
                 url = f"{INSTANTLY_BASE_URL}/api/v2/leads/list"
-                payload = {
-                    "campaign_id": campaign_id,
-                    "offset": offset,
-                    "limit": limit
-                }
+                payload = {"campaign_id": campaign_id}
+                
+                if starting_after:
+                    payload["starting_after"] = starting_after
                 
                 # RATE LIMITING: Add delay between API calls to prevent 401 errors
                 if page_count > 0:  # Don't delay the first call
@@ -329,54 +470,95 @@ def get_finished_leads() -> List[InstantlyLead]:
                 
                 if response.status_code == 200:
                     data = response.json()
-                    # FIX: Use 'items' instead of 'data' (correct API response structure)
                     leads = data.get('items', [])
                     
                     if not leads:
-                        # No more leads to process
+                        logger.info(f"📄 No more leads found for {campaign_name} - pagination complete")
                         break
                     
                     page_count += 1
-                    logger.info(f"📄 Processing page {page_count}: {len(leads)} leads")
-                    total_leads_processed += len(leads)
+                    total_leads_accessed += len(leads)
                     
-                    # Classify each lead according to our approved drain logic
-                    for lead in leads:
-                        classification = classify_lead_for_drain(lead, campaign_name)
+                    # DEDUPLICATION SAFETY NET
+                    page_lead_ids = {lead.get('id') for lead in leads if lead.get('id')}
+                    
+                    if page_lead_ids.issubset(seen_lead_ids):
+                        # We've seen all these leads before
+                        consecutive_duplicate_pages += 1
+                        logger.warning(f"⚠️ Page {page_count} contains only duplicate leads (consecutive: {consecutive_duplicate_pages})")
                         
-                        if classification['should_drain']:
-                            instantly_lead = InstantlyLead(
-                                id=lead.get('id', ''),
-                                email=lead.get('email', ''),
-                                campaign_id=campaign_id,
-                                status=classification['drain_reason']
-                            )
-                            finished_leads.append(instantly_lead)
+                        if consecutive_duplicate_pages >= 3:
+                            logger.error(f"❌ Detected broken pagination for {campaign_name} - same leads repeated 3+ times")
+                            break
+                    else:
+                        consecutive_duplicate_pages = 0
+                        seen_lead_ids.update(page_lead_ids)
+                    
+                    logger.info(f"📄 Processing page {page_count}: {len(leads)} leads ({len(seen_lead_ids)} unique total)")
+                    
+                    # OPTIMIZED TIME-BASED FILTERING: Batch check all leads on this page
+                    page_lead_ids_list = [lead.get('id') for lead in leads if lead.get('id')]
+                    leads_check_results = batch_check_leads_for_drain(page_lead_ids_list)
+                    
+                    # Process leads that need evaluation
+                    for lead in leads:
+                        lead_id = lead.get('id', '')
+                        email = lead.get('email', '')
+                        
+                        if not lead_id:
+                            logger.debug(f"⚠️ Skipping lead with no ID: {email}")
+                            continue
                             
-                            logger.info(f"🗑️ Marking for drain: {lead.get('email')} - {classification['drain_reason']}")
+                        # Check if lead needs evaluation (from batch results)
+                        if leads_check_results.get(lead_id, True):  # Default to True if not found
+                            leads_needing_check += 1
+                            
+                            # Classify lead according to our approved drain logic
+                            classification = classify_lead_for_drain(lead, campaign_name)
+                            
+                            if classification['should_drain']:
+                                instantly_lead = InstantlyLead(
+                                    id=lead_id,
+                                    email=email,
+                                    campaign_id=campaign_id,
+                                    status=classification['drain_reason']
+                                )
+                                finished_leads.append(instantly_lead)
+                                
+                                logger.info(f"🗑️ Marking for drain: {email} - {classification['drain_reason']}")
+                            else:
+                                logger.debug(f"⏸️ Keeping: {email} - {classification['keep_reason']}")
+                            
+                            # Update timestamp after evaluation (regardless of drain decision)
+                            update_lead_drain_check_timestamp(lead_id)
+                            
                         else:
-                            logger.debug(f"⏸️ Keeping: {lead.get('email')} - {classification['keep_reason']}")
+                            logger.debug(f"⏰ Skipping recent check: {email} (checked within 24h)")
                     
-                    # Move to next page
-                    offset += limit
+                    # Get cursor for next page
+                    starting_after = data.get('next_starting_after')
+                    if not starting_after:
+                        logger.info(f"✅ Reached end of {campaign_name} campaign - no more pages")
+                        break
                     
-                    # Safety check to prevent infinite loops
-                    if offset > 10000:  # Don't process more than 10,000 leads
-                        logger.warning(f"Reached safety limit of 10,000 leads for {campaign_name}")
+                    # Safety check to prevent infinite loops (now with proper limit)
+                    if page_count >= 50:  # Max 50 pages (5,000 leads per campaign)
+                        logger.warning(f"⚠️ Reached safety limit of 50 pages for {campaign_name} (processed {total_leads_accessed} leads)")
                         break
                 
                 elif response.status_code == 401:
                     # Rate limiting likely cause of 401 errors
-                    logger.warning(f"⚠️ Got 401 error (likely rate limiting) for {campaign_name} at offset {offset}")
+                    logger.warning(f"⚠️ Got 401 error (likely rate limiting) for {campaign_name} on page {page_count + 1}")
                     logger.info(f"💤 Backing off for 5 seconds before retry...")
                     time.sleep(5.0)  # Longer backoff for 401 errors
                     continue  # Retry the same page
                     
                 else:
-                    logger.error(f"❌ Failed to get leads from {campaign_name} campaign (offset {offset}): {response.status_code} - {response.text}")
+                    logger.error(f"❌ Failed to get leads from {campaign_name} campaign (page {page_count + 1}): {response.status_code} - {response.text}")
                     break
             
-            logger.info(f"📊 {campaign_name} campaign: processed {total_leads_processed} total leads in {page_count} pages")
+            logger.info(f"📊 {campaign_name} campaign: accessed {total_leads_accessed} leads ({len(seen_lead_ids)} unique) in {page_count} pages")
+            logger.info(f"📊 {campaign_name} campaign: {leads_needing_check} leads evaluated (24hr+ since last check)")
         
         logger.info(f"✅ DRAIN: Found {len(finished_leads)} leads to drain across all campaigns")
         return finished_leads
