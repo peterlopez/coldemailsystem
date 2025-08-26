@@ -62,6 +62,7 @@ VERIFICATION_TIMEOUT = int(os.getenv('VERIFICATION_TIMEOUT', '10'))  # Max wait 
 
 # Drain testing configuration - limit total leads processed for testing
 MAX_LEADS_TO_EVALUATE = int(os.getenv('MAX_LEADS_TO_EVALUATE', '0'))  # 0 = no limit, set to 200 for testing
+MAX_PAGES_TO_PROCESS = int(os.getenv('MAX_PAGES_TO_PROCESS', '0'))  # 0 = no limit, set to 2 for testing
 
 # Instantly API configuration
 INSTANTLY_API_KEY = os.getenv('INSTANTLY_API_KEY')
@@ -540,6 +541,9 @@ def get_finished_leads() -> List[InstantlyLead]:
         if MAX_LEADS_TO_EVALUATE > 0:
             logger.info(f"🧪 TESTING MODE: Limiting evaluation to {MAX_LEADS_TO_EVALUATE} leads total")
         
+        if MAX_PAGES_TO_PROCESS > 0:
+            logger.info(f"🧪 TESTING MODE: Limiting pagination to {MAX_PAGES_TO_PROCESS} pages per campaign")
+        
         finished_leads = []
         total_leads_evaluated = 0  # Track total across all campaigns
         reached_test_limit = False  # Flag to break out of nested loops
@@ -679,6 +683,11 @@ def get_finished_leads() -> List[InstantlyLead]:
                     starting_after = data.get('next_starting_after')
                     if not starting_after:
                         logger.info(f"✅ Reached end of {campaign_name} campaign - no more pages")
+                        break
+                    
+                    # Testing page limit check
+                    if MAX_PAGES_TO_PROCESS > 0 and page_count >= MAX_PAGES_TO_PROCESS:
+                        logger.info(f"🧪 TESTING LIMIT: Reached {MAX_PAGES_TO_PROCESS} pages for {campaign_name} (processed {total_leads_accessed} leads)")
                         break
                     
                     # Safety check to prevent infinite loops (now with proper limit)
