@@ -148,6 +148,7 @@ jobs:
           # Testing configuration - limit leads processed for faster testing
           MAX_LEADS_TO_EVALUATE: 0  # Process all leads (0 = no limit)
           MAX_PAGES_TO_PROCESS: 2   # Limit to 2 pages for testing (0 = no limit)
+          FORCE_DRAIN_CHECK: true   # Skip 24hr check for testing (bypass timestamp filtering)
           
           # Python path
           PYTHONPATH: .
@@ -155,7 +156,7 @@ jobs:
         run: |
           echo "🧹 Starting Enhanced Lead Drain Process" | tee -a drain-workflow.log
           echo "Dry run: $DRY_RUN" | tee -a drain-workflow.log
-          echo "Testing limits: $MAX_LEADS_TO_EVALUATE leads, $MAX_PAGES_TO_PROCESS pages" | tee -a drain-workflow.log
+          echo "Testing limits: $MAX_LEADS_TO_EVALUATE leads, $MAX_PAGES_TO_PROCESS pages, force_check: $FORCE_DRAIN_CHECK" | tee -a drain-workflow.log
           echo "Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" | tee -a drain-workflow.log
           echo "" | tee -a drain-workflow.log
           

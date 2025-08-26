@@ -63,6 +63,7 @@ VERIFICATION_TIMEOUT = int(os.getenv('VERIFICATION_TIMEOUT', '10'))  # Max wait 
 # Drain testing configuration - limit total leads processed for testing
 MAX_LEADS_TO_EVALUATE = int(os.getenv('MAX_LEADS_TO_EVALUATE', '0'))  # 0 = no limit, set to 200 for testing
 MAX_PAGES_TO_PROCESS = int(os.getenv('MAX_PAGES_TO_PROCESS', '0'))  # 0 = no limit, set to 2 for testing
+FORCE_DRAIN_CHECK = os.getenv('FORCE_DRAIN_CHECK', 'false').lower() == 'true'  # Skip 24hr check for testing
 
 # Instantly API configuration
 INSTANTLY_API_KEY = os.getenv('INSTANTLY_API_KEY')
@@ -549,6 +550,9 @@ def get_finished_leads() -> List[InstantlyLead]:
         if MAX_PAGES_TO_PROCESS > 0:
             logger.info(f"🧪 TESTING MODE: Limiting pagination to {MAX_PAGES_TO_PROCESS} pages per campaign")
         
+        if FORCE_DRAIN_CHECK:
+            logger.info(f"🧪 TESTING MODE: Forcing drain check on all leads (bypassing 24hr limit)")
+        
         finished_leads = []
         total_leads_evaluated = 0  # Track total across all campaigns
         reached_test_limit = False  # Flag to break out of nested loops
@@ -645,8 +649,9 @@ def get_finished_leads() -> List[InstantlyLead]:
                             logger.debug(f"⚠️ Skipping lead with no ID: {email}")
                             continue
                             
-                        # Check if lead needs evaluation (from batch results)
-                        if leads_check_results.get(lead_id, True):  # Default to True if not found
+                        # Check if lead needs evaluation (from batch results or force check)
+                        needs_check = FORCE_DRAIN_CHECK or leads_check_results.get(lead_id, True)  # Default to True if not found
+                        if needs_check:
                             leads_needing_check += 1
                             total_leads_evaluated += 1
                             
