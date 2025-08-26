@@ -215,7 +215,7 @@ def should_check_lead_for_drain(lead_id: str) -> bool:
 
 def batch_check_leads_for_drain(lead_ids: list) -> dict:
     """
-    Efficiently check multiple leads for drain evaluation in a single BigQuery query.
+    Efficiently check multiple leads for drain evaluation with timeout handling and smaller batches.
     
     Args:
         lead_ids: List of Instantly lead IDs to check
@@ -227,53 +227,69 @@ def batch_check_leads_for_drain(lead_ids: list) -> dict:
         if not lead_ids:
             return {}
         
-        # Create parameterized query for all lead IDs
-        query = """
-        SELECT 
-            instantly_lead_id,
-            last_drain_check,
-            TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), last_drain_check, HOUR) as hours_since_check
-        FROM `instant-ground-394115.email_analytics.ops_inst_state`
-        WHERE instantly_lead_id IN UNNEST(@lead_ids)
-        """
+        # Process in smaller batches to avoid BigQuery timeouts
+        BIGQUERY_BATCH_SIZE = 50  # Smaller batches for BigQuery
+        all_results = {}
         
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ArrayQueryParameter("lead_ids", "STRING", lead_ids),
-            ]
-        )
-        
-        query_job = bq_client.query(query, job_config=job_config)
-        results = list(query_job.result())
-        
-        # Create result mapping
-        needs_check = {}
-        found_lead_ids = set()
-        
-        for row in results:
-            lead_id = row.instantly_lead_id
-            found_lead_ids.add(lead_id)
+        for i in range(0, len(lead_ids), BIGQUERY_BATCH_SIZE):
+            batch_ids = lead_ids[i:i + BIGQUERY_BATCH_SIZE]
+            logger.debug(f"📊 Processing BigQuery batch {i//BIGQUERY_BATCH_SIZE + 1}: {len(batch_ids)} leads")
             
-            if row.last_drain_check is None:
-                # Never checked before
-                needs_check[lead_id] = True
-                logger.debug(f"📝 Lead {lead_id} has no drain check timestamp - needs check")
-            elif row.hours_since_check >= 24:
-                # 24+ hours since last check
-                needs_check[lead_id] = True
-                logger.debug(f"📝 Lead {lead_id} last checked {row.hours_since_check} hours ago - needs check")
-            else:
-                # Recent check, skip
-                needs_check[lead_id] = False
-                logger.debug(f"⏰ Lead {lead_id} checked {row.hours_since_check} hours ago - skipping")
+            try:
+                # Create parameterized query for batch
+                query = """
+                SELECT 
+                    instantly_lead_id,
+                    last_drain_check,
+                    TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), last_drain_check, HOUR) as hours_since_check
+                FROM `instant-ground-394115.email_analytics.ops_inst_state`
+                WHERE instantly_lead_id IN UNNEST(@lead_ids)
+                """
+                
+                job_config = bigquery.QueryJobConfig(
+                    query_parameters=[
+                        bigquery.ArrayQueryParameter("lead_ids", "STRING", batch_ids),
+                    ],
+                    job_timeout=30  # 30 second timeout per query
+                )
+                
+                query_job = bq_client.query(query, job_config=job_config)
+                results = list(query_job.result(timeout=30))  # 30 second result timeout
+                
+                # Process batch results
+                found_lead_ids = set()
+                
+                for row in results:
+                    lead_id = row.instantly_lead_id
+                    found_lead_ids.add(lead_id)
+                    
+                    if row.last_drain_check is None:
+                        # Never checked before
+                        all_results[lead_id] = True
+                        logger.debug(f"📝 Lead {lead_id} has no drain check timestamp - needs check")
+                    elif row.hours_since_check >= 24:
+                        # 24+ hours since last check
+                        all_results[lead_id] = True
+                        logger.debug(f"📝 Lead {lead_id} last checked {row.hours_since_check} hours ago - needs check")
+                    else:
+                        # Recent check, skip
+                        all_results[lead_id] = False
+                        logger.debug(f"⏰ Lead {lead_id} checked {row.hours_since_check} hours ago - skipping")
+                
+                # Any lead IDs not found in the database need first-time check
+                for lead_id in batch_ids:
+                    if lead_id not in found_lead_ids:
+                        all_results[lead_id] = True
+                        logger.debug(f"📝 Lead {lead_id} not in tracking - needs first drain check")
+                        
+            except Exception as batch_error:
+                logger.error(f"❌ BigQuery batch failed: {batch_error}")
+                # Conservative fallback: check all leads in this batch
+                for lead_id in batch_ids:
+                    all_results[lead_id] = True
+                    logger.debug(f"📝 Lead {lead_id} - defaulting to check due to batch error")
         
-        # Any lead IDs not found in the database need first-time check
-        for lead_id in lead_ids:
-            if lead_id not in found_lead_ids:
-                needs_check[lead_id] = True
-                logger.debug(f"📝 Lead {lead_id} not in tracking - needs first drain check")
-        
-        return needs_check
+        return all_results
         
     except Exception as e:
         logger.error(f"❌ Error batch checking drain timestamps: {e}")
@@ -285,6 +301,8 @@ def update_lead_drain_check_timestamp(lead_id: str) -> bool:
     """
     Update the last_drain_check timestamp for a lead after evaluation.
     
+    Note: For better performance, use batch_update_drain_timestamps() for multiple leads.
+    
     Args:
         lead_id: The Instantly lead ID
         
@@ -295,7 +313,7 @@ def update_lead_drain_check_timestamp(lead_id: str) -> bool:
         if not lead_id:
             return False
         
-        # Update timestamp using MERGE to handle both insert and update cases
+        # Update timestamp using MERGE to handle both insert and update cases with timeout
         query = """
         MERGE `instant-ground-394115.email_analytics.ops_inst_state` AS target
         USING (
@@ -312,17 +330,80 @@ def update_lead_drain_check_timestamp(lead_id: str) -> bool:
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
                 bigquery.ScalarQueryParameter("lead_id", "STRING", lead_id),
-            ]
+            ],
+            job_timeout=15  # 15 second timeout
         )
         
         query_job = bq_client.query(query, job_config=job_config)
-        query_job.result()  # Wait for completion
+        query_job.result(timeout=15)  # 15 second result timeout
         
         logger.debug(f"✅ Updated drain check timestamp for lead {lead_id}")
         return True
         
     except Exception as e:
         logger.error(f"❌ Failed to update drain timestamp for lead {lead_id}: {e}")
+        return False
+
+
+def batch_update_drain_timestamps(lead_ids: list) -> bool:
+    """
+    Batch update drain check timestamps for multiple leads to avoid timeout issues.
+    
+    Args:
+        lead_ids: List of Instantly lead IDs to update
+        
+    Returns:
+        True if batch update successful, False otherwise
+    """
+    try:
+        if not lead_ids:
+            return True
+        
+        # Process in smaller batches to avoid BigQuery timeouts
+        BATCH_SIZE = 100  # Process 100 leads at a time
+        
+        for i in range(0, len(lead_ids), BATCH_SIZE):
+            batch_ids = lead_ids[i:i + BATCH_SIZE]
+            logger.debug(f"📊 Batch updating timestamps: batch {i//BATCH_SIZE + 1}, {len(batch_ids)} leads")
+            
+            try:
+                # Create batch update query
+                query = """
+                MERGE `instant-ground-394115.email_analytics.ops_inst_state` AS target
+                USING (
+                    SELECT lead_id as instantly_lead_id, CURRENT_TIMESTAMP() as check_time
+                    FROM UNNEST(@lead_ids) AS lead_id
+                ) AS source
+                ON target.instantly_lead_id = source.instantly_lead_id
+                WHEN MATCHED THEN
+                    UPDATE SET last_drain_check = source.check_time, updated_at = source.check_time
+                WHEN NOT MATCHED THEN
+                    INSERT (instantly_lead_id, last_drain_check, added_at, updated_at)
+                    VALUES (source.instantly_lead_id, source.check_time, source.check_time, source.check_time)
+                """
+                
+                job_config = bigquery.QueryJobConfig(
+                    query_parameters=[
+                        bigquery.ArrayQueryParameter("lead_ids", "STRING", batch_ids),
+                    ],
+                    job_timeout=30  # 30 second timeout per batch
+                )
+                
+                query_job = bq_client.query(query, job_config=job_config)
+                query_job.result(timeout=30)  # 30 second result timeout
+                
+                logger.debug(f"✅ Batch updated {len(batch_ids)} drain timestamps")
+                
+            except Exception as batch_error:
+                logger.error(f"❌ Batch timestamp update failed: {batch_error}")
+                # Fall back to individual updates for this batch
+                for lead_id in batch_ids:
+                    update_lead_drain_check_timestamp(lead_id)
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Error batch updating drain timestamps: {e}")
         return False
 
 def classify_lead_for_drain(lead: dict, campaign_name: str) -> dict:
@@ -444,6 +525,9 @@ def get_finished_leads() -> List[InstantlyLead]:
             total_leads_accessed = 0
             leads_needing_check = 0
             
+            # Track leads that need timestamp updates
+            leads_to_update_timestamps = []
+            
             # Deduplication safety net
             seen_lead_ids = set()
             consecutive_duplicate_pages = 0
@@ -529,8 +613,8 @@ def get_finished_leads() -> List[InstantlyLead]:
                             else:
                                 logger.debug(f"⏸️ Keeping: {email} - {classification['keep_reason']}")
                             
-                            # Update timestamp after evaluation (regardless of drain decision)
-                            update_lead_drain_check_timestamp(lead_id)
+                            # Queue for batch timestamp update (don't do individual updates)
+                            leads_to_update_timestamps.append(lead_id)
                             
                         else:
                             logger.debug(f"⏰ Skipping recent check: {email} (checked within 24h)")
@@ -556,6 +640,16 @@ def get_finished_leads() -> List[InstantlyLead]:
                 else:
                     logger.error(f"❌ Failed to get leads from {campaign_name} campaign (page {page_count + 1}): {response.status_code} - {response.text}")
                     break
+            
+            # BATCH UPDATE TIMESTAMPS: Much more efficient than individual updates
+            if leads_to_update_timestamps:
+                logger.info(f"📊 Batch updating timestamps for {len(leads_to_update_timestamps)} evaluated leads...")
+                try:
+                    batch_update_drain_timestamps(leads_to_update_timestamps)
+                    logger.info(f"✅ Successfully updated timestamps for {len(leads_to_update_timestamps)} leads")
+                except Exception as timestamp_error:
+                    logger.error(f"❌ Batch timestamp update failed: {timestamp_error}")
+                    # Continue processing - timestamp updates are not critical for drain functionality
             
             logger.info(f"📊 {campaign_name} campaign: accessed {total_leads_accessed} leads ({len(seen_lead_ids)} unique) in {page_count} pages")
             logger.info(f"📊 {campaign_name} campaign: {leads_needing_check} leads evaluated (24hr+ since last check)")
