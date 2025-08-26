@@ -73,7 +73,7 @@ if not INSTANTLY_API_KEY:
         from config.config import Config
         config = Config()
         INSTANTLY_API_KEY = config.instantly_api_key
-        logger.info("Loaded INSTANTLY_API_KEY from config file")
+        logger.info(f"Loaded INSTANTLY_API_KEY from config file: {'[PRESENT]' if INSTANTLY_API_KEY else '[EMPTY/NONE]'}")
     except ImportError as e:
         logger.warning(f"Could not import config module: {e}")
         logger.info("This is expected in GitHub Actions where config module is not needed")

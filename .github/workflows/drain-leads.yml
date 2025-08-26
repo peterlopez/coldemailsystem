@@ -123,6 +123,8 @@ jobs:
           }
           
       - name: Test imports for drain
+        env:
+          INSTANTLY_API_KEY: ${{ secrets.INSTANTLY_API_KEY }}
         run: |
           echo "🧪 Testing Python imports for drain workflow..."
           python -c "import os; print('✅ os module OK')"
