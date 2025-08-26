@@ -12,6 +12,7 @@ ignore_all_files_in_gitignore: true
 ignored_paths:
   - "**/__pycache__"
   - "**/.venv"
+  - "**/venv"        # add explicit venv folder ignore
   - "**/.env"
   - "**/.git"
   - "**/dist"
@@ -31,12 +32,13 @@ initial_prompt: ""
 languages:
   python:
     lsp: pyright
-    # Adjust pythonPath if `which python3` on your system points elsewhere
-    pythonPath: /opt/homebrew/bin/python3
+    # Use the project's venv Python so `python -m pyright.langserver` works
+    pythonPath: "/Users/peterlopez/Documents/Cold Email System/venv/bin/python"
     initialization_options:
       exclude:
         - "**/__pycache__"
         - "**/.venv"
+        - "**/venv"
         - "**/.env"
         - "**/.git"
         - "**/dist"
