@@ -161,57 +161,57 @@ def call_instantly_api(endpoint: str, method: str = 'GET', data: Optional[Dict] 
 
 def delete_lead_from_instantly(lead: 'InstantlyLead') -> bool:
     """
-    Delete a lead from Instantly using multiple approaches.
-    Tries different API methods to ensure successful deletion.
+    Delete a lead from Instantly using multiple V2 API approaches.
+    Tries different V2 endpoints to ensure successful deletion.
     """
     if DRY_RUN:
         logger.info(f"🧪 DRY RUN: Would delete lead {lead.email} (ID: {lead.id})")
         return True
     
-    # Approach 1: Try API v2 DELETE endpoint (current method)
+    # Approach 1: Try API v2 DELETE with plural endpoint
     try:
-        logger.debug(f"🔄 Attempting API v2 DELETE for {lead.email}")
+        logger.debug(f"🔄 Attempting API v2 DELETE (plural) for {lead.email}")
         response = call_instantly_api(f'/api/v2/leads/{lead.id}', method='DELETE')
-        logger.info(f"✅ Successfully deleted {lead.email} via API v2 DELETE")
+        logger.info(f"✅ Successfully deleted {lead.email} via API v2 DELETE (plural)")
         return True
     except Exception as e:
-        logger.warning(f"⚠️ API v2 DELETE failed for {lead.email}: {e}")
+        logger.warning(f"⚠️ API v2 DELETE (plural) failed for {lead.email}: {e}")
     
-    # Approach 2: Try API v1 POST delete endpoint (fallback with different auth)
+    # Approach 2: Try API v2 DELETE with singular endpoint  
     try:
-        logger.debug(f"🔄 Attempting API v1 POST delete for {lead.email}")
-        # v1 API uses different URL and auth method
-        v1_url = f"https://api.instantly.ai/api/v1/lead/delete"
-        v1_headers = {'Content-Type': 'application/json'}  # No Bearer token for v1
-        delete_data = {
-            'api_key': INSTANTLY_API_KEY,  # v1 uses api_key in body
-            'campaign_id': lead.campaign_id,
-            'delete_all_data': True,  # Remove all data for this lead
-            'delete_list_of_emails': [lead.email]
-        }
-        
-        import requests
-        response = requests.post(v1_url, headers=v1_headers, json=delete_data, timeout=30)
-        response.raise_for_status()
-        
-        logger.info(f"✅ Successfully deleted {lead.email} via API v1 POST")
+        logger.debug(f"🔄 Attempting API v2 DELETE (singular) for {lead.email}")
+        response = call_instantly_api(f'/api/v2/lead/delete/{lead.id}', method='DELETE')
+        logger.info(f"✅ Successfully deleted {lead.email} via API v2 DELETE (singular)")
         return True
     except Exception as e:
-        logger.warning(f"⚠️ API v1 POST delete failed for {lead.email}: {e}")
+        logger.warning(f"⚠️ API v2 DELETE (singular) failed for {lead.email}: {e}")
+        
+    # Approach 3: Try API v2 POST delete (some APIs use POST for delete operations)
+    try:
+        logger.debug(f"🔄 Attempting API v2 POST delete for {lead.email}")
+        delete_data = {'lead_id': lead.id}
+        response = call_instantly_api(f'/api/v2/lead/delete', method='POST', data=delete_data)
+        logger.info(f"✅ Successfully deleted {lead.email} via API v2 POST")
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️ API v2 POST delete failed for {lead.email}: {e}")
     
-    # Approach 3: Try removing from campaign (keeps lead but stops emails)
+    # Approach 4: Try archiving/marking completed leads (Status 3 specific)
     try:
-        logger.debug(f"🔄 Attempting to remove {lead.email} from campaign")
-        remove_data = {
-            'campaign_id': lead.campaign_id,
-            'email': lead.email
+        logger.debug(f"🔄 Attempting to archive completed lead {lead.email}")
+        archive_data = {
+            'lead_id': lead.id,
+            'status': 'archived'  # Try marking as archived instead of deleting
         }
-        response = call_instantly_api('/api/v2/lead/removeleadfromsubsequence', method='POST', data=remove_data)
-        logger.info(f"⚠️ Removed {lead.email} from campaign (lead still exists but stopped)")
+        response = call_instantly_api(f'/api/v2/lead/status', method='POST', data=archive_data)
+        logger.info(f"✅ Successfully archived {lead.email} via API v2 status update")
         return True
     except Exception as e:
-        logger.error(f"❌ All deletion methods failed for {lead.email}: {e}")
-        return False
+        logger.warning(f"⚠️ API v2 archive failed for {lead.email}: {e}")
+    
+    # All V2 methods failed
+    logger.error(f"❌ All V2 deletion methods failed for {lead.email}")
+    return False
 
 def log_dead_letter(phase: str, email: Optional[str], payload: str, status_code: int, error_text: str) -> None:
     """Log failed operations to dead letters table."""
