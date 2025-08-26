@@ -168,6 +168,10 @@ jobs:
           LEAD_INVENTORY_MULTIPLIER: '3.5'  # Smart capacity management
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           
+          # Notification settings
+          SLACK_NOTIFICATION_CHANNEL: ${{ secrets.SLACK_NOTIFICATION_CHANNEL }}
+          SLACK_NOTIFICATIONS_ENABLED: ${{ secrets.SLACK_NOTIFICATIONS_ENABLED }}
+          
           # Python path
           PYTHONPATH: .
         

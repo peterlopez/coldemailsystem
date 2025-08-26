@@ -150,6 +150,10 @@ jobs:
           MAX_PAGES_TO_PROCESS: 0   # Process all pages (0 = no limit)
           FORCE_DRAIN_CHECK: false  # Enable 24hr timestamp filtering for efficiency
           
+          # Notification settings
+          SLACK_NOTIFICATION_CHANNEL: ${{ secrets.SLACK_NOTIFICATION_CHANNEL }}
+          SLACK_NOTIFICATIONS_ENABLED: ${{ secrets.SLACK_NOTIFICATIONS_ENABLED }}
+          
           # Python path
           PYTHONPATH: .
         
