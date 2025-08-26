@@ -19,51 +19,25 @@ from sync_once import (
     log_dead_letter
 )
 
-def delete_single_lead_with_retry(lead: InstantlyLead, max_retries: int = 3) -> bool:
-    """Delete a single lead with enhanced retry logic and multiple API approaches."""
+def delete_single_lead_with_retry(lead: InstantlyLead, max_retries: int = 1) -> bool:
+    """Delete a single lead - simplified to avoid retry conflicts."""
     
-    for attempt in range(max_retries + 1):
-        try:
-            # Use the new enhanced deletion function that tries multiple approaches
-            success = delete_lead_from_instantly(lead)
+    try:
+        # Use the working delete function from sync_once.py (it handles errors properly)
+        success = delete_lead_from_instantly(lead)
+        
+        if success:
+            logger.debug(f"✅ Successfully deleted {lead.email}")
+            return True
+        else:
+            logger.error(f"❌ Failed to delete {lead.email}")
+            log_dead_letter("drain", lead.email, f"DELETE {lead.id}", 400, "Delete function returned False")
+            return False
             
-            if success:
-                logger.debug(f"✅ Successfully deleted {lead.email}")
-                return True
-            else:
-                logger.warning(f"⚠️ Deletion failed for {lead.email} on attempt {attempt + 1}")
-                if attempt < max_retries:
-                    backoff_time = (2 ** attempt) * 3  # 3, 6, 12 seconds
-                    logger.info(f"💤 Backing off for {backoff_time} seconds before retry...")
-                    time.sleep(backoff_time)
-                    continue
-                else:
-                    logger.error(f"❌ Failed to delete {lead.email} after {max_retries + 1} attempts")
-                    log_dead_letter("drain", lead.email, f"MULTI-DELETE {lead.id}", 500, "All deletion methods failed")
-                    return False
-                    
-        except Exception as e:
-            error_str = str(e).lower()
-            
-            if '401' in error_str or 'unauthorized' in error_str:
-                # Rate limiting - exponential backoff
-                if attempt < max_retries:
-                    backoff_time = (2 ** attempt) * 3  # 3, 6, 12 seconds
-                    logger.warning(f"⚠️ Rate limit hit deleting {lead.email}, attempt {attempt + 1}/{max_retries + 1}")
-                    logger.info(f"💤 Backing off for {backoff_time} seconds...")
-                    time.sleep(backoff_time)
-                    continue
-                else:
-                    logger.error(f"❌ Failed to delete {lead.email} after {max_retries + 1} attempts: rate limiting")
-                    log_dead_letter("drain", lead.email, f"MULTI-DELETE {lead.id}", 401, "Rate limit exceeded")
-                    return False
-            else:
-                # Other error - don't retry
-                logger.error(f"❌ Failed to delete {lead.email}: {e}")
-                log_dead_letter("drain", lead.email, f"MULTI-DELETE {lead.id}", 500, str(e))
-                return False
-    
-    return False
+    except Exception as e:
+        logger.error(f"❌ Delete error for {lead.email}: {e}")
+        log_dead_letter("drain", lead.email, f"DELETE {lead.id}", 0, str(e))
+        return False
 
 def delete_leads_from_instantly_enhanced(leads: List[InstantlyLead]) -> int:
     """Delete leads with enhanced rate limiting designed for DELETE operations."""

@@ -168,32 +168,43 @@ def delete_lead_from_instantly(lead: 'InstantlyLead') -> bool:
     """
     Delete a lead from Instantly using the official V2 DELETE endpoint.
     Follows API best practices: treats 404 as idempotent success.
+    Simplified to avoid retry wrapper conflicts.
     """
     if DRY_RUN:
         logger.info(f"🧪 DRY RUN: Would delete lead {lead.email} (ID: {lead.id})")
         return True
     
     try:
-        logger.debug(f"🔄 Deleting lead {lead.email} via official DELETE endpoint")
-        response = call_instantly_api(f'/api/v2/leads/{lead.id}', method='DELETE')
-        logger.info(f"✅ Successfully deleted {lead.email} from Instantly")
-        return True
+        logger.debug(f"🔄 Deleting lead {lead.email} via DELETE /api/v2/leads/{lead.id}")
         
-    except requests.exceptions.HTTPError as e:
-        if e.response and e.response.status_code == 404:
+        # Use direct requests to avoid any wrapper issues
+        headers = {
+            'Authorization': f'Bearer {INSTANTLY_API_KEY}',
+            'Accept': 'application/json'
+        }
+        
+        response = requests.delete(
+            f"{INSTANTLY_BASE_URL}/api/v2/leads/{lead.id}",
+            headers=headers,
+            timeout=30
+        )
+        
+        if response.status_code in [200, 204]:
+            logger.info(f"✅ Successfully deleted {lead.email} from Instantly")
+            return True
+        elif response.status_code == 404:
             # 404 means lead is already gone - treat as successful idempotent operation
             logger.info(f"✅ Lead {lead.email} already deleted (404 = idempotent success)")
             return True
-        elif e.response and e.response.status_code == 429:
+        elif response.status_code == 429:
             # 429 means rate limited - this is a recoverable error
             logger.warning(f"⚠️ Rate limited deleting {lead.email} - API suggests slowing down")
-            log_dead_letter('delete_lead_rate_limit', lead.email, lead.id, 429, str(e))
-            return False  # Caller should retry with longer delays
+            log_dead_letter('delete_lead_rate_limit', lead.email, lead.id, 429, response.text)
+            return False
         else:
             # Other HTTP errors are actual failures
-            status_code = e.response.status_code if e.response else 0
-            logger.error(f"❌ HTTP error deleting {lead.email}: {status_code} - {e}")
-            log_dead_letter('delete_lead', lead.email, lead.id, status_code, str(e))
+            logger.error(f"❌ HTTP error deleting {lead.email}: {response.status_code} - {response.text}")
+            log_dead_letter('delete_lead', lead.email, lead.id, response.status_code, response.text)
             return False
             
     except Exception as e:
@@ -742,8 +753,24 @@ def get_finished_leads() -> List[InstantlyLead]:
                 logger.info(f"🧪 Stopping campaign processing due to test limit ({total_leads_evaluated} leads evaluated)")
                 break
         
-        logger.info(f"✅ DRAIN: Found {len(finished_leads)} leads to drain across all campaigns")
-        return finished_leads
+        # DEDUPLICATE LEADS: Same email can appear in multiple campaigns but has single lead ID
+        unique_leads = {}
+        duplicate_count = 0
+        
+        for lead in finished_leads:
+            if lead.email in unique_leads:
+                duplicate_count += 1
+                logger.debug(f"🔄 Skipping duplicate lead: {lead.email} (already found with ID {unique_leads[lead.email].id})")
+            else:
+                unique_leads[lead.email] = lead
+        
+        deduplicated_leads = list(unique_leads.values())
+        
+        if duplicate_count > 0:
+            logger.info(f"🔄 Deduplicated {duplicate_count} duplicate leads - {len(deduplicated_leads)} unique leads to drain")
+        
+        logger.info(f"✅ DRAIN: Found {len(deduplicated_leads)} unique leads to drain across all campaigns")
+        return deduplicated_leads
         
     except Exception as e:
         logger.error(f"❌ Failed to get finished leads: {e}")
