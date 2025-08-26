@@ -743,7 +743,7 @@ def get_finished_leads() -> List[InstantlyLead]:
                                 keep_reason = classification['keep_reason']
                                 status = lead.get('status', 0)
                                 
-                                if 'auto-reply' in keep_reason.lower() or 'auto_reply' in classification.get('auto_reply', False):
+                                if 'auto-reply' in keep_reason.lower() or classification.get('auto_reply', False):
                                     drain_reasons['auto_reply_detected'] += 1
                                     logger.debug(f"🤖 KEEP: {email} → auto-reply detected | {keep_reason}")
                                 elif status == 1:
