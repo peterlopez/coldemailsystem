@@ -603,6 +603,10 @@ def get_finished_leads() -> List[InstantlyLead]:
         total_leads_evaluated = 0  # Track total across all campaigns
         reached_test_limit = False  # Flag to break out of nested loops
         
+        # ACCURATE TRACKING: Track unique leads evaluated across all campaigns
+        global_unique_leads_evaluated = set()  # Track unique lead IDs evaluated
+        global_unique_leads_to_drain = set()   # Track unique emails to drain
+        
         # ENHANCED TRACKING: Count drain reasons for visibility
         drain_reasons = {
             'replied': 0,
@@ -714,6 +718,9 @@ def get_finished_leads() -> List[InstantlyLead]:
                             leads_needing_check += 1
                             total_leads_evaluated += 1
                             
+                            # ACCURATE TRACKING: Track unique leads evaluated
+                            global_unique_leads_evaluated.add(lead_id)
+                            
                             # Check testing limit
                             if MAX_LEADS_TO_EVALUATE > 0 and total_leads_evaluated > MAX_LEADS_TO_EVALUATE:
                                 logger.info(f"🧪 TESTING LIMIT REACHED: Evaluated {total_leads_evaluated} leads, stopping")
@@ -732,6 +739,9 @@ def get_finished_leads() -> List[InstantlyLead]:
                                     status=classification['drain_reason']
                                 )
                                 finished_leads.append(instantly_lead)
+                                
+                                # ACCURATE TRACKING: Track unique emails to drain
+                                global_unique_leads_to_drain.add(email)
                                 
                                 # ENHANCED LOGGING: Track drain reason with details (type safe)
                                 drain_reason = classification.get('drain_reason', 'unknown')
@@ -841,32 +851,34 @@ def get_finished_leads() -> List[InstantlyLead]:
         if duplicate_count > 0:
             logger.info(f"🔄 Deduplicated {duplicate_count} duplicate leads - {len(deduplicated_leads)} unique leads to drain")
         
-        # ENHANCED LOGGING: Summary of drain analysis results
+        # ENHANCED LOGGING: Summary of drain analysis results with ACCURATE counts
         logger.info("=" * 60)
         logger.info("📊 DRAIN ANALYSIS SUMMARY")
         logger.info("=" * 60)
-        logger.info(f"📋 Total leads analyzed: {total_leads_evaluated}")
-        logger.info(f"🗑️ Total leads to drain: {len(deduplicated_leads)}")
-        logger.info(f"📈 Drain rate: {(len(deduplicated_leads)/max(total_leads_evaluated,1)*100):.1f}%")
+        logger.info(f"📋 Total unique leads evaluated: {len(global_unique_leads_evaluated)}")
+        logger.info(f"📋 Total evaluations performed: {total_leads_evaluated} (includes re-evaluations due to pagination)")
+        logger.info(f"🗑️ Total unique emails to drain: {len(global_unique_leads_to_drain)}")
+        logger.info(f"🗑️ Final leads to drain (after dedup): {len(deduplicated_leads)}")
+        logger.info(f"📈 Drain rate: {(len(deduplicated_leads)/max(len(global_unique_leads_evaluated),1)*100):.1f}%")
         logger.info("")
         
         # Show breakdown of drain reasons
         drains_found = sum(drain_reasons[reason] for reason in ['replied', 'completed', 'bounced_hard', 'unsubscribed', 'stale_active'])
         if drains_found > 0:
-            logger.info("🗑️ DRAIN REASONS BREAKDOWN:")
+            logger.info("🗑️ DRAIN REASONS BREAKDOWN (includes duplicates from pagination):")
             for reason in ['replied', 'completed', 'bounced_hard', 'unsubscribed', 'stale_active']:
                 if drain_reasons[reason] > 0:
-                    logger.info(f"   • {reason}: {drain_reasons[reason]} leads")
+                    logger.info(f"   • {reason}: {drain_reasons[reason]} evaluations")
             logger.info("")
         
         # Show breakdown of keep reasons  
         keeps_found = sum(drain_reasons[reason] for reason in ['auto_reply_detected', 'kept_active', 'kept_paused', 'kept_other'])
         if keeps_found > 0:
-            logger.info("⏸️ KEEP REASONS BREAKDOWN:")
+            logger.info("⏸️ KEEP REASONS BREAKDOWN (includes duplicates from pagination):")
             for reason in ['auto_reply_detected', 'kept_active', 'kept_paused', 'kept_other']:
                 if drain_reasons[reason] > 0:
                     reason_display = reason.replace('kept_', '').replace('_', ' ').title()
-                    logger.info(f"   • {reason_display}: {drain_reasons[reason]} leads")
+                    logger.info(f"   • {reason_display}: {drain_reasons[reason]} evaluations")
             logger.info("")
         
         logger.info(f"✅ DRAIN: Found {len(deduplicated_leads)} unique leads to drain across all campaigns")
