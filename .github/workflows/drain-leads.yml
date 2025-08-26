@@ -147,7 +147,7 @@ jobs:
           
           # Testing configuration - limit leads processed for faster testing
           MAX_LEADS_TO_EVALUATE: 0  # Process all leads (0 = no limit)
-          MAX_PAGES_TO_PROCESS: 5   # Limit to 5 pages for testing (0 = no limit)
+          MAX_PAGES_TO_PROCESS: 10  # Limit to 10 pages for testing (0 = no limit)
           FORCE_DRAIN_CHECK: true   # Skip 24hr check for testing (bypass timestamp filtering)
           
           # Python path
