@@ -457,9 +457,10 @@ def classify_lead_for_drain(lead: dict, campaign_name: str) -> dict:
     """
     Classify a lead from Instantly API to determine if it should be drained.
     
+    Enhanced with auto-reply detection using the pause_until field.
     Based on approved drain logic:
-    - Trust Instantly's OOO detection (stop_on_auto_reply=false)
-    - Use status codes to differentiate replies 
+    - Use pause_until field to detect auto-replies (OOO messages)
+    - Use status codes to differentiate genuine replies from auto-replies
     - 7-day grace period for delivery issues
     - Allow bounced emails to retry later
     """
@@ -468,7 +469,11 @@ def classify_lead_for_drain(lead: dict, campaign_name: str) -> dict:
         status = lead.get('status', 0)  # Status code from Instantly
         esp_code = lead.get('esp_code', 0)  # Email service provider code
         email_reply_count = lead.get('email_reply_count', 0)
-        created_at = lead.get('created_at')
+        created_at = lead.get('timestamp_created')  # Use correct timestamp field
+        
+        # NEW: Check for auto-reply indicators in payload
+        payload = lead.get('payload', {})
+        pause_until = payload.get('pause_until') if payload else None
         
         # Parse creation date for time-based decisions
         days_since_created = 0
@@ -480,17 +485,29 @@ def classify_lead_for_drain(lead: dict, campaign_name: str) -> dict:
             except:
                 days_since_created = 0
         
-        # DRAIN DECISION LOGIC (based on approved plan)
+        # ENHANCED DRAIN DECISION LOGIC
         
-        # 1. Status 3 = Processed/Finished leads
+        # 1. Status 3 = Processed/Finished leads - CHECK FOR AUTO-REPLIES FIRST
         if status == 3:
             if email_reply_count > 0:
-                # Trust Instantly's reply detection (they handle OOO filtering)
-                return {
-                    'should_drain': True,
-                    'drain_reason': 'replied',
-                    'details': f'Status 3 with {email_reply_count} replies - genuine engagement'
-                }
+                # NEW: Check for auto-reply detection
+                if pause_until:
+                    # Auto-reply detected - do not drain as genuine engagement
+                    logger.debug(f"🤖 Auto-reply detected for {email}: paused until {pause_until}")
+                    return {
+                        'should_drain': False,
+                        'keep_reason': f'Auto-reply detected (paused until {pause_until}) - not genuine engagement',
+                        'auto_reply': True
+                    }
+                else:
+                    # No auto-reply indicators - genuine engagement
+                    logger.debug(f"👤 Genuine reply detected for {email}: no auto-reply flags")
+                    return {
+                        'should_drain': True,
+                        'drain_reason': 'replied',
+                        'details': f'Status 3 with {email_reply_count} replies - genuine engagement (no auto-reply flags)',
+                        'auto_reply': False
+                    }
             else:
                 # Sequence completed without replies
                 return {
@@ -499,8 +516,17 @@ def classify_lead_for_drain(lead: dict, campaign_name: str) -> dict:
                     'details': 'Sequence completed without replies'
                 }
         
-        # 2. ESP Code analysis for email delivery issues
-        if esp_code in [550, 551, 553]:  # Hard bounces
+        # 2. Status 1 with replies and pause_until - auto-replies that didn't stop sequence
+        elif status == 1 and email_reply_count > 0 and pause_until:
+            logger.debug(f"🤖 Active auto-reply for {email}: Status 1 + replies + paused until {pause_until}")
+            return {
+                'should_drain': False,
+                'keep_reason': f'Active lead with auto-reply (paused until {pause_until}) - sequence will continue',
+                'auto_reply': True
+            }
+        
+        # 3. ESP Code analysis for email delivery issues
+        elif esp_code in [550, 551, 553]:  # Hard bounces
             if days_since_created >= 7:  # 7-day grace period
                 return {
                     'should_drain': True,
@@ -513,23 +539,22 @@ def classify_lead_for_drain(lead: dict, campaign_name: str) -> dict:
                     'keep_reason': f'Recent hard bounce (ESP {esp_code}), within 7-day grace period'
                 }
         
-        if esp_code in [421, 450, 451]:  # Soft bounces
-            if days_since_created >= 7:  # Allow retry period
-                return {
-                    'should_drain': False,
-                    'keep_reason': f'Soft bounce (ESP {esp_code}) - keeping for retry'
-                }
+        elif esp_code in [421, 450, 451]:  # Soft bounces
+            return {
+                'should_drain': False,
+                'keep_reason': f'Soft bounce (ESP {esp_code}) - keeping for retry'
+            }
         
-        # 3. Unsubscribes (if available in API data)
-        if 'unsubscribed' in str(lead.get('status_text', '')).lower():
+        # 4. Unsubscribes (if available in API data)
+        elif 'unsubscribed' in str(lead.get('status_text', '')).lower():
             return {
                 'should_drain': True,
                 'drain_reason': 'unsubscribed',
                 'details': 'Lead unsubscribed from campaign'
             }
         
-        # 4. Very old active leads (90+ days) - potential stuck leads
-        if status == 1 and days_since_created >= 90:
+        # 5. Very old active leads (90+ days) - potential stuck leads
+        elif status == 1 and days_since_created >= 90:
             return {
                 'should_drain': True,
                 'drain_reason': 'stale_active',
@@ -537,10 +562,11 @@ def classify_lead_for_drain(lead: dict, campaign_name: str) -> dict:
             }
         
         # DEFAULT: Keep active leads (Status 1) and recent leads
-        return {
-            'should_drain': False,
-            'keep_reason': f'Active lead (Status {status}) - {days_since_created} days old'
-        }
+        else:
+            return {
+                'should_drain': False,
+                'keep_reason': f'Active lead (Status {status}) - {days_since_created} days old'
+            }
         
     except Exception as e:
         logger.error(f"Error classifying lead {lead.get('email', 'unknown')}: {e}")
