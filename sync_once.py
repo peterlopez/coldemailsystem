@@ -733,17 +733,22 @@ def get_finished_leads() -> List[InstantlyLead]:
                                 )
                                 finished_leads.append(instantly_lead)
                                 
-                                # ENHANCED LOGGING: Track drain reason with details
-                                drain_reason = classification['drain_reason']
-                                drain_reasons[drain_reason] += 1
+                                # ENHANCED LOGGING: Track drain reason with details (type safe)
+                                drain_reason = classification.get('drain_reason', 'unknown')
+                                drain_reasons[drain_reason] = drain_reasons.get(drain_reason, 0) + 1
                                 
-                                logger.info(f"🗑️ DRAIN: {email} → {drain_reason} | {classification.get('details', '')}")
+                                details = classification.get('details', '')
+                                logger.info(f"🗑️ DRAIN: {email} → {drain_reason} | {details}")
                             else:
-                                # ENHANCED LOGGING: Track keep reasons
-                                keep_reason = classification['keep_reason']
+                                # ENHANCED LOGGING: Track keep reasons with type safety
+                                keep_reason = str(classification.get('keep_reason', 'unknown reason'))
                                 status = lead.get('status', 0)
                                 
-                                if 'auto-reply' in keep_reason.lower() or classification.get('auto_reply', False):
+                                # Safe string checking for auto-reply detection
+                                is_auto_reply = ('auto-reply' in keep_reason.lower() if isinstance(keep_reason, str) else False) or \
+                                               classification.get('auto_reply', False) == True
+                                
+                                if is_auto_reply:
                                     drain_reasons['auto_reply_detected'] += 1
                                     logger.debug(f"🤖 KEEP: {email} → auto-reply detected | {keep_reason}")
                                 elif status == 1:
