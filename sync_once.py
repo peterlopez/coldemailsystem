@@ -457,12 +457,10 @@ def classify_lead_for_drain(lead: dict, campaign_name: str) -> dict:
     """
     Classify a lead from Instantly API to determine if it should be drained.
     
-    Enhanced with auto-reply detection using the pause_until field.
-    Based on approved drain logic:
-    - Use pause_until field to detect auto-replies (OOO messages)
-    - Use status codes to differentiate genuine replies from auto-replies
-    - 7-day grace period for delivery issues
-    - Allow bounced emails to retry later
+    BALANCED APPROACH: 
+    - Trust Instantly's sequence management for normal operations
+    - But include 90-day safety net for truly stuck leads
+    - Enhanced auto-reply detection using pause_until field
     """
     try:
         email = lead.get('email', 'unknown')
@@ -485,12 +483,12 @@ def classify_lead_for_drain(lead: dict, campaign_name: str) -> dict:
             except:
                 days_since_created = 0
         
-        # ENHANCED DRAIN DECISION LOGIC
+        # BALANCED DRAIN DECISION LOGIC
         
-        # 1. Status 3 = Processed/Finished leads - CHECK FOR AUTO-REPLIES FIRST
+        # 1. ONLY drain Status 3 (Finished) leads - Instantly has decided they're done
         if status == 3:
             if email_reply_count > 0:
-                # NEW: Check for auto-reply detection
+                # Check for auto-reply detection
                 if pause_until:
                     # Auto-reply detected - do not drain as genuine engagement
                     logger.debug(f"🤖 Auto-reply detected for {email}: paused until {pause_until}")
@@ -516,22 +514,31 @@ def classify_lead_for_drain(lead: dict, campaign_name: str) -> dict:
                     'details': 'Sequence completed without replies'
                 }
         
-        # 2. Status 1 with replies and pause_until - auto-replies that didn't stop sequence
-        elif status == 1 and email_reply_count > 0 and pause_until:
-            logger.debug(f"🤖 Active auto-reply for {email}: Status 1 + replies + paused until {pause_until}")
+        # 2. Status 1/2 with auto-replies - keep but log auto-reply detection
+        elif (status == 1 or status == 2) and email_reply_count > 0 and pause_until:
+            logger.debug(f"🤖 Auto-reply for {email}: Status {status} + replies + paused until {pause_until}")
             return {
                 'should_drain': False,
-                'keep_reason': f'Active lead with auto-reply (paused until {pause_until}) - sequence will continue',
+                'keep_reason': f'Status {status} lead with auto-reply (paused until {pause_until}) - let Instantly manage sequence',
                 'auto_reply': True
             }
         
-        # 3. ESP Code analysis for email delivery issues
+        # 3. SAFETY NET: Very old active leads (90+ days) - trust Instantly but prevent stuck leads
+        elif status == 1 and days_since_created >= 90:
+            logger.debug(f"⚠️ Stale active lead detected: {email} - {days_since_created} days old")
+            return {
+                'should_drain': True,
+                'drain_reason': 'stale_active',
+                'details': f'Active lead stuck for {days_since_created} days - safety net for inventory management'
+            }
+        
+        # 4. CLEAR delivery failures only - hard bounces after grace period
         elif esp_code in [550, 551, 553]:  # Hard bounces
             if days_since_created >= 7:  # 7-day grace period
                 return {
                     'should_drain': True,
                     'drain_reason': 'bounced_hard',
-                    'details': f'Hard bounce (ESP {esp_code}) after {days_since_created} days'
+                    'details': f'Hard bounce (ESP {esp_code}) after {days_since_created} days - clear delivery failure'
                 }
             else:
                 return {
@@ -539,13 +546,14 @@ def classify_lead_for_drain(lead: dict, campaign_name: str) -> dict:
                     'keep_reason': f'Recent hard bounce (ESP {esp_code}), within 7-day grace period'
                 }
         
+        # 5. Soft bounces - always keep for retry (trust Instantly to manage)
         elif esp_code in [421, 450, 451]:  # Soft bounces
             return {
                 'should_drain': False,
-                'keep_reason': f'Soft bounce (ESP {esp_code}) - keeping for retry'
+                'keep_reason': f'Soft bounce (ESP {esp_code}) - letting Instantly manage retry'
             }
         
-        # 4. Unsubscribes (if available in API data)
+        # 6. Unsubscribes - clear signal to drain regardless of status
         elif 'unsubscribed' in str(lead.get('status_text', '')).lower():
             return {
                 'should_drain': True,
@@ -553,19 +561,20 @@ def classify_lead_for_drain(lead: dict, campaign_name: str) -> dict:
                 'details': 'Lead unsubscribed from campaign'
             }
         
-        # 5. Very old active leads (90+ days) - potential stuck leads
-        elif status == 1 and days_since_created >= 90:
-            return {
-                'should_drain': True,
-                'drain_reason': 'stale_active',
-                'details': f'Active lead stuck for {days_since_created} days'
-            }
-        
-        # DEFAULT: Keep active leads (Status 1) and recent leads
+        # DEFAULT: TRUST INSTANTLY'S STATUS MANAGEMENT (under 90 days)
+        # Status 1 (Active) = Instantly wants sequence to continue
+        # Status 2 (Paused) = Instantly may resume sequence  
+        # Any other status = Keep conservatively
         else:
+            status_description = {
+                1: "Active - sequence continuing",
+                2: "Paused - may resume", 
+                0: "Unknown status"
+            }.get(status, f"Status {status}")
+            
             return {
                 'should_drain': False,
-                'keep_reason': f'Active lead (Status {status}) - {days_since_created} days old'
+                'keep_reason': f'{status_description} - trusting Instantly\'s sequence management ({days_since_created} days old)'
             }
         
     except Exception as e:
