@@ -227,8 +227,8 @@ def batch_check_leads_for_drain(lead_ids: list) -> dict:
         if not lead_ids:
             return {}
         
-        # Process in smaller batches to avoid BigQuery timeouts
-        BIGQUERY_BATCH_SIZE = 50  # Smaller batches for BigQuery
+        # Process in optimized batches to handle larger API pages
+        BIGQUERY_BATCH_SIZE = 50  # Match API page size for efficiency
         all_results = {}
         
         for i in range(0, len(lead_ids), BIGQUERY_BATCH_SIZE):
@@ -250,11 +250,11 @@ def batch_check_leads_for_drain(lead_ids: list) -> dict:
                     query_parameters=[
                         bigquery.ArrayQueryParameter("lead_ids", "STRING", batch_ids),
                     ],
-                    job_timeout=30  # 30 second timeout per query
+                    job_timeout=60  # 60 second timeout per query (increased for larger batches)
                 )
                 
                 query_job = bq_client.query(query, job_config=job_config)
-                results = list(query_job.result(timeout=30))  # 30 second result timeout
+                results = list(query_job.result(timeout=60))  # 60 second result timeout
                 
                 # Process batch results
                 found_lead_ids = set()
@@ -532,12 +532,15 @@ def get_finished_leads() -> List[InstantlyLead]:
             seen_lead_ids = set()
             consecutive_duplicate_pages = 0
             
+            # Rate limit retry tracking
+            consecutive_401_errors = 0
+            
             while True:
                 # Use proper cursor-based pagination
                 url = f"{INSTANTLY_BASE_URL}/api/v2/leads/list"
                 payload = {
                     "campaign_id": campaign_id,
-                    "limit": 100  # Get 100 leads per page instead of default 10
+                    "limit": 50  # Get 50 leads per page (conservative approach)
                 }
                 
                 if starting_after:
@@ -545,8 +548,8 @@ def get_finished_leads() -> List[InstantlyLead]:
                 
                 # RATE LIMITING: Add delay between API calls to prevent 401 errors
                 if page_count > 0:  # Don't delay the first call
-                    logger.debug(f"⏸️ Rate limiting: waiting 1 second before next API call...")
-                    time.sleep(1.0)  # 1 second delay between pagination calls
+                    logger.debug(f"⏸️ Rate limiting: waiting 3 seconds before next API call...")
+                    time.sleep(3.0)  # 3 second delay between pagination calls (increased for larger pages)
                 
                 response = requests.post(
                     url,
@@ -556,6 +559,9 @@ def get_finished_leads() -> List[InstantlyLead]:
                 )
                 
                 if response.status_code == 200:
+                    # Reset 401 counter on successful response
+                    consecutive_401_errors = 0
+                    
                     data = response.json()
                     leads = data.get('items', [])
                     
@@ -629,15 +635,22 @@ def get_finished_leads() -> List[InstantlyLead]:
                         break
                     
                     # Safety check to prevent infinite loops (now with proper limit)
-                    if page_count >= 30:  # Max 30 pages (3,000 leads per campaign with 100/page)
-                        logger.warning(f"⚠️ Reached safety limit of 30 pages for {campaign_name} (processed {total_leads_accessed} leads)")
+                    if page_count >= 60:  # Max 60 pages (3,000 leads per campaign with 50/page)
+                        logger.warning(f"⚠️ Reached safety limit of 60 pages for {campaign_name} (processed {total_leads_accessed} leads)")
                         break
                 
                 elif response.status_code == 401:
-                    # Rate limiting likely cause of 401 errors
-                    logger.warning(f"⚠️ Got 401 error (likely rate limiting) for {campaign_name} on page {page_count + 1}")
-                    logger.info(f"💤 Backing off for 5 seconds before retry...")
-                    time.sleep(5.0)  # Longer backoff for 401 errors
+                    # Rate limiting likely cause of 401 errors - be more aggressive with backoff
+                    consecutive_401_errors += 1
+                    
+                    if consecutive_401_errors >= 5:
+                        logger.error(f"❌ Too many consecutive 401 errors ({consecutive_401_errors}) for {campaign_name} - stopping pagination")
+                        break
+                    
+                    backoff_time = min(10 * consecutive_401_errors, 60)  # 10s, 20s, 30s, 40s, 60s max
+                    logger.warning(f"⚠️ Got 401 error #{consecutive_401_errors} (likely rate limiting) for {campaign_name} on page {page_count + 1}")
+                    logger.info(f"💤 Backing off for {backoff_time} seconds before retry...")
+                    time.sleep(backoff_time)
                     continue  # Retry the same page
                     
                 else:
