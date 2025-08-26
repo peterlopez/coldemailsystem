@@ -322,10 +322,16 @@ def batch_check_leads_for_drain(lead_ids: list) -> dict:
                         logger.debug(f"⏰ Lead {lead_id} checked {row.hours_since_check} hours ago - skipping")
                 
                 # Any lead IDs not found in the database need first-time check
+                untracked_leads = []
                 for lead_id in batch_ids:
                     if lead_id not in found_lead_ids:
                         all_results[lead_id] = True
+                        untracked_leads.append(lead_id)
                         logger.debug(f"📝 Lead {lead_id} not in tracking - needs first drain check")
+                
+                # Log summary of untracked leads (these are leads in Instantly but not in our BigQuery table)
+                if untracked_leads:
+                    logger.info(f"🔍 Found {len(untracked_leads)} leads in Instantly not tracked in BigQuery - will evaluate for drain")
                         
             except Exception as batch_error:
                 logger.error(f"❌ BigQuery batch failed: {batch_error}")
@@ -426,9 +432,8 @@ def batch_update_drain_timestamps(lead_ids: list) -> bool:
                 
             except Exception as batch_error:
                 logger.error(f"❌ Batch timestamp update failed: {batch_error}")
-                # Fall back to individual updates for this batch
-                for lead_id in batch_ids:
-                    update_lead_drain_check_timestamp(lead_id)
+                # Skip individual fallback - timestamp updates are not critical for drain functionality
+                logger.info(f"⏭️ Skipping timestamp updates for batch due to error - drain will continue")
         
         return True
         
@@ -721,6 +726,7 @@ def get_finished_leads() -> List[InstantlyLead]:
                     logger.info(f"✅ Successfully updated timestamps for {len(leads_to_update_timestamps)} leads")
                 except Exception as timestamp_error:
                     logger.error(f"❌ Batch timestamp update failed: {timestamp_error}")
+                    logger.info(f"⏭️ Continuing drain process - timestamp updates are not critical for functionality")
                     # Continue processing - timestamp updates are not critical for drain functionality
             
             logger.info(f"📊 {campaign_name} campaign: accessed {total_leads_accessed} leads ({len(seen_lead_ids)} unique) in {page_count} pages")
