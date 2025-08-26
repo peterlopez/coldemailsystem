@@ -357,18 +357,11 @@ def update_lead_drain_check_timestamp(lead_id: str) -> bool:
         if not lead_id:
             return False
         
-        # Update timestamp using MERGE to handle both insert and update cases with timeout
+        # Update timestamp - only update existing records, don't create new ones
         query = """
-        MERGE `instant-ground-394115.email_analytics.ops_inst_state` AS target
-        USING (
-            SELECT @lead_id as instantly_lead_id, CURRENT_TIMESTAMP() as check_time
-        ) AS source
-        ON target.instantly_lead_id = source.instantly_lead_id
-        WHEN MATCHED THEN
-            UPDATE SET last_drain_check = source.check_time, updated_at = source.check_time
-        WHEN NOT MATCHED THEN
-            INSERT (instantly_lead_id, last_drain_check, added_at, updated_at)
-            VALUES (source.instantly_lead_id, source.check_time, source.check_time, source.check_time)
+        UPDATE `instant-ground-394115.email_analytics.ops_inst_state`
+        SET last_drain_check = CURRENT_TIMESTAMP(), updated_at = CURRENT_TIMESTAMP()
+        WHERE instantly_lead_id = @lead_id
         """
         
         job_config = bigquery.QueryJobConfig(
@@ -411,19 +404,11 @@ def batch_update_drain_timestamps(lead_ids: list) -> bool:
             logger.debug(f"📊 Batch updating timestamps: batch {i//BATCH_SIZE + 1}, {len(batch_ids)} leads")
             
             try:
-                # Create batch update query
+                # Create batch update query - only update existing records, don't insert new ones
                 query = """
-                MERGE `instant-ground-394115.email_analytics.ops_inst_state` AS target
-                USING (
-                    SELECT lead_id as instantly_lead_id, CURRENT_TIMESTAMP() as check_time
-                    FROM UNNEST(@lead_ids) AS lead_id
-                ) AS source
-                ON target.instantly_lead_id = source.instantly_lead_id
-                WHEN MATCHED THEN
-                    UPDATE SET last_drain_check = source.check_time, updated_at = source.check_time
-                WHEN NOT MATCHED THEN
-                    INSERT (instantly_lead_id, last_drain_check, added_at, updated_at)
-                    VALUES (source.instantly_lead_id, source.check_time, source.check_time, source.check_time)
+                UPDATE `instant-ground-394115.email_analytics.ops_inst_state`
+                SET last_drain_check = CURRENT_TIMESTAMP(), updated_at = CURRENT_TIMESTAMP()
+                WHERE instantly_lead_id IN UNNEST(@lead_ids)
                 """
                 
                 job_config = bigquery.QueryJobConfig(
