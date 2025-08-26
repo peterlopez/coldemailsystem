@@ -19,16 +19,7 @@ import requests
 from google.cloud import bigquery
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-# Import notification system
-try:
-    from cold_email_notifier import notifier
-    NOTIFICATIONS_AVAILABLE = True
-    logger.info("📡 Notification system loaded")
-except ImportError as e:
-    NOTIFICATIONS_AVAILABLE = False
-    logger.warning(f"📴 Notification system not available: {e}")
-
-# Configure logging
+# Configure logging FIRST
 log_format = '%(asctime)s - %(levelname)s - %(message)s'
 
 # Configure logging to both console and file
@@ -47,6 +38,15 @@ logging.basicConfig(
     handlers=log_handlers
 )
 logger = logging.getLogger(__name__)
+
+# Import notification system AFTER logger is configured
+try:
+    from cold_email_notifier import notifier
+    NOTIFICATIONS_AVAILABLE = True
+    logger.info("📡 Notification system loaded")
+except ImportError as e:
+    NOTIFICATIONS_AVAILABLE = False
+    logger.warning(f"📴 Notification system not available: {e}")
 
 # Configuration from environment
 PROJECT_ID = "instant-ground-394115"
