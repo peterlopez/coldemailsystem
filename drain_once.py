@@ -46,11 +46,25 @@ def delete_leads_from_instantly_enhanced(leads: List[InstantlyLead]) -> int:
     
     logger.info(f"🗑️ Starting enhanced deletion of {len(leads)} leads...")
     
+    # ENHANCED LOGGING: Track deletion reasons
+    deletion_reasons = {}
+    for lead in leads:
+        reason = lead.status if hasattr(lead, 'status') and lead.status else 'unknown'
+        deletion_reasons[reason] = deletion_reasons.get(reason, 0) + 1
+    
+    # Show what we're about to delete
+    logger.info("🗑️ DELETION BREAKDOWN:")
+    for reason, count in deletion_reasons.items():
+        logger.info(f"   • {reason}: {count} leads")
+    logger.info("")
+    
     DELETE_DELAY = 3.0  # 3 seconds between each DELETE call (aggressive rate limiting)
     successful_deletions = 0
+    failed_deletions = 0
     
     for i, lead in enumerate(leads):
-        logger.info(f"🗑️ Deleting lead {i+1}/{len(leads)}: {lead.email}")
+        reason = lead.status if hasattr(lead, 'status') and lead.status else 'unknown'
+        logger.info(f"🗑️ Deleting {i+1}/{len(leads)}: {lead.email} → {reason}")
         
         # Rate limiting delay (except for first lead)
         if i > 0:
@@ -60,10 +74,21 @@ def delete_leads_from_instantly_enhanced(leads: List[InstantlyLead]) -> int:
         # Attempt deletion with retry
         if delete_single_lead_with_retry(lead):
             successful_deletions += 1
+            logger.info(f"   ✅ SUCCESS: {lead.email} deleted")
         else:
-            logger.warning(f"⚠️ Skipping failed deletion for {lead.email}, continuing with batch...")
+            failed_deletions += 1
+            logger.warning(f"   ❌ FAILED: {lead.email} deletion failed")
     
-    logger.info(f"✅ Enhanced deletion complete: {successful_deletions}/{len(leads)} successful")
+    # ENHANCED LOGGING: Summary of deletion results
+    logger.info("=" * 60)
+    logger.info("🗑️ DELETION RESULTS SUMMARY")
+    logger.info("=" * 60)
+    logger.info(f"📋 Total deletion attempts: {len(leads)}")
+    logger.info(f"✅ Successful deletions: {successful_deletions}")
+    logger.info(f"❌ Failed deletions: {failed_deletions}")
+    logger.info(f"📈 Success rate: {(successful_deletions/max(len(leads),1)*100):.1f}%")
+    logger.info("=" * 60)
+    
     return successful_deletions
 
 def drain_finished_leads_enhanced() -> int:
