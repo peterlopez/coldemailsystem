@@ -146,7 +146,7 @@ jobs:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           
           # Testing configuration - limit leads processed for faster testing
-          MAX_LEADS_TO_EVALUATE: 200  # Process only 200 leads for testing
+          MAX_LEADS_TO_EVALUATE: 0  # Process all leads (0 = no limit)
           
           # Python path
           PYTHONPATH: .

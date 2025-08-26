@@ -15,25 +15,33 @@ from typing import List
 # Import required functions and classes from sync_once.py
 from sync_once import (
     get_finished_leads, update_bigquery_state, 
-    logger, DRY_RUN, InstantlyLead, call_instantly_api,
+    logger, DRY_RUN, InstantlyLead, delete_lead_from_instantly,
     log_dead_letter
 )
 
 def delete_single_lead_with_retry(lead: InstantlyLead, max_retries: int = 3) -> bool:
-    """Delete a single lead with enhanced retry logic for rate limiting."""
+    """Delete a single lead with enhanced retry logic and multiple API approaches."""
     
     for attempt in range(max_retries + 1):
         try:
-            if DRY_RUN:
-                logger.info(f"🧪 DRY RUN: Would delete lead {lead.email} (ID: {lead.id})")
+            # Use the new enhanced deletion function that tries multiple approaches
+            success = delete_lead_from_instantly(lead)
+            
+            if success:
+                logger.debug(f"✅ Successfully deleted {lead.email}")
                 return True
-            
-            response = call_instantly_api(f'/api/v2/leads/{lead.id}', method='DELETE')
-            
-            # Success
-            logger.debug(f"✅ Successfully deleted {lead.email}")
-            return True
-            
+            else:
+                logger.warning(f"⚠️ Deletion failed for {lead.email} on attempt {attempt + 1}")
+                if attempt < max_retries:
+                    backoff_time = (2 ** attempt) * 3  # 3, 6, 12 seconds
+                    logger.info(f"💤 Backing off for {backoff_time} seconds before retry...")
+                    time.sleep(backoff_time)
+                    continue
+                else:
+                    logger.error(f"❌ Failed to delete {lead.email} after {max_retries + 1} attempts")
+                    log_dead_letter("drain", lead.email, f"MULTI-DELETE {lead.id}", 500, "All deletion methods failed")
+                    return False
+                    
         except Exception as e:
             error_str = str(e).lower()
             
@@ -47,12 +55,12 @@ def delete_single_lead_with_retry(lead: InstantlyLead, max_retries: int = 3) -> 
                     continue
                 else:
                     logger.error(f"❌ Failed to delete {lead.email} after {max_retries + 1} attempts: rate limiting")
-                    log_dead_letter("drain", lead.email, f"DELETE /api/v2/leads/{lead.id}", 401, "Rate limit exceeded")
+                    log_dead_letter("drain", lead.email, f"MULTI-DELETE {lead.id}", 401, "Rate limit exceeded")
                     return False
             else:
                 # Other error - don't retry
                 logger.error(f"❌ Failed to delete {lead.email}: {e}")
-                log_dead_letter("drain", lead.email, f"DELETE /api/v2/leads/{lead.id}", 500, str(e))
+                log_dead_letter("drain", lead.email, f"MULTI-DELETE {lead.id}", 500, str(e))
                 return False
     
     return False

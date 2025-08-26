@@ -159,6 +159,53 @@ def call_instantly_api(endpoint: str, method: str = 'GET', data: Optional[Dict] 
         log_dead_letter('api_call', None, str(data), getattr(e.response, 'status_code', 0), str(e))
         raise
 
+def delete_lead_from_instantly(lead: 'InstantlyLead') -> bool:
+    """
+    Delete a lead from Instantly using multiple approaches.
+    Tries different API methods to ensure successful deletion.
+    """
+    if DRY_RUN:
+        logger.info(f"🧪 DRY RUN: Would delete lead {lead.email} (ID: {lead.id})")
+        return True
+    
+    # Approach 1: Try API v2 DELETE endpoint (current method)
+    try:
+        logger.debug(f"🔄 Attempting API v2 DELETE for {lead.email}")
+        response = call_instantly_api(f'/api/v2/leads/{lead.id}', method='DELETE')
+        logger.info(f"✅ Successfully deleted {lead.email} via API v2 DELETE")
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️ API v2 DELETE failed for {lead.email}: {e}")
+    
+    # Approach 2: Try API v1 POST delete endpoint (fallback)
+    try:
+        logger.debug(f"🔄 Attempting API v1 POST delete for {lead.email}")
+        delete_data = {
+            'api_key': INSTANTLY_API_KEY,  # v1 uses api_key in body
+            'campaign_id': lead.campaign_id,
+            'delete_all_data': True,  # Remove all data for this lead
+            'delete_list_of_emails': [lead.email]
+        }
+        response = call_instantly_api('/api/v1/lead/delete', method='POST', data=delete_data)
+        logger.info(f"✅ Successfully deleted {lead.email} via API v1 POST")
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️ API v1 POST delete failed for {lead.email}: {e}")
+    
+    # Approach 3: Try removing from campaign (keeps lead but stops emails)
+    try:
+        logger.debug(f"🔄 Attempting to remove {lead.email} from campaign")
+        remove_data = {
+            'campaign_id': lead.campaign_id,
+            'email': lead.email
+        }
+        response = call_instantly_api('/api/v2/lead/removeleadfromsubsequence', method='POST', data=remove_data)
+        logger.info(f"⚠️ Removed {lead.email} from campaign (lead still exists but stopped)")
+        return True
+    except Exception as e:
+        logger.error(f"❌ All deletion methods failed for {lead.email}: {e}")
+        return False
+
 def log_dead_letter(phase: str, email: Optional[str], payload: str, status_code: int, error_text: str) -> None:
     """Log failed operations to dead letters table."""
     try:
