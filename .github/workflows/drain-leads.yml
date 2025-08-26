@@ -208,5 +208,6 @@ jobs:
           path: |
             *.log
             drain-workflow.log
+            cold-email-drain.log
           if-no-files-found: warn
           retention-days: 7

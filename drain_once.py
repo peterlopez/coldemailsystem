@@ -15,9 +15,37 @@ from typing import List
 # Import required functions and classes from sync_once.py
 from sync_once import (
     get_finished_leads, update_bigquery_state, 
-    logger, DRY_RUN, InstantlyLead, delete_lead_from_instantly,
+    DRY_RUN, InstantlyLead, delete_lead_from_instantly,
     log_dead_letter
 )
+
+# SEPARATE LOGGING CONFIGURATION FOR DRAIN WORKFLOW
+# Note: This creates a separate logger but imported functions still use sync logger
+log_format = '%(asctime)s - %(levelname)s - %(message)s'
+
+# Create separate logger for drain workflow  
+drain_logger = logging.getLogger('drain_workflow')
+drain_logger.setLevel(logging.INFO)
+
+# Remove any existing handlers to avoid conflicts
+drain_logger.handlers.clear()
+
+# Add console handler
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(logging.Formatter(log_format))
+drain_logger.addHandler(console_handler)
+
+# Add separate file handler for drain operations
+drain_file_handler = logging.FileHandler('cold-email-drain.log')
+drain_file_handler.setFormatter(logging.Formatter(log_format))
+drain_logger.addHandler(drain_file_handler)
+
+# Use this logger for drain-specific operations
+logger = drain_logger
+
+# INFO: Functions imported from sync_once.py will still use their original logger
+# This means get_finished_leads() logs will go to sync log, but our drain-specific
+# logs will go to drain log. This is actually a good separation of concerns.
 
 def delete_single_lead_with_retry(lead: InstantlyLead, max_retries: int = 1) -> bool:
     """Delete a single lead - simplified to avoid retry conflicts."""
