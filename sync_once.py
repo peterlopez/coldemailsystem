@@ -60,6 +60,9 @@ VERIFY_EMAILS_BEFORE_CREATION = os.getenv('VERIFY_EMAILS_BEFORE_CREATION', 'true
 VERIFICATION_VALID_STATUSES = ['valid', 'accept_all']  # Configurable valid statuses
 VERIFICATION_TIMEOUT = int(os.getenv('VERIFICATION_TIMEOUT', '10'))  # Max wait for pending
 
+# Drain testing configuration - limit total leads processed for testing
+MAX_LEADS_TO_EVALUATE = int(os.getenv('MAX_LEADS_TO_EVALUATE', '0'))  # 0 = no limit, set to 200 for testing
+
 # Instantly API configuration
 INSTANTLY_API_KEY = os.getenv('INSTANTLY_API_KEY')
 logger.info(f"Environment INSTANTLY_API_KEY present: {bool(INSTANTLY_API_KEY)}")
@@ -508,7 +511,12 @@ def get_finished_leads() -> List[InstantlyLead]:
     try:
         logger.info("🔄 DRAIN: Fetching finished leads from Instantly campaigns...")
         
+        if MAX_LEADS_TO_EVALUATE > 0:
+            logger.info(f"🧪 TESTING MODE: Limiting evaluation to {MAX_LEADS_TO_EVALUATE} leads total")
+        
         finished_leads = []
+        total_leads_evaluated = 0  # Track total across all campaigns
+        reached_test_limit = False  # Flag to break out of nested loops
         
         # Get leads from both campaigns using proper cursor pagination
         campaigns_to_check = [
@@ -605,6 +613,14 @@ def get_finished_leads() -> List[InstantlyLead]:
                         # Check if lead needs evaluation (from batch results)
                         if leads_check_results.get(lead_id, True):  # Default to True if not found
                             leads_needing_check += 1
+                            total_leads_evaluated += 1
+                            
+                            # Check testing limit
+                            if MAX_LEADS_TO_EVALUATE > 0 and total_leads_evaluated > MAX_LEADS_TO_EVALUATE:
+                                logger.info(f"🧪 TESTING LIMIT REACHED: Evaluated {total_leads_evaluated} leads, stopping")
+                                # Set flag to break out of all loops
+                                reached_test_limit = True
+                                break
                             
                             # Classify lead according to our approved drain logic
                             classification = classify_lead_for_drain(lead, campaign_name)
@@ -627,6 +643,11 @@ def get_finished_leads() -> List[InstantlyLead]:
                             
                         else:
                             logger.debug(f"⏰ Skipping recent check: {email} (checked within 24h)")
+                    
+                    # Break out of pagination loop if test limit reached
+                    if reached_test_limit:
+                        logger.info(f"🧪 Stopping pagination for {campaign_name} due to test limit")
+                        break
                     
                     # Get cursor for next page
                     starting_after = data.get('next_starting_after')
@@ -669,6 +690,11 @@ def get_finished_leads() -> List[InstantlyLead]:
             
             logger.info(f"📊 {campaign_name} campaign: accessed {total_leads_accessed} leads ({len(seen_lead_ids)} unique) in {page_count} pages")
             logger.info(f"📊 {campaign_name} campaign: {leads_needing_check} leads evaluated (24hr+ since last check)")
+            
+            # Break out of campaign loop if test limit reached
+            if reached_test_limit:
+                logger.info(f"🧪 Stopping campaign processing due to test limit ({total_leads_evaluated} leads evaluated)")
+                break
         
         logger.info(f"✅ DRAIN: Found {len(finished_leads)} leads to drain across all campaigns")
         return finished_leads

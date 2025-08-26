@@ -145,12 +145,16 @@ jobs:
           # Drain-specific configuration
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           
+          # Testing configuration - limit leads processed for faster testing
+          MAX_LEADS_TO_EVALUATE: 200  # Process only 200 leads for testing
+          
           # Python path
           PYTHONPATH: .
         
         run: |
           echo "🧹 Starting Enhanced Lead Drain Process" | tee -a drain-workflow.log
           echo "Dry run: $DRY_RUN" | tee -a drain-workflow.log
+          echo "Testing limit: $MAX_LEADS_TO_EVALUATE leads" | tee -a drain-workflow.log
           echo "Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" | tee -a drain-workflow.log
           echo "" | tee -a drain-workflow.log
           
