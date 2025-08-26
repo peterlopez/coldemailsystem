@@ -333,8 +333,8 @@ def update_lead_drain_check_timestamp(lead_id: str) -> bool:
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
                 bigquery.ScalarQueryParameter("lead_id", "STRING", lead_id),
-            ],
-            job_timeout=15  # 15 second timeout
+            ]
+            # Note: QueryJobConfig doesn't accept timeout parameters
         )
         
         query_job = bq_client.query(query, job_config=job_config)
@@ -388,8 +388,8 @@ def batch_update_drain_timestamps(lead_ids: list) -> bool:
                 job_config = bigquery.QueryJobConfig(
                     query_parameters=[
                         bigquery.ArrayQueryParameter("lead_ids", "STRING", batch_ids),
-                    ],
-                    job_timeout=30  # 30 second timeout per batch
+                    ]
+                    # Note: QueryJobConfig doesn't accept timeout parameters
                 )
                 
                 query_job = bq_client.query(query, job_config=job_config)
