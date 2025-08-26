@@ -145,10 +145,10 @@ jobs:
           # Drain-specific configuration
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           
-          # Testing configuration - limit leads processed for faster testing
+          # Production configuration - full processing with efficiency optimizations
           MAX_LEADS_TO_EVALUATE: 0  # Process all leads (0 = no limit)
-          MAX_PAGES_TO_PROCESS: 10  # Limit to 10 pages for testing (0 = no limit)
-          FORCE_DRAIN_CHECK: true   # Skip 24hr check for development testing
+          MAX_PAGES_TO_PROCESS: 0   # Process all pages (0 = no limit)
+          FORCE_DRAIN_CHECK: false  # Enable 24hr timestamp filtering for efficiency
           
           # Python path
           PYTHONPATH: .
