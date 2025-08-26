@@ -249,8 +249,8 @@ def batch_check_leads_for_drain(lead_ids: list) -> dict:
                 job_config = bigquery.QueryJobConfig(
                     query_parameters=[
                         bigquery.ArrayQueryParameter("lead_ids", "STRING", batch_ids),
-                    ],
-                    job_timeout_ms=60000  # 60 second timeout per query (60000ms)
+                    ]
+                    # Note: QueryJobConfig doesn't accept timeout parameters - use result() timeout instead
                 )
                 
                 query_job = bq_client.query(query, job_config=job_config)
