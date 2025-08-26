@@ -151,6 +151,9 @@ def call_instantly_api(endpoint: str, method: str = 'GET', data: Optional[Dict] 
             raise ValueError(f"Unsupported method: {method}")
         
         response.raise_for_status()
+        # Handle empty response for DELETE operations
+        if method == 'DELETE' and not response.content:
+            return {'success': True}
         return response.json()
     
     except requests.exceptions.RequestException as e:
@@ -161,57 +164,41 @@ def call_instantly_api(endpoint: str, method: str = 'GET', data: Optional[Dict] 
 
 def delete_lead_from_instantly(lead: 'InstantlyLead') -> bool:
     """
-    Delete a lead from Instantly using multiple V2 API approaches.
-    Tries different V2 endpoints to ensure successful deletion.
+    Delete a lead from Instantly using the official V2 DELETE endpoint.
+    Follows API best practices: treats 404 as idempotent success.
     """
     if DRY_RUN:
         logger.info(f"🧪 DRY RUN: Would delete lead {lead.email} (ID: {lead.id})")
         return True
     
-    # Approach 1: Try API v2 DELETE with plural endpoint
     try:
-        logger.debug(f"🔄 Attempting API v2 DELETE (plural) for {lead.email}")
+        logger.debug(f"🔄 Deleting lead {lead.email} via official DELETE endpoint")
         response = call_instantly_api(f'/api/v2/leads/{lead.id}', method='DELETE')
-        logger.info(f"✅ Successfully deleted {lead.email} via API v2 DELETE (plural)")
+        logger.info(f"✅ Successfully deleted {lead.email} from Instantly")
         return True
-    except Exception as e:
-        logger.warning(f"⚠️ API v2 DELETE (plural) failed for {lead.email}: {e}")
-    
-    # Approach 2: Try API v2 DELETE with singular endpoint  
-    try:
-        logger.debug(f"🔄 Attempting API v2 DELETE (singular) for {lead.email}")
-        response = call_instantly_api(f'/api/v2/lead/delete/{lead.id}', method='DELETE')
-        logger.info(f"✅ Successfully deleted {lead.email} via API v2 DELETE (singular)")
-        return True
-    except Exception as e:
-        logger.warning(f"⚠️ API v2 DELETE (singular) failed for {lead.email}: {e}")
         
-    # Approach 3: Try API v2 POST delete (some APIs use POST for delete operations)
-    try:
-        logger.debug(f"🔄 Attempting API v2 POST delete for {lead.email}")
-        delete_data = {'lead_id': lead.id}
-        response = call_instantly_api(f'/api/v2/lead/delete', method='POST', data=delete_data)
-        logger.info(f"✅ Successfully deleted {lead.email} via API v2 POST")
-        return True
+    except requests.exceptions.HTTPError as e:
+        if e.response and e.response.status_code == 404:
+            # 404 means lead is already gone - treat as successful idempotent operation
+            logger.info(f"✅ Lead {lead.email} already deleted (404 = idempotent success)")
+            return True
+        elif e.response and e.response.status_code == 429:
+            # 429 means rate limited - this is a recoverable error
+            logger.warning(f"⚠️ Rate limited deleting {lead.email} - API suggests slowing down")
+            log_dead_letter('delete_lead_rate_limit', lead.email, lead.id, 429, str(e))
+            return False  # Caller should retry with longer delays
+        else:
+            # Other HTTP errors are actual failures
+            status_code = e.response.status_code if e.response else 0
+            logger.error(f"❌ HTTP error deleting {lead.email}: {status_code} - {e}")
+            log_dead_letter('delete_lead', lead.email, lead.id, status_code, str(e))
+            return False
+            
     except Exception as e:
-        logger.warning(f"⚠️ API v2 POST delete failed for {lead.email}: {e}")
-    
-    # Approach 4: Try archiving/marking completed leads (Status 3 specific)
-    try:
-        logger.debug(f"🔄 Attempting to archive completed lead {lead.email}")
-        archive_data = {
-            'lead_id': lead.id,
-            'status': 'archived'  # Try marking as archived instead of deleting
-        }
-        response = call_instantly_api(f'/api/v2/lead/status', method='POST', data=archive_data)
-        logger.info(f"✅ Successfully archived {lead.email} via API v2 status update")
-        return True
-    except Exception as e:
-        logger.warning(f"⚠️ API v2 archive failed for {lead.email}: {e}")
-    
-    # All V2 methods failed
-    logger.error(f"❌ All V2 deletion methods failed for {lead.email}")
-    return False
+        # Non-HTTP errors (network, timeout, etc.)
+        logger.error(f"❌ Delete error for {lead.email}: {e}")
+        log_dead_letter('delete_lead', lead.email, lead.id, 0, str(e))
+        return False
 
 def log_dead_letter(phase: str, email: Optional[str], payload: str, status_code: int, error_text: str) -> None:
     """Log failed operations to dead letters table."""
@@ -853,26 +840,45 @@ def update_bigquery_state(leads: List[InstantlyLead]) -> None:
         log_dead_letter('bigquery_update_drain', None, json.dumps([l.__dict__ for l in leads]), 0, str(e))
 
 def delete_leads_from_instantly(leads: List[InstantlyLead]) -> None:
-    """Delete finished leads from Instantly to free inventory."""
+    """Delete finished leads from Instantly to free inventory with proper rate limiting."""
     if not leads:
         return
     
+    logger.info(f"🗑️ Deleting {len(leads)} leads from Instantly...")
+    successful_deletes = 0
+    failed_deletes = 0
+    
     try:
-        for lead in leads:
-            if DRY_RUN:
-                logger.info(f"DRY RUN: Would delete lead {lead.email} from Instantly")
-                continue
-                
-            try:
-                call_instantly_api(f'/api/v2/leads/{lead.id}', method='DELETE')
-                logger.info(f"Deleted lead {lead.email} from Instantly")
-                time.sleep(1)  # Rate limiting
-            except Exception as e:
-                logger.error(f"Failed to delete lead {lead.email}: {e}")
-                log_dead_letter('delete_lead', lead.email, lead.id, 0, str(e))
+        for i, lead in enumerate(leads, 1):
+            logger.debug(f"Deleting {i}/{len(leads)}: {lead.email}")
+            
+            # Use our improved single-lead delete function
+            success = delete_lead_from_instantly(lead)
+            
+            if success:
+                successful_deletes += 1
+            else:
+                failed_deletes += 1
+            
+            # Adaptive rate limiting: sleep between deletes (except for dry run and last item)
+            if not DRY_RUN and i < len(leads):
+                # Increase delay if we're seeing failures (could be rate limiting)
+                base_delay = 1.5
+                if failed_deletes > 0 and i > 5:  # After 5 deletes, if seeing failures
+                    adaptive_delay = min(base_delay * (1 + failed_deletes * 0.5), 10.0)  # Max 10s
+                    logger.debug(f"⏱️ Adaptive rate limiting: {adaptive_delay:.1f}s (failures: {failed_deletes})")
+                    time.sleep(adaptive_delay)
+                else:
+                    logger.debug("⏱️ Standard rate limiting: 1.5s between deletes")
+                    time.sleep(base_delay)
     
     except Exception as e:
-        logger.error(f"Failed to delete leads: {e}")
+        logger.error(f"❌ Batch delete operation failed: {e}")
+    
+    # Report batch results
+    logger.info(f"📊 Delete batch complete: {successful_deletes} successful, {failed_deletes} failed")
+    if failed_deletes > 0:
+        logger.warning(f"⚠️ {failed_deletes} leads failed to delete - check dead letters table")
 
 def drain_finished_leads() -> int:
     """Main drain function - remove completed/bounced/unsubscribed leads."""
