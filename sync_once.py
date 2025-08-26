@@ -535,7 +535,10 @@ def get_finished_leads() -> List[InstantlyLead]:
             while True:
                 # Use proper cursor-based pagination
                 url = f"{INSTANTLY_BASE_URL}/api/v2/leads/list"
-                payload = {"campaign_id": campaign_id}
+                payload = {
+                    "campaign_id": campaign_id,
+                    "limit": 100  # Get 100 leads per page instead of default 10
+                }
                 
                 if starting_after:
                     payload["starting_after"] = starting_after
@@ -626,8 +629,8 @@ def get_finished_leads() -> List[InstantlyLead]:
                         break
                     
                     # Safety check to prevent infinite loops (now with proper limit)
-                    if page_count >= 50:  # Max 50 pages (5,000 leads per campaign)
-                        logger.warning(f"⚠️ Reached safety limit of 50 pages for {campaign_name} (processed {total_leads_accessed} leads)")
+                    if page_count >= 30:  # Max 30 pages (3,000 leads per campaign with 100/page)
+                        logger.warning(f"⚠️ Reached safety limit of 30 pages for {campaign_name} (processed {total_leads_accessed} leads)")
                         break
                 
                 elif response.status_code == 401:
