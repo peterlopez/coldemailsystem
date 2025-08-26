@@ -177,16 +177,23 @@ def delete_lead_from_instantly(lead: 'InstantlyLead') -> bool:
     except Exception as e:
         logger.warning(f"⚠️ API v2 DELETE failed for {lead.email}: {e}")
     
-    # Approach 2: Try API v1 POST delete endpoint (fallback)
+    # Approach 2: Try API v1 POST delete endpoint (fallback with different auth)
     try:
         logger.debug(f"🔄 Attempting API v1 POST delete for {lead.email}")
+        # v1 API uses different URL and auth method
+        v1_url = f"https://api.instantly.ai/api/v1/lead/delete"
+        v1_headers = {'Content-Type': 'application/json'}  # No Bearer token for v1
         delete_data = {
             'api_key': INSTANTLY_API_KEY,  # v1 uses api_key in body
             'campaign_id': lead.campaign_id,
             'delete_all_data': True,  # Remove all data for this lead
             'delete_list_of_emails': [lead.email]
         }
-        response = call_instantly_api('/api/v1/lead/delete', method='POST', data=delete_data)
+        
+        import requests
+        response = requests.post(v1_url, headers=v1_headers, json=delete_data, timeout=30)
+        response.raise_for_status()
+        
         logger.info(f"✅ Successfully deleted {lead.email} via API v1 POST")
         return True
     except Exception as e:
