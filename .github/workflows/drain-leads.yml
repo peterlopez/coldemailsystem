@@ -155,17 +155,7 @@ jobs:
           
           # Test drain-specific imports (non-blocking)
           echo "🧪 Testing drain-specific imports..."
-          python -c "
-import sys
-print(f'Python path: {sys.path}')
-try:
-    from sync_once import get_finished_leads, logger
-    print('✅ drain imports OK')
-except Exception as e:
-    print(f'⚠️ Drain imports warning: {e}')
-    print('   This may be normal if dependencies are still being resolved')
-    print('   The actual drain script will handle this gracefully')
-" || echo "⚠️ Drain import test completed with warnings"
+          python -c "import sys; print('Python path:', len(sys.path), 'entries'); from sync_once import get_finished_leads; print('✅ drain imports OK')" || echo "⚠️ Drain import test completed with warnings"
           
       - name: Run drain process
         env:
