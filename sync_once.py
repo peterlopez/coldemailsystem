@@ -48,59 +48,26 @@ except ImportError as e:
     NOTIFICATIONS_AVAILABLE = False
     logger.warning(f"📴 Notification system not available: {e}")
 
-# Configuration from environment
-PROJECT_ID = "instant-ground-394115"
-DATASET_ID = "email_analytics"
-TARGET_NEW_LEADS_PER_RUN = int(os.getenv('TARGET_NEW_LEADS_PER_RUN', '100'))
-INSTANTLY_CAP_GUARD = int(os.getenv('INSTANTLY_CAP_GUARD', '24000'))
-BATCH_SIZE = int(os.getenv('BATCH_SIZE', '100'))
-BATCH_SLEEP_SECONDS = int(os.getenv('BATCH_SLEEP_SECONDS', '10'))
-DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
+# OPTIMIZED: Use centralized configuration
+from shared_config import config, DRY_RUN, SMB_CAMPAIGN_ID, MIDSIZE_CAMPAIGN_ID, PROJECT_ID, DATASET_ID, TARGET_NEW_LEADS_PER_RUN, VERIFICATION_VALID_STATUSES
 
-# Campaign configuration
-SMB_CAMPAIGN_ID = '8c46e0c9-c1f9-4201-a8d6-6221bafeada6'
-MIDSIZE_CAMPAIGN_ID = '5ffbe8c3-dc0e-41e4-9999-48f00d2015df'
-
-# Mailbox capacity management
+# Legacy variable mappings for backward compatibility
+INSTANTLY_CAP_GUARD = config.processing.inventory_cap_guard
+BATCH_SIZE = config.processing.bigquery_batch_size
+BATCH_SLEEP_SECONDS = int(os.getenv('BATCH_SLEEP_SECONDS', '10'))  # Keep for backward compatibility
+VERIFY_EMAILS_BEFORE_CREATION = config.verification.enabled
+VERIFICATION_TIMEOUT = int(os.getenv('VERIFICATION_TIMEOUT', '10'))  # Max wait for pending
 LEAD_INVENTORY_MULTIPLIER = float(os.getenv('LEAD_INVENTORY_MULTIPLIER', '3.5'))  # Conservative start
 
-# Email verification settings
-VERIFY_EMAILS_BEFORE_CREATION = os.getenv('VERIFY_EMAILS_BEFORE_CREATION', 'true').lower() == 'true'
-VERIFICATION_VALID_STATUSES = ['valid', 'accept_all', 'verified']  # Accept verified emails from Instantly API
-VERIFICATION_TIMEOUT = int(os.getenv('VERIFICATION_TIMEOUT', '10'))  # Max wait for pending
-
-# Drain testing configuration - limit total leads processed for testing
+# Drain testing configuration - limit total leads processed for testing  
 MAX_LEADS_TO_EVALUATE = int(os.getenv('MAX_LEADS_TO_EVALUATE', '0'))  # 0 = no limit, set to 200 for testing
 MAX_PAGES_TO_PROCESS = int(os.getenv('MAX_PAGES_TO_PROCESS', '0'))  # 0 = no limit, set to 2 for testing
 FORCE_DRAIN_CHECK = os.getenv('FORCE_DRAIN_CHECK', 'false').lower() == 'true'  # Skip 24hr check for testing
 
-# Instantly API configuration
-INSTANTLY_API_KEY = os.getenv('INSTANTLY_API_KEY')
-logger.info(f"Environment INSTANTLY_API_KEY present: {bool(INSTANTLY_API_KEY)}")
-
-if not INSTANTLY_API_KEY:
-    # Fallback to config file if environment variable not set (local development)
-    logger.info("INSTANTLY_API_KEY not found in environment, attempting to load from config file")
-    try:
-        # Add current directory to Python path to help with imports
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from config.config import Config
-        config = Config()
-        INSTANTLY_API_KEY = config.instantly_api_key
-        logger.info(f"Loaded INSTANTLY_API_KEY from config file: {'[PRESENT]' if INSTANTLY_API_KEY else '[EMPTY/NONE]'}")
-    except ImportError as e:
-        logger.warning(f"Could not import config module: {e}")
-        logger.info("This is expected in GitHub Actions where config module is not needed")
-    except Exception as e:
-        logger.error(f"Failed to load API key from config: {e}")
-        logger.error("INSTANTLY_API_KEY must be set as environment variable or in config file")
-        
-if not INSTANTLY_API_KEY:
-    logger.error("❌ INSTANTLY_API_KEY is not configured!")
-    raise RuntimeError("INSTANTLY_API_KEY not configured")
-
-
-INSTANTLY_BASE_URL = 'https://api.instantly.ai'
+# OPTIMIZED: API configuration handled by shared_config
+INSTANTLY_API_KEY = config.api.instantly_api_key
+INSTANTLY_BASE_URL = config.api.instantly_base_url
+logger.info(f"✅ INSTANTLY_API_KEY configured via shared_config")
 
 # BigQuery client
 try:
@@ -247,11 +214,8 @@ def log_dead_letter(phase: str, email: Optional[str], payload: str, status_code:
         logger.error(f"Failed to log dead letter: {e}")
 
 def get_instantly_headers() -> dict:
-    """Get standard Instantly API headers."""
-    return {
-        'Authorization': f'Bearer {INSTANTLY_API_KEY}',
-        'Content-Type': 'application/json'
-    }
+    """OPTIMIZED: Get headers for Instantly API calls using shared config."""
+    return config.get_instantly_headers()
 
 def should_check_lead_for_drain(lead_id: str) -> bool:
     """
@@ -665,10 +629,11 @@ def get_finished_leads() -> List[InstantlyLead]:
                 if starting_after:
                     payload["starting_after"] = starting_after
                 
-                # RATE LIMITING: Add delay between API calls to prevent 401 errors
+                # RATE LIMITING: Use optimized delay from centralized config
                 if page_count > 0:  # Don't delay the first call
-                    logger.debug(f"⏸️ Rate limiting: waiting 3 seconds before next API call...")
-                    time.sleep(3.0)  # 3 second delay between pagination calls (increased for larger pages)
+                    delay = config.rate_limits.pagination_delay
+                    logger.debug(f"⏸️ Optimized rate limiting: waiting {delay}s before next API call...")
+                    time.sleep(delay)  # OPTIMIZED: Centralized configuration
                 
                 response = requests.post(
                     url,
@@ -900,99 +865,200 @@ def get_finished_leads() -> List[InstantlyLead]:
         return []
 
 def update_bigquery_state(leads: List[InstantlyLead]) -> None:
-    """Update BigQuery with lead status and history - enhanced for new drain logic."""
+    """Update BigQuery with lead status and history - OPTIMIZED with bulk operations."""
     if not leads or DRY_RUN:
         return
     
     try:
-        logger.info(f"📊 Updating BigQuery state for {len(leads)} drained leads...")
+        logger.info(f"📊 Updating BigQuery state for {len(leads)} drained leads with bulk operations...")
         
         # Track drain reasons for reporting
         drain_reasons = {}
-        
         for lead in leads:
-            # Count drain reasons for summary
             drain_reasons[lead.status] = drain_reasons.get(lead.status, 0) + 1
-            
-            # Update ops_inst_state with new status
-            query = f"""
-            MERGE `{PROJECT_ID}.{DATASET_ID}.ops_inst_state` T
-            USING (SELECT @email as email, @campaign_id as campaign_id, @status as status) S
-            ON LOWER(T.email) = LOWER(S.email) AND T.campaign_id = S.campaign_id
-            WHEN MATCHED THEN
-              UPDATE SET status = S.status, updated_at = CURRENT_TIMESTAMP()
-            WHEN NOT MATCHED THEN
-              INSERT (email, campaign_id, status, instantly_lead_id, added_at, updated_at)
-              VALUES (S.email, S.campaign_id, S.status, @lead_id, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
-            """
-            
-            job_config = bigquery.QueryJobConfig(
-                query_parameters=[
-                    bigquery.ScalarQueryParameter("email", "STRING", lead.email),
-                    bigquery.ScalarQueryParameter("campaign_id", "STRING", lead.campaign_id),
-                    bigquery.ScalarQueryParameter("status", "STRING", lead.status),
-                    bigquery.ScalarQueryParameter("lead_id", "STRING", lead.id),
-                ]
-            )
-            
-            bq_client.query(query, job_config=job_config).result()
-            
-            # Add to history for completed/replied leads (90-day cooldown)
-            if lead.status in ['completed', 'replied']:
-                history_query = f"""
-                INSERT INTO `{PROJECT_ID}.{DATASET_ID}.ops_lead_history`
-                (email, campaign_id, sequence_name, status_final, completed_at, attempt_num)
-                VALUES (@email, @campaign_id, @sequence_name, @status, CURRENT_TIMESTAMP(), 1)
-                """
-                
-                sequence_name = 'SMB' if lead.campaign_id == SMB_CAMPAIGN_ID else 'Midsize'
-                
-                job_config = bigquery.QueryJobConfig(
-                    query_parameters=[
-                        bigquery.ScalarQueryParameter("email", "STRING", lead.email),
-                        bigquery.ScalarQueryParameter("campaign_id", "STRING", lead.campaign_id),
-                        bigquery.ScalarQueryParameter("sequence_name", "STRING", sequence_name),
-                        bigquery.ScalarQueryParameter("status", "STRING", lead.status),
-                    ]
-                )
-                
-                bq_client.query(history_query, job_config=job_config).result()
-                logger.debug(f"📝 Added {lead.email} to 90-day cooldown history")
-            
-            # Add unsubscribes to DNC list (permanent block)
-            if lead.status == 'unsubscribed':
-                dnc_query = f"""
-                INSERT INTO `{PROJECT_ID}.{DATASET_ID}.dnc_list`
-                (id, email, domain, source, reason, added_date, added_by, is_active)
-                VALUES (
-                    GENERATE_UUID(), 
-                    @email, 
-                    SPLIT(@email, '@')[OFFSET(1)], 
-                    'instantly_drain', 
-                    'unsubscribe_via_api', 
-                    CURRENT_TIMESTAMP(), 
-                    'sync_script_v2', 
-                    TRUE
-                )
-                """
-                
-                job_config = bigquery.QueryJobConfig(
-                    query_parameters=[
-                        bigquery.ScalarQueryParameter("email", "STRING", lead.email),
-                    ]
-                )
-                
-                bq_client.query(dnc_query, job_config=job_config).result()
-                logger.info(f"🚫 Added {lead.email} to permanent DNC list")
+        
+        # OPTIMIZATION 1: Bulk MERGE for ops_inst_state
+        _bulk_update_ops_inst_state(leads)
+        
+        # OPTIMIZATION 2: Bulk INSERT for history (90-day cooldown)
+        history_leads = [lead for lead in leads if lead.status in ['completed', 'replied']]
+        if history_leads:
+            _bulk_insert_lead_history(history_leads)
+        
+        # OPTIMIZATION 3: Bulk INSERT for DNC list
+        dnc_leads = [lead for lead in leads if lead.status == 'unsubscribed']
+        if dnc_leads:
+            _bulk_insert_dnc_list(dnc_leads)
         
         # Log summary of drain reasons
-        logger.info(f"✅ Updated BigQuery state - Drain summary:")
+        logger.info(f"✅ Updated BigQuery state with bulk operations - Drain summary:")
         for reason, count in drain_reasons.items():
             logger.info(f"  - {reason}: {count} leads")
     
     except Exception as e:
         logger.error(f"❌ Failed to update BigQuery state: {e}")
         log_dead_letter('bigquery_update_drain', None, json.dumps([l.__dict__ for l in leads]), 0, str(e))
+
+def _bulk_update_ops_inst_state(leads: List[InstantlyLead]) -> None:
+    """OPTIMIZED: Single bulk MERGE operation instead of individual queries."""
+    if not leads:
+        return
+        
+    # Build VALUES clause for all leads at once
+    values_rows = []
+    for lead in leads:
+        # Escape single quotes in email and use safe string formatting
+        safe_email = lead.email.replace("'", "''")
+        safe_status = lead.status.replace("'", "''") 
+        safe_lead_id = lead.id.replace("'", "''") if lead.id else ''
+        
+        values_rows.append(f"('{safe_email}', '{lead.campaign_id}', '{safe_status}', '{safe_lead_id}')")
+    
+    values_clause = ",\n    ".join(values_rows)
+    
+    # Single MERGE query for all leads
+    bulk_merge_query = f"""
+    MERGE `{PROJECT_ID}.{DATASET_ID}.ops_inst_state` T
+    USING (
+        SELECT email, campaign_id, status, instantly_lead_id
+        FROM UNNEST([
+            {values_clause}
+        ]) AS S(email, campaign_id, status, instantly_lead_id)
+    ) S
+    ON LOWER(T.email) = LOWER(S.email) AND T.campaign_id = S.campaign_id
+    WHEN MATCHED THEN
+        UPDATE SET status = S.status, updated_at = CURRENT_TIMESTAMP()
+    WHEN NOT MATCHED THEN
+        INSERT (email, campaign_id, status, instantly_lead_id, added_at, updated_at)
+        VALUES (S.email, S.campaign_id, S.status, S.instantly_lead_id, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
+    """
+    
+    bq_client.query(bulk_merge_query).result()
+    logger.info(f"✅ Bulk updated {len(leads)} leads in ops_inst_state (single query vs {len(leads)} individual queries)")
+
+def _bulk_insert_lead_history(leads: List[InstantlyLead]) -> None:
+    """OPTIMIZED: Single bulk INSERT for lead history."""
+    if not leads:
+        return
+        
+    # Build VALUES clause for all history entries
+    values_rows = []
+    for lead in leads:
+        safe_email = lead.email.replace("'", "''")
+        safe_status = lead.status.replace("'", "''")
+        sequence_name = 'SMB' if lead.campaign_id == SMB_CAMPAIGN_ID else 'Midsize'
+        
+        values_rows.append(f"('{safe_email}', '{lead.campaign_id}', '{sequence_name}', '{safe_status}', CURRENT_TIMESTAMP(), 1)")
+    
+    values_clause = ",\n    ".join(values_rows)
+    
+    # Single INSERT query for all history records
+    bulk_history_query = f"""
+    INSERT INTO `{PROJECT_ID}.{DATASET_ID}.ops_lead_history`
+    (email, campaign_id, sequence_name, status_final, completed_at, attempt_num)
+    VALUES
+    {values_clause}
+    """
+    
+    bq_client.query(bulk_history_query).result()
+    logger.info(f"✅ Bulk inserted {len(leads)} leads to history (90-day cooldown)")
+
+def _bulk_insert_dnc_list(leads: List[InstantlyLead]) -> None:
+    """OPTIMIZED: Single bulk INSERT for DNC list."""
+    if not leads:
+        return
+        
+    # Build VALUES clause for all DNC entries
+    values_rows = []
+    for lead in leads:
+        safe_email = lead.email.replace("'", "''")
+        domain_part = lead.email.split('@')[1] if '@' in lead.email else 'unknown'
+        safe_domain = domain_part.replace("'", "''")
+        
+        values_rows.append(f"""(
+            GENERATE_UUID(), 
+            '{safe_email}', 
+            '{safe_domain}', 
+            'instantly_drain', 
+            'unsubscribe_via_api', 
+            CURRENT_TIMESTAMP(), 
+            'sync_script_v2_bulk', 
+            TRUE
+        )""")
+    
+    values_clause = ",\n    ".join(values_rows)
+    
+    # Single INSERT query for all DNC records
+    bulk_dnc_query = f"""
+    INSERT INTO `{PROJECT_ID}.{DATASET_ID}.dnc_list`
+    (id, email, domain, source, reason, added_date, added_by, is_active)
+    VALUES
+    {values_clause}
+    """
+    
+    bq_client.query(bulk_dnc_query).result()
+    logger.info(f"🚫 Bulk added {len(leads)} unsubscribes to permanent DNC list")
+
+def _bulk_track_verification_failures(failed_verification_leads: List[tuple], campaign_id: str) -> None:
+    """OPTIMIZED: Single bulk operation for tracking verification failures."""
+    if not failed_verification_leads:
+        return
+    
+    # Build VALUES clause for all failed verifications
+    values_rows = []
+    for lead, verification in failed_verification_leads:
+        safe_email = lead.email.replace("'", "''")
+        safe_status = verification.get('status', 'unknown').replace("'", "''")
+        catch_all = str(verification.get('catch_all', False)).upper()
+        credits_used = verification.get('credits_used', 1)
+        
+        values_rows.append(f"""(
+            '{safe_email}', 
+            '{campaign_id}', 
+            'verification_failed',
+            '{safe_status}',
+            {catch_all},
+            {credits_used},
+            CURRENT_TIMESTAMP(),
+            CURRENT_TIMESTAMP(),
+            CURRENT_TIMESTAMP()
+        )""")
+    
+    values_clause = ",\n    ".join(values_rows)
+    
+    # Single MERGE query for all verification failures
+    bulk_verification_query = f"""
+    MERGE `{PROJECT_ID}.{DATASET_ID}.ops_inst_state` T
+    USING (
+        SELECT email, campaign_id, status, verification_status, 
+               verification_catch_all, verification_credits_used,
+               verified_at, added_at, updated_at
+        FROM UNNEST([
+            {values_clause}
+        ]) AS S(email, campaign_id, status, verification_status, 
+                verification_catch_all, verification_credits_used,
+                verified_at, added_at, updated_at)
+    ) S
+    ON T.email = S.email AND T.campaign_id = S.campaign_id
+    WHEN MATCHED THEN
+        UPDATE SET 
+            status = S.status,
+            verification_status = S.verification_status,
+            verification_catch_all = S.verification_catch_all,
+            verification_credits_used = S.verification_credits_used,
+            verified_at = S.verified_at,
+            updated_at = S.updated_at
+    WHEN NOT MATCHED THEN
+        INSERT (email, campaign_id, status, verification_status,
+                verification_catch_all, verification_credits_used,
+                verified_at, added_at, updated_at)
+        VALUES (S.email, S.campaign_id, S.status, S.verification_status,
+                S.verification_catch_all, S.verification_credits_used,
+                S.verified_at, S.added_at, S.updated_at)
+    """
+    
+    bq_client.query(bulk_verification_query).result()
+    logger.info(f"✅ Bulk tracked {len(failed_verification_leads)} verification failures")
 
 def delete_leads_from_instantly(leads: List[InstantlyLead]) -> None:
     """Delete finished leads from Instantly to free inventory with proper rate limiting."""
@@ -1250,7 +1316,7 @@ def split_leads_by_segment(leads: List[Lead]) -> Tuple[List[Lead], List[Lead]]:
     return smb_leads, midsize_leads
 
 def verify_email(email: str) -> dict:
-    """Verify email using Instantly.ai verification API."""
+    """Verify email using Instantly.ai verification API - OPTIMIZED with rate limiting."""
     try:
         # Skip verification in dry run mode
         if DRY_RUN:
@@ -1261,6 +1327,10 @@ def verify_email(email: str) -> dict:
                 'credits_used': 0
             }
         
+        # OPTIMIZATION: Add small delay between verification calls
+        verification_delay = config.rate_limits.verification_delay if config else 0.2
+        time.sleep(verification_delay)
+        
         data = {'email': email}
         response = call_instantly_api('/api/v2/email-verification', 
                                     method='POST', 
@@ -1269,7 +1339,7 @@ def verify_email(email: str) -> dict:
         # Log the full verification response for debugging
         logger.debug(f"Verification API response for {email}: {json.dumps(response)}")
         
-        # Handle pending status with polling
+        # Handle pending status with polling (optimized timeout)
         if response.get('verification_status') == 'pending':
             logger.info(f"Verification pending for {email}, waiting...")
             time.sleep(2)  # Wait before checking status
@@ -1470,44 +1540,11 @@ def process_lead_batch(leads: List[Lead], campaign_id: str) -> int:
         
         logger.info(f"Verified {len(verified_leads)}/{len(leads)} leads as valid")
         
-        # Track failed verifications in BigQuery
+        # OPTIMIZED: Track failed verifications in BigQuery with bulk operation
         if failed_verification_leads:
-            logger.info(f"Tracking {len(failed_verification_leads)} failed verifications in ops_inst_state")
+            logger.info(f"Tracking {len(failed_verification_leads)} failed verifications in ops_inst_state with bulk operation")
             try:
-                for lead, verification in failed_verification_leads:
-                    query = f"""
-                    MERGE `{PROJECT_ID}.{DATASET_ID}.ops_inst_state` T
-                    USING (SELECT @email as email, @campaign_id as campaign_id) S
-                    ON T.email = S.email AND T.campaign_id = S.campaign_id
-                    WHEN MATCHED THEN
-                        UPDATE SET 
-                            status = 'verification_failed',
-                            verification_status = @verification_status,
-                            verification_catch_all = @catch_all,
-                            verification_credits_used = @credits_used,
-                            verified_at = CURRENT_TIMESTAMP(),
-                            updated_at = CURRENT_TIMESTAMP()
-                    WHEN NOT MATCHED THEN
-                        INSERT (email, campaign_id, status, verification_status, 
-                                verification_catch_all, verification_credits_used,
-                                verified_at, added_at, updated_at)
-                        VALUES (@email, @campaign_id, 'verification_failed', @verification_status,
-                                @catch_all, @credits_used, CURRENT_TIMESTAMP(),
-                                CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
-                    """
-                    
-                    job_config = bigquery.QueryJobConfig(
-                        query_parameters=[
-                            bigquery.ScalarQueryParameter("email", "STRING", lead.email),
-                            bigquery.ScalarQueryParameter("campaign_id", "STRING", campaign_id),
-                            bigquery.ScalarQueryParameter("verification_status", "STRING", verification.get('status', 'unknown')),
-                            bigquery.ScalarQueryParameter("catch_all", "BOOL", verification.get('catch_all', False)),
-                            bigquery.ScalarQueryParameter("credits_used", "INT64", verification.get('credits_used', 1)),
-                        ]
-                    )
-                    
-                    bq_client.query(query, job_config=job_config).result()
-                    
+                _bulk_track_verification_failures(failed_verification_leads, campaign_id)
             except Exception as e:
                 logger.error(f"Failed to track verification failures: {e}")
                 

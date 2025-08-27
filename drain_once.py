@@ -12,8 +12,15 @@ import logging
 from datetime import datetime
 from typing import List
 
-# Temporarily revert to sync_once imports to fix GitHub Actions failures
-# TODO: Re-implement shared modules after fixing the basic import issues
+# OPTIMIZED: Use shared configuration
+try:
+    from shared_config import config
+    print("✅ Loaded shared configuration")
+except ImportError:
+    print("⚠️ Shared config not available, using environment fallback")
+    config = None
+
+# Import core functions from sync_once
 try:
     from sync_once import (
         get_finished_leads, update_bigquery_state, 
@@ -124,7 +131,7 @@ def delete_leads_from_instantly_enhanced(leads: List[InstantlyLead]) -> int:
         logger.info(f"   • {reason}: {count} leads")
     logger.info("")
     
-    DELETE_DELAY = 3.0  # 3 seconds between each DELETE call (aggressive rate limiting)
+    DELETE_DELAY = config.rate_limits.delete_delay if config else 1.0  # OPTIMIZED: Use centralized config
     successful_deletions = 0
     failed_deletions = 0
     
@@ -172,7 +179,7 @@ def drain_finished_leads_enhanced() -> int:
     
     # Process in smaller batches with longer delays for DELETE operations
     DRAIN_BATCH_SIZE = 5   # Smaller batches for DELETE (vs 50-100 for CREATE)
-    DRAIN_BATCH_DELAY = 10 # Longer delays between batches (vs 1s for pagination)
+    DRAIN_BATCH_DELAY = config.rate_limits.delete_batch_delay if config else 5.0  # OPTIMIZED: Use centralized config
     
     total_drained = 0
     batch_count = (len(finished_leads) + DRAIN_BATCH_SIZE - 1) // DRAIN_BATCH_SIZE
