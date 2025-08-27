@@ -242,6 +242,6 @@ def should_drain_lead(lead: InstantlyLead, raw_data: dict) -> dict:
             'keep_reason': f'Status {status} - lead still active in campaign'
         }
 
-# Campaign IDs - moved here to avoid circular imports
+# Campaign IDs - centralized here  
 SMB_CAMPAIGN_ID = "8c46e0c9-c1f9-4201-a8d6-6221bafeada6"
 MIDSIZE_CAMPAIGN_ID = "5ffbe8c3-dc0e-41e4-9999-48f00d2015df"
