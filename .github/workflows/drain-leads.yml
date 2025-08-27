@@ -139,23 +139,13 @@ jobs:
           PYTHONPATH: .
           GOOGLE_APPLICATION_CREDENTIALS: config/secrets/bigquery-credentials.json
         run: |
-          echo "🧪 Testing Python imports for drain workflow..."
-          echo "Python executable: $(which python)"
-          echo "Python version: $(python --version)"
-          echo "PYTHONPATH: $PYTHONPATH"
-          echo "Current directory: $(pwd)"
-          echo "Files in directory:"
-          ls -la sync_once.py drain_once.py
-          
-          python -c "import os; print('✅ os module OK')"
-          python -c "import logging; print('✅ logging module OK')"
-          python -c "from google.cloud import bigquery; print('✅ google.cloud.bigquery OK')" || echo "❌ Failed to import bigquery"
-          python -c "import requests; print('✅ requests OK')" || echo "❌ Failed to import requests"
-          python -c "import tenacity; print('✅ tenacity OK')" || echo "❌ Failed to import tenacity"
-          
-          # Test drain-specific imports (non-blocking)
-          echo "🧪 Testing drain-specific imports..."
-          python -c "import sys; print('Python path:', len(sys.path), 'entries'); from sync_once import get_finished_leads; print('✅ drain imports OK')" || echo "⚠️ Drain import test completed with warnings"
+          echo "Testing Python imports for drain workflow..."
+          python --version
+          python -c "import os; print('os module OK')"
+          python -c "import logging; print('logging module OK')"
+          python -c "from google.cloud import bigquery; print('google.cloud.bigquery OK')" || echo "Failed to import bigquery"
+          python -c "import requests; print('requests OK')" || echo "Failed to import requests" 
+          python -c "from sync_once import get_finished_leads; print('sync_once imports OK')" || echo "sync_once import failed"
           
       - name: Run drain process
         env:
