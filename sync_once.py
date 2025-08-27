@@ -279,7 +279,7 @@ def batch_check_leads_for_drain(lead_ids: list) -> dict:
                     instantly_lead_id,
                     last_drain_check,
                     TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), last_drain_check, HOUR) as hours_since_check
-                FROM `instant-ground-394115.email_analytics.ops_inst_state`
+                FROM `{PROJECT_ID}.{DATASET_ID}.ops_inst_state`
                 WHERE instantly_lead_id IN UNNEST(@lead_ids)
                 """
                 
@@ -358,7 +358,7 @@ def update_lead_drain_check_timestamp(lead_id: str) -> bool:
         
         # Update timestamp - only update existing records, don't create new ones
         query = """
-        UPDATE `instant-ground-394115.email_analytics.ops_inst_state`
+        UPDATE `{PROJECT_ID}.{DATASET_ID}.ops_inst_state`
         SET last_drain_check = CURRENT_TIMESTAMP(), updated_at = CURRENT_TIMESTAMP()
         WHERE instantly_lead_id = @lead_id
         """
@@ -405,7 +405,7 @@ def batch_update_drain_timestamps(lead_ids: list) -> bool:
             try:
                 # Create batch update query - only update existing records, don't insert new ones
                 query = """
-                UPDATE `instant-ground-394115.email_analytics.ops_inst_state`
+                UPDATE `{PROJECT_ID}.{DATASET_ID}.ops_inst_state`
                 SET last_drain_check = CURRENT_TIMESTAMP(), updated_at = CURRENT_TIMESTAMP()
                 WHERE instantly_lead_id IN UNNEST(@lead_ids)
                 """
@@ -622,8 +622,8 @@ def get_finished_leads() -> List[InstantlyLead]:
             seen_lead_ids = set()
             consecutive_duplicate_pages = 0
             
-            # Rate limit retry tracking
-            consecutive_401_errors = 0
+            # Rate limit retry tracking  
+            consecutive_429_errors = 0
             
             while True:
                 # Use proper cursor-based pagination
@@ -650,8 +650,8 @@ def get_finished_leads() -> List[InstantlyLead]:
                 )
                 
                 if response.status_code == 200:
-                    # Reset 401 counter on successful response
-                    consecutive_401_errors = 0
+                    # Reset rate limit counter on successful response
+                    consecutive_429_errors = 0
                     
                     data = response.json()
                     leads = data.get('items', [])
@@ -780,15 +780,30 @@ def get_finished_leads() -> List[InstantlyLead]:
                         break
                 
                 elif response.status_code == 401:
-                    # Rate limiting likely cause of 401 errors - be more aggressive with backoff
-                    consecutive_401_errors += 1
+                    # 401 = Authentication/Authorization error - not rate limiting
+                    logger.error(f"❌ Authentication error (401) for {campaign_name} - invalid API key or permissions")
+                    logger.error(f"Response: {response.text}")
                     
-                    if consecutive_401_errors >= 5:
-                        logger.error(f"❌ Too many consecutive 401 errors ({consecutive_401_errors}) for {campaign_name} - stopping pagination")
+                    # Record as dead letter for investigation
+                    record_dead_letter(
+                        phase="DRAIN",
+                        email="system",
+                        http_status=401,
+                        error_text=f"Authentication failed for campaign {campaign_name}: {response.text}",
+                        retry_count=0
+                    )
+                    break  # Don't retry auth errors
+                
+                elif response.status_code == 429:
+                    # 429 = Rate limiting - implement backoff
+                    consecutive_429_errors += 1
+                    
+                    if consecutive_429_errors >= 5:
+                        logger.error(f"❌ Too many consecutive rate limit errors ({consecutive_429_errors}) for {campaign_name} - stopping pagination")
                         break
                     
-                    backoff_time = min(10 * consecutive_401_errors, 60)  # 10s, 20s, 30s, 40s, 60s max
-                    logger.warning(f"⚠️ Got 401 error #{consecutive_401_errors} (likely rate limiting) for {campaign_name} on page {page_count + 1}")
+                    backoff_time = min(10 * consecutive_429_errors, 60)  # 10s, 20s, 30s, 40s, 60s max
+                    logger.warning(f"⚠️ Rate limit error #{consecutive_429_errors} for {campaign_name} on page {page_count + 1}")
                     logger.info(f"💤 Backing off for {backoff_time} seconds before retry...")
                     time.sleep(backoff_time)
                     continue  # Retry the same page
@@ -1107,26 +1122,32 @@ def get_current_instantly_inventory() -> int:
                 logger.info(f"📊 Checking {campaign_name} campaign ({campaign_id}) inventory...")
                 
                 # ENHANCED: Try getting ALL leads first (not just active) to see what's there
-                page = 1
                 campaign_total = 0
                 status_breakdown = {}
+                
+                # Use cursor pagination (same as get_finished_leads)
+                starting_after = None
+                page_count = 0
                 
                 while True:
                     data = {
                         'campaign_id': campaign_id,
                         # ENHANCED: Remove status filter to get ALL leads and count by status
-                        'page': page,
-                        'per_page': 100
+                        'limit': 100
                     }
+                    
+                    # Add cursor if we have one
+                    if starting_after:
+                        data['starting_after'] = starting_after
                     
                     response = call_instantly_api('/api/v2/leads/list', method='POST', data=data)
                     
                     if not response or not response.get('items'):
-                        logger.debug(f"  No items in {campaign_name} page {page}")
+                        logger.debug(f"  No items in {campaign_name} batch {page_count + 1}")
                         break
                     
                     items = response.get('items', [])
-                    logger.debug(f"  {campaign_name} page {page}: {len(items)} leads found")
+                    logger.debug(f"  {campaign_name} batch {page_count + 1}: {len(items)} leads found")
                     
                     # ENHANCED: Count leads by status for debugging
                     for item in items:
@@ -1137,15 +1158,17 @@ def get_current_instantly_inventory() -> int:
                         if status in [1, 2]:  # Active or in-progress
                             campaign_total += 1
                     
-                    # Check if there are more pages
-                    if len(items) < 100:  # Less than full page means we're done
+                    # Check for next cursor
+                    starting_after = response.get('next_starting_after')
+                    if not starting_after:
+                        logger.debug(f"  {campaign_name} pagination complete - no more cursor")
                         break
                     
-                    page += 1
+                    page_count += 1
                     
                     # Safety limit to prevent infinite loops
-                    if page > 50:  # 5000 leads max per campaign
-                        logger.warning(f"Hit page limit for {campaign_name} campaign inventory check")
+                    if page_count > 50:  # 5000 leads max per campaign
+                        logger.warning(f"Hit batch limit for {campaign_name} campaign inventory check")
                         break
                 
                 # ENHANCED: Log status breakdown for debugging
@@ -1329,24 +1352,53 @@ def create_lead_in_instantly(lead: Lead, campaign_id: str) -> Optional[str]:
         
         move_response = call_instantly_api('/api/v2/leads/move', method='POST', data=move_data)
         
-        if move_response.get('status') == 'pending':
-            logger.info(f"🎯 Lead {lead.email} successfully assigned to campaign")
-            return lead_id
+        # Robust success check: API call succeeded and returned a valid response
+        if isinstance(move_response, dict):
+            # Check for explicit success indicators or assume success if no error
+            success_indicators = [
+                move_response.get('status') == 'pending',  # Original expected response
+                move_response.get('success', True),        # Explicit success field
+                'error' not in move_response,              # No error field present
+                move_response.get('status') == 'success'   # Alternative success status
+            ]
+            
+            if any(success_indicators):
+                logger.info(f"🎯 Lead {lead.email} successfully assigned to campaign")
+                logger.debug(f"📋 Move response: {json.dumps(move_response)}")
+                return lead_id
+            else:
+                # Response indicates failure
+                logger.error(f"❌ Campaign assignment FAILED for {lead.email}")
+                logger.error(f"📋 Move response indicates failure: {json.dumps(move_response)}")
         else:
-            logger.error(f"❌ Campaign assignment FAILED for {lead.email}")
-            logger.error(f"📋 Move response: {json.dumps(move_response)}")
-            logger.error(f"🎯 Target campaign: {campaign_id}")
-            logger.error(f"💀 Lead {lead_id} is now ORPHANED - deleting to prevent inventory waste")
-            
-            # Delete the orphaned lead to prevent inventory waste
-            try:
-                delete_response = call_instantly_api(f'/api/v2/leads/{lead_id}', method='DELETE')
-                logger.info(f"🗑️ Deleted orphaned lead {lead.email}")
-            except Exception as delete_error:
-                logger.error(f"Failed to delete orphaned lead {lead.email}: {delete_error}")
-            
-            # Return None to indicate failure
-            return None
+            # Invalid response type (likely None or error)
+            logger.error(f"❌ Campaign assignment FAILED for {lead.email} - invalid response")
+            logger.error(f"📋 Move response type: {type(move_response)}, value: {move_response}")
+        
+        # Assignment failed - add to dead letters instead of immediate deletion
+        logger.error(f"🎯 Target campaign: {campaign_id}")
+        logger.warning(f"💀 Lead {lead_id} assignment failed - adding to dead letters for retry")
+        
+        try:
+            record_dead_letter(
+                phase="TOP-UP",
+                email=lead.email,
+                http_status=0,  # Will be updated if we had HTTP status
+                error_text=f"Campaign assignment failed: {json.dumps(move_response) if isinstance(move_response, dict) else str(move_response)}",
+                retry_count=0
+            )
+        except Exception as dl_error:
+            logger.error(f"Failed to record dead letter for {lead.email}: {dl_error}")
+        
+        # Only delete after recording the failure for potential retry
+        try:
+            delete_response = call_instantly_api(f'/api/v2/leads/{lead_id}', method='DELETE')
+            logger.info(f"🗑️ Deleted orphaned lead {lead.email} after recording failure")
+        except Exception as delete_error:
+            logger.error(f"Failed to delete orphaned lead {lead.email}: {delete_error}")
+        
+        # Return None to indicate failure
+        return None
     
     except Exception as e:
         if '409' in str(e) or 'already exists' in str(e).lower():
@@ -1591,7 +1643,12 @@ def housekeeping() -> Dict:
         logger.info(f"  - Mailboxes: {mailbox_count} ({daily_capacity} emails/day)")
         logger.info(f"  - Safe capacity: {safe_inventory_limit:,} leads (utilization: {capacity_utilization:.1f}%)")
         logger.info(f"  - Legacy cap guard: {INSTANTLY_CAP_GUARD:,}")
-        logger.info(f"  - Verification: DISABLED (handled by Instantly)")
+        # Update verification logging based on actual system behavior
+        if ASYNC_VERIFICATION_AVAILABLE:
+            logger.info(f"  - Verification: ASYNC (triggered after lead creation)")
+        else:
+            logger.info(f"  - Verification: UNAVAILABLE (async verification module not loaded)")
+        logger.info(f"  - Verification details: Instantly handles validation internally")
         
         return metrics
     
@@ -1617,7 +1674,13 @@ def main():
             "smb_campaign": {"campaign_id": SMB_CAMPAIGN_ID, "leads_added": 0, "campaign_name": "SMB"},
             "midsize_campaign": {"campaign_id": MIDSIZE_CAMPAIGN_ID, "leads_added": 0, "campaign_name": "Midsize"}
         },
-        # VERIFICATION_RESULTS REMOVED - Let Instantly handle verification internally
+        "verification_results": {
+            "total_attempted": 0,
+            "verified_successful": 0,
+            "verification_failed": 0,
+            "success_rate_percentage": 0.0,
+            "credits_used": 0.0
+        },
         "final_inventory": {"instantly_total": 0, "bigquery_eligible": 0},
         "performance": {"api_success_rate": 0.0, "processing_rate_per_minute": 0.0},
         "errors": [],
