@@ -104,7 +104,7 @@ class ColdEmailNotifier:
         # Load configuration from environment
         self.config = NotificationConfig(
             echo_api_base_url=os.getenv('ECHO_API_BASE_URL', 'https://echo-api-ssh6.onrender.com'),
-            slack_channel=os.getenv('SLACK_NOTIFICATION_CHANNEL', '#sales-cold-email-replies'),
+            slack_channel=os.getenv('SLACK_NOTIFICATION_CHANNEL', '#sales-cold-email-ops'),
             notifications_enabled=os.getenv('SLACK_NOTIFICATIONS_ENABLED', 'true').lower() == 'true'
         )
         

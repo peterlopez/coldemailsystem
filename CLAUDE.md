@@ -372,7 +372,7 @@ python setup.py
 ## 📡 Slack Notification System ✅ IMPLEMENTED
 
 ### **Real-Time Operational Notifications**
-- **Integration**: Cold Email System → Echo API → Slack (`#sales-cold-email-replies`)
+- **Integration**: Cold Email System → Echo API → Slack (`#sales-cold-email-ops`)
 - **Coverage**: Both sync and drain operations with comprehensive metrics
 - **Format**: Rich, formatted messages with capacity, performance, and error data
 
