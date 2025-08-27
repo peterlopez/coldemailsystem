@@ -1083,18 +1083,71 @@ def get_mailbox_capacity() -> Tuple[int, int]:
         return 68, 680  # Fallback estimate
 
 def get_current_instantly_inventory() -> int:
-    """Get current lead count in Instantly (both campaigns)."""
+    """Get current lead count in Instantly using real API data."""
     try:
-        # For now, use our BigQuery tracking instead of Instantly API
+        # Get real inventory from Instantly API for both campaigns
+        total_count = 0
+        
+        for campaign_name, campaign_id in [("SMB", SMB_CAMPAIGN_ID), ("Midsize", MIDSIZE_CAMPAIGN_ID)]:
+            try:
+                # Use the POST /api/v2/leads/list endpoint to get actual lead count
+                page = 1
+                campaign_total = 0
+                
+                while True:
+                    data = {
+                        'campaign_id': campaign_id,
+                        'status': 1,  # Active leads only
+                        'page': page,
+                        'per_page': 100  # Just for counting
+                    }
+                    
+                    response = call_instantly_api('/api/v2/leads/list', method='POST', data=data)
+                    
+                    if not response or not response.get('items'):
+                        break
+                    
+                    items_count = len(response.get('items', []))
+                    campaign_total += items_count
+                    
+                    # Check if there are more pages
+                    if items_count < 100:  # Less than full page means we're done
+                        break
+                    
+                    page += 1
+                    
+                    # Safety limit to prevent infinite loops
+                    if page > 50:  # 5000 leads max per campaign
+                        logger.warning(f"Hit page limit for {campaign_name} campaign inventory check")
+                        break
+                
+                logger.info(f"  {campaign_name} campaign: {campaign_total} active leads")
+                total_count += campaign_total
+                
+            except Exception as e:
+                logger.error(f"Failed to get {campaign_name} campaign inventory: {e}")
+                # Fall back to BigQuery for this campaign
+                query = f"""
+                SELECT COUNT(*) as count 
+                FROM `{PROJECT_ID}.{DATASET_ID}.ops_inst_state` 
+                WHERE status = 'active' AND campaign_id = '{campaign_id}'
+                """
+                result = bq_client.query(query).result()
+                campaign_count = next(result).count
+                logger.info(f"  {campaign_name} campaign (fallback): {campaign_count} tracked leads")
+                total_count += campaign_count
+        
+        logger.info(f"Current Instantly inventory (actual): {total_count} active leads")
+        return total_count
+        
+    except Exception as e:
+        logger.error(f"Failed to get inventory from API, falling back to BigQuery: {e}")
+        # Fallback to BigQuery tracking
         query = f"SELECT COUNT(*) as count FROM `{PROJECT_ID}.{DATASET_ID}.ops_inst_state` WHERE status = 'active'"
         result = bq_client.query(query).result()
         total = next(result).count
-        
-        logger.info(f"Current Instantly inventory (tracked): {total}")
+        logger.info(f"Current Instantly inventory (tracked fallback): {total}")
         return total
-    except Exception as e:
-        logger.error(f"Failed to get inventory: {e}")
-        return 0
 
 def calculate_smart_lead_target() -> int:
     """Calculate optimal number of leads to add based on mailbox capacity."""
@@ -1213,19 +1266,39 @@ def verify_email(email: str) -> dict:
                                     method='POST', 
                                     data=data)
         
+        # Log the full verification response for debugging
+        logger.debug(f"Verification API response for {email}: {json.dumps(response)}")
+        
         # Handle pending status with polling
         if response.get('verification_status') == 'pending':
             logger.info(f"Verification pending for {email}, waiting...")
             time.sleep(2)  # Wait before checking status
             response = call_instantly_api(f'/api/v2/email-verification/{email}', 
                                         method='GET')
+            logger.debug(f"Verification GET response for {email}: {json.dumps(response)}")
         
-        return {
+        # Extract all verification details for better tracking
+        verification_result = {
             'email': email,
             'status': response.get('verification_status', 'unknown'),
             'catch_all': response.get('catch_all', False),
-            'credits_used': response.get('credits_used', 1)
+            'credits_used': response.get('credits_used', 1),
+            'disposable': response.get('disposable', False),
+            'role_based': response.get('role_based', False),
+            'free_email': response.get('free_email', False),
+            'mx_records': response.get('mx_records', False),
+            'smtp_check': response.get('smtp_check', False)
         }
+        
+        # Log verification result details
+        if verification_result['status'] not in VERIFICATION_VALID_STATUSES:
+            logger.info(f"❌ Verification failed for {email}: status={verification_result['status']}, "
+                       f"disposable={verification_result['disposable']}, "
+                       f"role_based={verification_result['role_based']}, "
+                       f"mx_records={verification_result['mx_records']}")
+        
+        return verification_result
+        
     except Exception as e:
         logger.error(f"Email verification failed for {email}: {e}")
         log_dead_letter('verification', email, None, None, None, str(e))
@@ -1382,6 +1455,8 @@ def process_lead_batch(leads: List[Lead], campaign_id: str) -> int:
     
     if VERIFY_EMAILS_BEFORE_CREATION:
         logger.info(f"Verifying {len(leads)} email addresses...")
+        failed_verification_leads = []
+        
         for lead in leads:
             verification = verify_email(lead.email)
             verification_results.append(verification)
@@ -1391,8 +1466,51 @@ def process_lead_batch(leads: List[Lead], campaign_id: str) -> int:
                 logger.debug(f"✅ {lead.email} verified as {verification['status']}")
             else:
                 logger.info(f"❌ Skipping {lead.email}: {verification['status']}")
+                failed_verification_leads.append((lead, verification))
         
         logger.info(f"Verified {len(verified_leads)}/{len(leads)} leads as valid")
+        
+        # Track failed verifications in BigQuery
+        if failed_verification_leads:
+            logger.info(f"Tracking {len(failed_verification_leads)} failed verifications in ops_inst_state")
+            try:
+                for lead, verification in failed_verification_leads:
+                    query = f"""
+                    MERGE `{PROJECT_ID}.{DATASET_ID}.ops_inst_state` T
+                    USING (SELECT @email as email, @campaign_id as campaign_id) S
+                    ON T.email = S.email AND T.campaign_id = S.campaign_id
+                    WHEN MATCHED THEN
+                        UPDATE SET 
+                            status = 'verification_failed',
+                            verification_status = @verification_status,
+                            verification_catch_all = @catch_all,
+                            verification_credits_used = @credits_used,
+                            verified_at = CURRENT_TIMESTAMP(),
+                            updated_at = CURRENT_TIMESTAMP()
+                    WHEN NOT MATCHED THEN
+                        INSERT (email, campaign_id, status, verification_status, 
+                                verification_catch_all, verification_credits_used,
+                                verified_at, added_at, updated_at)
+                        VALUES (@email, @campaign_id, 'verification_failed', @verification_status,
+                                @catch_all, @credits_used, CURRENT_TIMESTAMP(),
+                                CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
+                    """
+                    
+                    job_config = bigquery.QueryJobConfig(
+                        query_parameters=[
+                            bigquery.ScalarQueryParameter("email", "STRING", lead.email),
+                            bigquery.ScalarQueryParameter("campaign_id", "STRING", campaign_id),
+                            bigquery.ScalarQueryParameter("verification_status", "STRING", verification.get('status', 'unknown')),
+                            bigquery.ScalarQueryParameter("catch_all", "BOOL", verification.get('catch_all', False)),
+                            bigquery.ScalarQueryParameter("credits_used", "INT64", verification.get('credits_used', 1)),
+                        ]
+                    )
+                    
+                    bq_client.query(query, job_config=job_config).result()
+                    
+            except Exception as e:
+                logger.error(f"Failed to track verification failures: {e}")
+                
     else:
         # Skip verification if disabled
         verified_leads = leads
