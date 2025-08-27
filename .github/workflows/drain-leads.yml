@@ -122,11 +122,14 @@ jobs:
             exit 1
           }
           
-      - name: Run import diagnostics
+      - name: Run refactor tests
         env:
           PYTHONPATH: .
           GOOGLE_APPLICATION_CREDENTIALS: config/secrets/bigquery-credentials.json
         run: |
+          echo "🔍 Testing refactored shared modules..."
+          python test_refactor.py || true
+          echo ""
           echo "🔍 Running detailed import diagnostics..."
           python test_drain_imports.py || true
           
