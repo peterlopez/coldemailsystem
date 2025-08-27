@@ -1284,7 +1284,6 @@ def create_lead_in_instantly(lead: Lead, campaign_id: str) -> Optional[str]:
             'first_name': '',  # Not available in our data
             'last_name': '',   # Not available in our data
             'company_name': lead.merchant_name,
-            'verify_on_import': True,  # Enable Instantly's built-in verification
             'custom_variables': {
                 'company': lead.merchant_name,
                 'domain': lead.platform_domain,
@@ -1303,10 +1302,14 @@ def create_lead_in_instantly(lead: Lead, campaign_id: str) -> Optional[str]:
         # Check for successful creation
         lead_id = response.get('id')
         if not lead_id:
-            logger.error(f"Failed to create lead {lead.email}: {response}")
+            logger.error(f"❌ Lead creation FAILED for {lead.email}")
+            logger.error(f"📋 Create response: {json.dumps(response)}")
             return None
         
-        logger.info(f"✅ Created lead {lead.email} with ID {lead_id} (verification enabled)")
+        logger.info(f"✅ Created lead {lead.email} with ID {lead_id}")
+        
+        # Small delay between creation and assignment to prevent race conditions
+        time.sleep(0.2)
         
         # Step 2: Move lead to the specified campaign
         logger.debug(f"Assigning lead {lead.email} to campaign (Step 2/2)")
@@ -1318,12 +1321,23 @@ def create_lead_in_instantly(lead: Lead, campaign_id: str) -> Optional[str]:
         move_response = call_instantly_api('/api/v2/leads/move', method='POST', data=move_data)
         
         if move_response.get('status') == 'pending':
-            logger.info(f"🎯 Lead {lead.email} assignment to campaign queued (async operation)")
+            logger.info(f"🎯 Lead {lead.email} successfully assigned to campaign")
             return lead_id
         else:
-            logger.warning(f"Campaign assignment may have failed for {lead.email}: {move_response}")
-            # Still return the lead_id as the lead was created successfully
-            return lead_id
+            logger.error(f"❌ Campaign assignment FAILED for {lead.email}")
+            logger.error(f"📋 Move response: {json.dumps(move_response)}")
+            logger.error(f"🎯 Target campaign: {campaign_id}")
+            logger.error(f"💀 Lead {lead_id} is now ORPHANED - deleting to prevent inventory waste")
+            
+            # Delete the orphaned lead to prevent inventory waste
+            try:
+                delete_response = call_instantly_api(f'/api/v2/leads/{lead_id}', method='DELETE')
+                logger.info(f"🗑️ Deleted orphaned lead {lead.email}")
+            except Exception as delete_error:
+                logger.error(f"Failed to delete orphaned lead {lead.email}: {delete_error}")
+            
+            # Return None to indicate failure
+            return None
     
     except Exception as e:
         if '409' in str(e) or 'already exists' in str(e).lower():
@@ -1415,7 +1429,7 @@ def process_lead_batch(leads: List[Lead], campaign_id: str) -> int:
         return 0
     
     logger.info(f"Processing batch of {len(leads)} leads for campaign {campaign_id}")
-    logger.info("📤 Processing all leads with verify_on_import=true (verification during creation)")
+    logger.info("📤 Processing all leads directly (no pre-verification)")
     
     successful_ids = []
     
