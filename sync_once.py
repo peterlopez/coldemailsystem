@@ -1149,35 +1149,48 @@ def get_mailbox_capacity() -> Tuple[int, int]:
         return 68, 680  # Fallback estimate based on typical setup
 
 def get_current_instantly_inventory() -> int:
-    """Get current lead count in Instantly using real API data."""
+    """Get current lead count in Instantly using real API data - ENHANCED with debugging."""
     try:
         # Get real inventory from Instantly API for both campaigns
         total_count = 0
         
         for campaign_name, campaign_id in [("SMB", SMB_CAMPAIGN_ID), ("Midsize", MIDSIZE_CAMPAIGN_ID)]:
             try:
-                # Use the POST /api/v2/leads/list endpoint to get actual lead count
+                logger.info(f"📊 Checking {campaign_name} campaign ({campaign_id}) inventory...")
+                
+                # ENHANCED: Try getting ALL leads first (not just active) to see what's there
                 page = 1
                 campaign_total = 0
+                status_breakdown = {}
                 
                 while True:
                     data = {
                         'campaign_id': campaign_id,
-                        'status': 1,  # Active leads only
+                        # ENHANCED: Remove status filter to get ALL leads and count by status
                         'page': page,
-                        'per_page': 100  # Just for counting
+                        'per_page': 100
                     }
                     
                     response = call_instantly_api('/api/v2/leads/list', method='POST', data=data)
                     
                     if not response or not response.get('items'):
+                        logger.debug(f"  No items in {campaign_name} page {page}")
                         break
                     
-                    items_count = len(response.get('items', []))
-                    campaign_total += items_count
+                    items = response.get('items', [])
+                    logger.debug(f"  {campaign_name} page {page}: {len(items)} leads found")
+                    
+                    # ENHANCED: Count leads by status for debugging
+                    for item in items:
+                        status = item.get('status', 'unknown')
+                        status_breakdown[status] = status_breakdown.get(status, 0) + 1
+                        
+                        # Count active leads (status 1 or 2) for inventory
+                        if status in [1, 2]:  # Active or in-progress
+                            campaign_total += 1
                     
                     # Check if there are more pages
-                    if items_count < 100:  # Less than full page means we're done
+                    if len(items) < 100:  # Less than full page means we're done
                         break
                     
                     page += 1
@@ -1187,7 +1200,13 @@ def get_current_instantly_inventory() -> int:
                         logger.warning(f"Hit page limit for {campaign_name} campaign inventory check")
                         break
                 
+                # ENHANCED: Log status breakdown for debugging
                 logger.info(f"  {campaign_name} campaign: {campaign_total} active leads")
+                if status_breakdown:
+                    logger.info(f"  {campaign_name} status breakdown: {status_breakdown}")
+                else:
+                    logger.warning(f"  {campaign_name}: No leads found at all!")
+                
                 total_count += campaign_total
                 
             except Exception as e:
@@ -1689,7 +1708,8 @@ def housekeeping() -> Dict:
         
         metrics = {
             'timestamp': datetime.now().isoformat(),
-            'instantly_inventory': inventory,
+            'current_inventory': inventory,  # NOTIFICATION FIX: Use expected key name
+            'instantly_inventory': inventory,  # Keep for backward compatibility
             'eligible_leads': eligible_count,
             'mailbox_count': mailbox_count,
             'daily_email_capacity': daily_capacity,
@@ -1773,6 +1793,12 @@ def main():
             current_inventory = metrics.get('current_inventory', 0)
             eligible_leads = metrics.get('eligible_leads', 0)
             
+            # NOTIFICATION FIX: Add debugging for capacity data
+            logger.info(f"📊 Housekeeping metrics for notification:")
+            logger.info(f"   - current_inventory from housekeeping: {current_inventory}")
+            logger.info(f"   - eligible_leads from housekeeping: {eligible_leads}")
+            logger.info(f"   - metrics keys available: {list(metrics.keys())}")
+            
             notification_data["capacity_status"] = {
                 "current_inventory": current_inventory,
                 "max_capacity": INSTANTLY_CAP_GUARD,
@@ -1784,6 +1810,13 @@ def main():
                 "instantly_total": current_inventory,
                 "bigquery_eligible": eligible_leads
             }
+        else:
+            # NOTIFICATION FIX: Add debugging for missing metrics
+            logger.warning("⚠️ No valid metrics from housekeeping - notification will show default values")
+            if metrics:
+                logger.warning(f"   Metrics error: {metrics.get('error', 'Unknown error')}")
+            else:
+                logger.warning("   Metrics is None - housekeeping may have failed")
         
         # Calculate final metrics
         sync_end_time = time.time()
