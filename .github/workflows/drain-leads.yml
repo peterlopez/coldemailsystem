@@ -122,6 +122,14 @@ jobs:
             exit 1
           }
           
+      - name: Run import diagnostics
+        env:
+          PYTHONPATH: .
+          GOOGLE_APPLICATION_CREDENTIALS: config/secrets/bigquery-credentials.json
+        run: |
+          echo "🔍 Running detailed import diagnostics..."
+          python test_drain_imports.py || true
+          
       - name: Test imports for drain
         env:
           INSTANTLY_API_KEY: ${{ secrets.INSTANTLY_API_KEY }}
