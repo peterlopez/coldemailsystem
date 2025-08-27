@@ -13,6 +13,7 @@ import os
 import sys
 import requests
 import logging
+import time
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
@@ -26,7 +27,7 @@ class NotificationConfig:
     echo_api_base_url: str
     slack_channel: str
     notifications_enabled: bool
-    timeout_seconds: int = 30
+    timeout_seconds: int = 60  # Increased for slower Echo API
     max_retries: int = 3
 
 class EchoAPIClient:
@@ -91,10 +92,32 @@ class EchoAPIClient:
             return False
     
     def create_and_send_message(self, title: str, content: str, recipients: List[str]) -> bool:
-        """Create and immediately send a message"""
-        message_id = self.create_message(title, content, recipients)
-        if message_id:
-            return self.send_message(message_id)
+        """Create and immediately send a message with retry logic"""
+        for attempt in range(1, self.config.max_retries + 1):
+            try:
+                message_id = self.create_message(title, content, recipients)
+                if message_id:
+                    success = self.send_message(message_id)
+                    if success:
+                        return True
+                    # If send failed but create succeeded, don't retry create
+                    logger.warning(f"Message created but send failed on attempt {attempt}")
+                    return False
+                else:
+                    # Create failed, will retry
+                    if attempt < self.config.max_retries:
+                        retry_delay = 2 ** attempt  # Exponential backoff: 2, 4, 8 seconds
+                        logger.warning(f"Create failed on attempt {attempt}, retrying in {retry_delay}s...")
+                        time.sleep(retry_delay)
+                    continue
+            except Exception as e:
+                if attempt < self.config.max_retries:
+                    retry_delay = 2 ** attempt
+                    logger.warning(f"Echo API error on attempt {attempt}: {e}, retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                else:
+                    logger.error(f"Echo API failed after {self.config.max_retries} attempts: {e}")
+        
         return False
 
 class ColdEmailNotifier:

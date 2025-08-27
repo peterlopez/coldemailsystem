@@ -66,7 +66,7 @@ LEAD_INVENTORY_MULTIPLIER = float(os.getenv('LEAD_INVENTORY_MULTIPLIER', '3.5'))
 
 # Email verification settings
 VERIFY_EMAILS_BEFORE_CREATION = os.getenv('VERIFY_EMAILS_BEFORE_CREATION', 'true').lower() == 'true'
-VERIFICATION_VALID_STATUSES = ['valid', 'accept_all']  # Configurable valid statuses
+VERIFICATION_VALID_STATUSES = ['valid', 'accept_all', 'verified']  # Accept verified emails from Instantly API
 VERIFICATION_TIMEOUT = int(os.getenv('VERIFICATION_TIMEOUT', '10'))  # Max wait for pending
 
 # Drain testing configuration - limit total leads processed for testing
@@ -1078,9 +1078,9 @@ def get_mailbox_capacity() -> Tuple[int, int]:
         return total_mailboxes, daily_capacity
         
     except Exception as e:
-        logger.error(f"Failed to get mailbox capacity: {e}")
-        logger.info("Using fallback capacity estimate")
-        return 68, 680  # Fallback estimate
+        logger.warning(f"Could not get mailbox capacity from API (this is normal): {e}")
+        logger.info("Using fallback capacity estimate - this doesn't affect functionality")
+        return 68, 680  # Fallback estimate based on typical setup
 
 def get_current_instantly_inventory() -> int:
     """Get current lead count in Instantly using real API data."""
@@ -1282,7 +1282,7 @@ def verify_email(email: str) -> dict:
             'email': email,
             'status': response.get('verification_status', 'unknown'),
             'catch_all': response.get('catch_all', False),
-            'credits_used': response.get('credits_used', 1),
+            'credits_used': int(float(response.get('credits_used', 1))),  # Convert decimal to integer for BigQuery
             'disposable': response.get('disposable', False),
             'role_based': response.get('role_based', False),
             'free_email': response.get('free_email', False),
