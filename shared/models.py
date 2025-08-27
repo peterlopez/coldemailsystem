@@ -11,14 +11,8 @@ class InstantlyLead:
     """Represents a lead from Instantly API."""
     id: str
     email: str
-    status: int
     campaign_id: str
-    email_reply_count: int = 0
-    created_at: Optional[str] = None
-    
-    def __post_init__(self):
-        # Store original status for drain tracking
-        self.status = self.status  # Keep as string for classification
+    status: str  # Keep as string to match original sync_once.py
 
 @dataclass
 class Lead:

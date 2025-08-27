@@ -12,7 +12,7 @@ import logging
 from datetime import datetime
 from typing import List
 
-# Import required functions from shared modules (no BigQuery dependencies)
+# Try importing from shared modules first, fallback to sync_once if needed
 try:
     from shared.api_client import get_finished_leads, delete_lead_from_instantly, DRY_RUN
     from shared.models import InstantlyLead
@@ -20,17 +20,29 @@ try:
     print("✅ Shared module imports successful")
     IMPORTS_AVAILABLE = True
 except ImportError as e:
-    print(f"❌ Import error: {e}")
-    print(f"   Error type: {type(e).__name__}")
-    print(f"   Error details: {str(e)}")
+    print(f"⚠️ Shared module import failed: {e}")
+    print("   Attempting fallback to sync_once imports...")
     
-    # Set defaults for missing imports
-    DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
-    IMPORTS_AVAILABLE = False
-    
-    print("❌ CRITICAL: Cannot proceed without shared module imports")
-    print("   Please ensure the shared package is available")
-    sys.exit(1)
+    # Fallback to original sync_once imports
+    try:
+        from sync_once import (
+            get_finished_leads, update_bigquery_state, 
+            DRY_RUN, InstantlyLead, delete_lead_from_instantly,
+            log_dead_letter
+        )
+        print("✅ Fallback to sync_once imports successful")
+        IMPORTS_AVAILABLE = True
+    except ImportError as fallback_error:
+        print(f"❌ Both import methods failed:")
+        print(f"   Shared: {e}")
+        print(f"   Fallback: {fallback_error}")
+        
+        # Set defaults for missing imports
+        DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
+        IMPORTS_AVAILABLE = False
+        
+        print("❌ CRITICAL: Cannot proceed with any import method")
+        sys.exit(1)
 
 # Import notification system
 try:
