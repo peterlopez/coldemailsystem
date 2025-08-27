@@ -12,52 +12,25 @@ import logging
 from datetime import datetime
 from typing import List
 
-# Import required functions and classes from sync_once.py
+# Import required functions from shared modules (no BigQuery dependencies)
 try:
-    # First check if we can import the required dependencies directly
-    import requests
-    import google.cloud.bigquery
-    print("✅ Core dependencies available")
-    
-    from sync_once import (
-        get_finished_leads, update_bigquery_state, 
-        DRY_RUN, InstantlyLead, delete_lead_from_instantly,
-        log_dead_letter
-    )
-    print("✅ Sync imports successful")
-    SYNC_IMPORTS_AVAILABLE = True
+    from shared.api_client import get_finished_leads, delete_lead_from_instantly, DRY_RUN
+    from shared.models import InstantlyLead
+    from shared.bigquery_utils import update_bigquery_state, log_dead_letter
+    print("✅ Shared module imports successful")
+    IMPORTS_AVAILABLE = True
 except ImportError as e:
     print(f"❌ Import error: {e}")
     print(f"   Error type: {type(e).__name__}")
     print(f"   Error details: {str(e)}")
     
-    # More detailed error information
-    if 'requests' in str(e):
-        print("   Missing 'requests' dependency")
-        print("   Attempting to install: pip install requests")
-        os.system("pip install requests")
-    elif 'google' in str(e):
-        print("   Missing Google Cloud dependency")
-        print("   Attempting to install: pip install google-cloud-bigquery")
-        os.system("pip install google-cloud-bigquery")
+    # Set defaults for missing imports
+    DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
+    IMPORTS_AVAILABLE = False
     
-    # Try one more time after installation attempt
-    try:
-        from sync_once import (
-            get_finished_leads, update_bigquery_state, 
-            DRY_RUN, InstantlyLead, delete_lead_from_instantly,
-            log_dead_letter
-        )
-        print("✅ Sync imports successful after dependency installation")
-        SYNC_IMPORTS_AVAILABLE = True
-    except:
-        # Set defaults for missing imports
-        DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
-        SYNC_IMPORTS_AVAILABLE = False
-        
-        print("❌ CRITICAL: Cannot proceed without sync_once.py imports")
-        print("   Please ensure all dependencies are installed")
-        sys.exit(1)  # Exit immediately rather than raising to get clearer error message
+    print("❌ CRITICAL: Cannot proceed without shared module imports")
+    print("   Please ensure the shared package is available")
+    sys.exit(1)
 
 # Import notification system
 try:
@@ -232,7 +205,7 @@ def main():
     logger.info(f"   Python path: {sys.executable}")
     logger.info(f"   Working directory: {os.getcwd()}")
     logger.info(f"   PYTHONPATH: {os.environ.get('PYTHONPATH', 'Not set')}")
-    logger.info(f"   Sync imports available: {SYNC_IMPORTS_AVAILABLE}")
+    logger.info(f"   Shared imports available: {IMPORTS_AVAILABLE}")
     logger.info(f"   Notifications available: {NOTIFICATIONS_AVAILABLE}")
     
     # Initialize notification tracking
