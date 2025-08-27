@@ -12,7 +12,7 @@ import time
 import uuid
 import logging
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 from dataclasses import dataclass
 
 import requests
@@ -47,6 +47,15 @@ try:
 except ImportError as e:
     NOTIFICATIONS_AVAILABLE = False
     logger.warning(f"📴 Notification system not available: {e}")
+
+# Import async verification system
+try:
+    from async_email_verification import trigger_verification_for_new_leads
+    ASYNC_VERIFICATION_AVAILABLE = True
+    logger.info("🔍 Async verification system loaded")
+except ImportError as e:
+    ASYNC_VERIFICATION_AVAILABLE = False
+    logger.warning(f"📴 Async verification system not available: {e}")
 
 # OPTIMIZED: Use centralized configuration
 from shared_config import config, DRY_RUN, SMB_CAMPAIGN_ID, MIDSIZE_CAMPAIGN_ID, PROJECT_ID, DATASET_ID, TARGET_NEW_LEADS_PER_RUN
@@ -1423,10 +1432,10 @@ def update_ops_state(leads: List[Lead], campaign_id: str, lead_ids: List[str],
     except Exception as e:
         logger.error(f"Failed to update ops state: {e}")
 
-def process_lead_batch(leads: List[Lead], campaign_id: str) -> int:
+def process_lead_batch(leads: List[Lead], campaign_id: str) -> Tuple[int, Dict[str, Any]]:
     """Process a batch of leads for a specific campaign - NO VERIFICATION."""
     if not leads:
-        return 0
+        return 0, {"verification_triggered": False, "verification_count": 0}
     
     logger.info(f"Processing batch of {len(leads)} leads for campaign {campaign_id}")
     logger.info("📤 Processing all leads directly (no pre-verification)")
@@ -1456,9 +1465,47 @@ def process_lead_batch(leads: List[Lead], campaign_id: str) -> int:
     successful_count = len([id for id in successful_ids if id is not None])
     logger.info(f"✅ Successfully processed {successful_count}/{len(leads)} leads")
     logger.info(f"📊 Notification will report {successful_count} leads added to campaign")
-    return successful_count
+    
+    # ASYNC VERIFICATION: Trigger verification for successfully created leads
+    verification_result = {"verification_triggered": False, "verification_count": 0}
+    
+    if successful_count > 0 and ASYNC_VERIFICATION_AVAILABLE and not DRY_RUN:
+        successful_emails = [lead.email for lead, lead_id in zip(leads, successful_ids) if lead_id is not None]
+        if successful_emails:
+            logger.info(f"🔍 Triggering async verification for {len(successful_emails)} successfully created leads")
+            try:
+                verification_triggered = trigger_verification_for_new_leads(successful_emails)
+                verification_result = {
+                    "verification_triggered": verification_triggered,
+                    "verification_count": len(successful_emails)
+                }
+                if verification_triggered:
+                    logger.info(f"✅ Async verification triggered successfully")
+                else:
+                    logger.warning(f"⚠️ Async verification trigger failed - leads created but verification not initiated")
+            except Exception as e:
+                logger.error(f"❌ Async verification trigger error: {e}")
+                logger.info("📧 Leads were created successfully but verification trigger failed")
+                verification_result = {
+                    "verification_triggered": False,
+                    "verification_count": len(successful_emails)
+                }
+    elif DRY_RUN:
+        logger.info(f"🔍 DRY RUN: Would trigger async verification for {successful_count} leads")
+        verification_result = {
+            "verification_triggered": False,  # Dry run doesn't actually trigger
+            "verification_count": successful_count
+        }
+    elif not ASYNC_VERIFICATION_AVAILABLE:
+        logger.info(f"📴 Async verification not available - leads created without verification trigger")
+        verification_result = {
+            "verification_triggered": False,
+            "verification_count": 0
+        }
+    
+    return successful_count, verification_result
 
-def top_up_campaigns() -> Tuple[int, int]:
+def top_up_campaigns() -> Tuple[int, int, Dict[str, Any]]:
     """Add new eligible leads to campaigns using smart capacity management."""
     logger.info("=== TOPPING UP CAMPAIGNS ===")
     
@@ -1467,13 +1514,13 @@ def top_up_campaigns() -> Tuple[int, int]:
     
     if target_leads == 0:
         logger.info("Smart capacity management: No leads to add this run")
-        return 0, 0
+        return 0, 0, {"triggered": False, "lead_count": 0}
     
     # Check legacy inventory guard as backup safety
     current_inventory = get_current_instantly_inventory()
     if current_inventory >= INSTANTLY_CAP_GUARD:
         logger.warning(f"Legacy safety guard triggered: Inventory at {current_inventory}, skipping top-up (guard: {INSTANTLY_CAP_GUARD})")
-        return 0, 0
+        return 0, 0, {"triggered": False, "lead_count": 0}
     
     # Get eligible leads using smart target
     logger.info(f"Smart targeting: requesting {target_leads} leads for this run")
@@ -1481,7 +1528,7 @@ def top_up_campaigns() -> Tuple[int, int]:
     
     if not leads:
         logger.info("No eligible leads found")
-        return 0, 0
+        return 0, 0, {"triggered": False, "lead_count": 0}
     
     # Split by segment
     smb_leads, midsize_leads = split_leads_by_segment(leads)
@@ -1489,11 +1536,19 @@ def top_up_campaigns() -> Tuple[int, int]:
     logger.info(f"Found {len(smb_leads)} SMB and {len(midsize_leads)} Midsize leads")
     
     # Process each segment
-    smb_processed = process_lead_batch(smb_leads, SMB_CAMPAIGN_ID)
-    midsize_processed = process_lead_batch(midsize_leads, MIDSIZE_CAMPAIGN_ID)
+    smb_processed, smb_verification = process_lead_batch(smb_leads, SMB_CAMPAIGN_ID)
+    midsize_processed, midsize_verification = process_lead_batch(midsize_leads, MIDSIZE_CAMPAIGN_ID)
+    
+    # Combine verification results
+    combined_verification = {
+        "triggered": smb_verification.get("verification_triggered", False) or midsize_verification.get("verification_triggered", False),
+        "lead_count": smb_verification.get("verification_count", 0) + midsize_verification.get("verification_count", 0),
+        "smb_verification": smb_verification,
+        "midsize_verification": midsize_verification
+    }
     
     logger.info(f"Top-up complete: {smb_processed} SMB + {midsize_processed} Midsize = {smb_processed + midsize_processed} total")
-    return smb_processed, midsize_processed
+    return smb_processed, midsize_processed, combined_verification
 
 def housekeeping() -> Dict:
     """Generate summary metrics and perform housekeeping."""
@@ -1574,11 +1629,14 @@ def main():
         logger.info("⏭️ SKIPPING DRAIN: Handled by separate drain-leads workflow")
         
         # Step 1: Top up campaigns (renamed from Step 2)
-        smb_added, midsize_added = top_up_campaigns()
+        smb_added, midsize_added, verification_data = top_up_campaigns()
         
         # Update notification data with results
         notification_data["leads_processed"]["smb_campaign"]["leads_added"] = smb_added
         notification_data["leads_processed"]["midsize_campaign"]["leads_added"] = midsize_added
+        
+        # Add async verification data to notifications
+        notification_data["async_verification"] = verification_data
         
         # NOTIFICATION FIX: Add debug logging
         logger.info(f"📊 Notification data: SMB={smb_added}, Midsize={midsize_added}, Total={smb_added + midsize_added}")
