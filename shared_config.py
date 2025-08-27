@@ -96,8 +96,8 @@ class ProcessingConfig:
     max_pages_per_campaign: int = 60  # Safety limit
     inventory_cap_guard: int = 24_000  # Total inventory limit
     
-    # Lead selection
-    target_new_leads_per_run: int = 100  # Default leads to add per run
+    # Lead selection  
+    target_new_leads_per_run: int = 100  # RESTORED: No verification filtering, so back to original target
     
     # Timestamps and cooldowns
     stale_lead_days: int = 90  # Days before lead considered stale
@@ -106,7 +106,7 @@ class ProcessingConfig:
 @dataclass
 class EmailVerificationConfig:
     """Email verification settings."""
-    enabled: bool = True
+    enabled: bool = False  # DISABLED: Let Instantly handle verification internally
     valid_statuses: List[str] = None
     cost_per_verification: float = 0.25  # Credits
     
