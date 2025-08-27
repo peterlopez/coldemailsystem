@@ -125,8 +125,17 @@ jobs:
       - name: Test imports for drain
         env:
           INSTANTLY_API_KEY: ${{ secrets.INSTANTLY_API_KEY }}
+          PYTHONPATH: .
+          GOOGLE_APPLICATION_CREDENTIALS: config/secrets/bigquery-credentials.json
         run: |
           echo "🧪 Testing Python imports for drain workflow..."
+          echo "Python executable: $(which python)"
+          echo "Python version: $(python --version)"
+          echo "PYTHONPATH: $PYTHONPATH"
+          echo "Current directory: $(pwd)"
+          echo "Files in directory:"
+          ls -la sync_once.py drain_once.py
+          
           python -c "import os; print('✅ os module OK')"
           python -c "import logging; print('✅ logging module OK')"
           python -c "from google.cloud import bigquery; print('✅ google.cloud.bigquery OK')" || echo "❌ Failed to import bigquery"
@@ -136,14 +145,16 @@ jobs:
           # Test drain-specific imports (non-blocking)
           echo "🧪 Testing drain-specific imports..."
           python -c "
-          try:
-              from sync_once import get_finished_leads, logger
-              print('✅ drain imports OK')
-          except Exception as e:
-              print(f'⚠️ Drain imports warning: {e}')
-              print('   This may be normal if dependencies are still being resolved')
-              print('   The actual drain script will handle this gracefully')
-          " || echo "⚠️ Drain import test completed with warnings"
+import sys
+print(f'Python path: {sys.path}')
+try:
+    from sync_once import get_finished_leads, logger
+    print('✅ drain imports OK')
+except Exception as e:
+    print(f'⚠️ Drain imports warning: {e}')
+    print('   This may be normal if dependencies are still being resolved')
+    print('   The actual drain script will handle this gracefully')
+" || echo "⚠️ Drain import test completed with warnings"
           
       - name: Run drain process
         env:
@@ -162,8 +173,9 @@ jobs:
           SLACK_NOTIFICATION_CHANNEL: ${{ secrets.SLACK_NOTIFICATION_CHANNEL }}
           SLACK_NOTIFICATIONS_ENABLED: ${{ secrets.SLACK_NOTIFICATIONS_ENABLED }}
           
-          # Python path
+          # Python path and credentials
           PYTHONPATH: .
+          GOOGLE_APPLICATION_CREDENTIALS: config/secrets/bigquery-credentials.json
         
         run: |
           echo "🧹 Starting Enhanced Lead Drain Process" | tee -a drain-workflow.log
