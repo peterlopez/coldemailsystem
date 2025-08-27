@@ -122,16 +122,16 @@ jobs:
             exit 1
           }
           
-      - name: Run refactor tests
+      - name: Debug GitHub environment
         env:
           PYTHONPATH: .
           GOOGLE_APPLICATION_CREDENTIALS: config/secrets/bigquery-credentials.json
         run: |
-          echo "🔍 Testing refactored shared modules..."
-          python test_refactor.py || true
+          echo "🔍 Running GitHub Actions environment debug..."
+          python debug_github_environment.py || true
           echo ""
-          echo "🔍 Running detailed import diagnostics..."
-          python test_drain_imports.py || true
+          echo "🔍 Running simple drain test..."
+          python simple_drain_test.py || true
           
       - name: Test imports for drain
         env:
