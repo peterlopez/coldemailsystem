@@ -25,10 +25,8 @@ logger = logging.getLogger(__name__)
 try:
     from shared_config import config
     from sync_once import (
-        verify_email, 
         get_bigquery_client,
         call_instantly_api,
-        _bulk_track_verification_failures,
         PROJECT_ID,
         DATASET_ID
     )

@@ -207,16 +207,7 @@ jobs:
             exit $exit_code
           }
           
-          # Post-campaign verification (only if sync succeeded and not in dry run)
-          if [ "$DRY_RUN" != "true" ]; then
-            echo "" | tee -a workflow.log
-            echo "🔍 Running post-campaign email verification..." | tee -a workflow.log
-            python verify_campaign_leads.py 2>&1 | tee -a workflow.log || {
-              echo "⚠️ Post-campaign verification failed, but continuing..." | tee -a workflow.log
-            }
-          else
-            echo "⏭️ Skipping post-campaign verification in dry run mode" | tee -a workflow.log
-          fi
+          echo "✅ Lead creation complete with verify_on_import=true" | tee -a workflow.log
       
       - name: Send logs to external service
         if: always()

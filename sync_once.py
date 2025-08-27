@@ -1278,12 +1278,13 @@ def split_leads_by_segment(leads: List[Lead]) -> Tuple[List[Lead], List[Lead]]:
 def create_lead_in_instantly(lead: Lead, campaign_id: str) -> Optional[str]:
     """Create a single lead in Instantly campaign with proper campaign assignment."""
     try:
-        # Step 1: Create the lead with basic data (no campaign assignment in creation)
+        # Step 1: Create the lead with Instantly's verification enabled
         basic_data = {
             'email': lead.email,
             'first_name': '',  # Not available in our data
             'last_name': '',   # Not available in our data
             'company_name': lead.merchant_name,
+            'verify_on_import': True,  # Enable Instantly's built-in verification
             'custom_variables': {
                 'company': lead.merchant_name,
                 'domain': lead.platform_domain,
@@ -1305,7 +1306,7 @@ def create_lead_in_instantly(lead: Lead, campaign_id: str) -> Optional[str]:
             logger.error(f"Failed to create lead {lead.email}: {response}")
             return None
         
-        logger.info(f"✅ Created lead {lead.email} with ID {lead_id}")
+        logger.info(f"✅ Created lead {lead.email} with ID {lead_id} (verification enabled)")
         
         # Step 2: Move lead to the specified campaign
         logger.debug(f"Assigning lead {lead.email} to campaign (Step 2/2)")
@@ -1414,7 +1415,7 @@ def process_lead_batch(leads: List[Lead], campaign_id: str) -> int:
         return 0
     
     logger.info(f"Processing batch of {len(leads)} leads for campaign {campaign_id}")
-    logger.info("📤 Processing all leads directly (verification handled by Instantly)")
+    logger.info("📤 Processing all leads with verify_on_import=true (verification during creation)")
     
     successful_ids = []
     
