@@ -1355,8 +1355,15 @@ def verify_email(email: str) -> dict:
                                     method='POST', 
                                     data=data)
         
-        # Log the full verification response for debugging
-        logger.debug(f"Verification API response for {email}: {json.dumps(response)}")
+        # ENHANCED DEBUG: Log full verification response to understand failure patterns
+        logger.info(f"📧 VERIFICATION DEBUG - API response for {email}: {json.dumps(response)}")
+        
+        # Additional specific debugging for common fields
+        verification_status = response.get('verification_status', 'unknown')
+        is_role_based = response.get('role_based', False)
+        is_disposable = response.get('disposable', False)
+        mx_records = response.get('mx_records', False)
+        logger.info(f"📧 VERIFICATION DETAILS - {email}: status={verification_status}, role_based={is_role_based}, disposable={is_disposable}, mx_records={mx_records}")
         
         # Handle pending status with polling (optimized timeout)
         if response.get('verification_status') == 'pending':
@@ -1364,7 +1371,7 @@ def verify_email(email: str) -> dict:
             time.sleep(2)  # Wait before checking status
             response = call_instantly_api(f'/api/v2/email-verification/{email}', 
                                         method='GET')
-            logger.debug(f"Verification GET response for {email}: {json.dumps(response)}")
+            logger.info(f"📧 VERIFICATION DEBUG (GET) - API response for {email}: {json.dumps(response)}")
         
         # Extract all verification details for better tracking
         verification_result = {
@@ -1699,6 +1706,22 @@ def housekeeping() -> Dict:
                     valid_rate = (valid_count / total_verified * 100) if total_verified > 0 else 0
                     logger.info(f"  - Total verified: {total_verified}, Valid rate: {valid_rate:.1f}%")
                     logger.info(f"  - Credits used: {total_credits}")
+                    
+                    # ENHANCED DEBUG: Analyze why emails are failing verification
+                    failed_statuses = [status for status in verification_stats.keys() 
+                                     if status not in VERIFICATION_VALID_STATUSES]
+                    if failed_statuses:
+                        failed_count = sum(stats['count'] for status, stats in verification_stats.items() 
+                                         if status not in VERIFICATION_VALID_STATUSES)
+                        logger.warning(f"📊 VERIFICATION ANALYSIS: {failed_count} emails failed ({(failed_count/total_verified*100):.1f}%)")
+                        logger.warning(f"📊 ACCEPTABLE STATUSES: {VERIFICATION_VALID_STATUSES}")
+                        logger.warning(f"📊 REJECTED STATUSES: {failed_statuses}")
+                        
+                        # Show specific failure reasons
+                        for status in failed_statuses:
+                            count = verification_stats[status]['count']
+                            pct = (count / total_verified * 100) if total_verified > 0 else 0
+                            logger.warning(f"   - {status}: {count} emails ({pct:.1f}%)")
                 
             except Exception as e:
                 logger.warning(f"Could not get verification metrics: {e}")
