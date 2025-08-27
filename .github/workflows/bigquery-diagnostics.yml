@@ -1,0 +1,99 @@
+name: BigQuery Diagnostics
+
+# Run comprehensive BigQuery diagnostics to check permissions, tables, and views
+# before making schema updates or troubleshooting sync issues
+
+on:
+  workflow_dispatch:  # Manual triggers only
+    inputs:
+      verbose:
+        description: 'Enable verbose output'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          echo "📦 Installing BigQuery dependencies..."
+          pip install --upgrade pip
+          pip install google-cloud-bigquery
+          echo "✅ Dependencies installed"
+      
+      - name: Create credentials file
+        env:
+          BIGQUERY_CREDS: ${{ secrets.BIGQUERY_CREDENTIALS_JSON }}
+        run: |
+          echo "📁 Creating directory structure..."
+          mkdir -p config/secrets
+          
+          # Check if secrets are available
+          if [ -z "${BIGQUERY_CREDS}" ]; then
+            echo "❌ ERROR: BIGQUERY_CREDENTIALS_JSON secret not set"
+            exit 1
+          fi
+          
+          # Create credentials file
+          printf '%s' "${BIGQUERY_CREDS}" > config/secrets/bigquery-credentials.json
+          chmod 600 config/secrets/bigquery-credentials.json
+          
+          # Validate JSON format
+          if python -m json.tool config/secrets/bigquery-credentials.json > /dev/null 2>&1; then
+            echo "✅ Credentials file is valid JSON"
+          else
+            echo "❌ ERROR: Credentials file is not valid JSON"
+            exit 1
+          fi
+          
+      - name: Run BigQuery diagnostics
+        run: |
+          echo "🔍 Starting BigQuery Diagnostics"
+          echo "Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          
+          # Build command arguments
+          ARGS=""
+          
+          # Check if we should enable verbose output
+          VERBOSE="${{ github.event.inputs.verbose || 'false' }}"
+          if [ "$VERBOSE" = "true" ]; then
+            ARGS="$ARGS --verbose"
+            echo "📊 Running in verbose mode"
+          fi
+          
+          # Run the diagnostics script
+          python diagnose_bigquery.py $ARGS
+          
+      - name: Cleanup credentials
+        if: always()
+        run: |
+          rm -f config/secrets/bigquery-credentials.json
+          
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bigquery-diagnostics-logs-${{ github.run_number }}
+          path: |
+            *.log
+          if-no-files-found: warn
+          retention-days: 7
