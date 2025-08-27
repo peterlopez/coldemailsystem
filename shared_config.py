@@ -80,9 +80,6 @@ class RateLimitConfig:
     # DELETE operation delays  
     delete_delay: float = 1.0  # OPTIMIZED: Reduced from 3.0s
     delete_batch_delay: float = 5.0  # OPTIMIZED: Reduced from 10.0s
-    
-    # Email verification delays
-    verification_delay: float = 0.2  # Between individual verifications
 
 @dataclass
 class ProcessingConfig:
@@ -103,22 +100,7 @@ class ProcessingConfig:
     stale_lead_days: int = 90  # Days before lead considered stale
     bounce_grace_days: int = 7  # Grace period for hard bounces
 
-@dataclass
-class EmailVerificationConfig:
-    """Email verification settings."""
-    enabled: bool = False  # DISABLED: Let Instantly handle verification internally
-    valid_statuses: List[str] = None
-    cost_per_verification: float = 0.25  # Credits
-    
-    def __post_init__(self):
-        if self.valid_statuses is None:
-            self.valid_statuses = ['valid', 'accept_all', 'verified']
-    
-    @classmethod
-    def load(cls) -> 'EmailVerificationConfig':
-        """Load verification config from environment."""
-        enabled = os.getenv('VERIFY_EMAILS_BEFORE_CREATION', 'true').lower() == 'true'
-        return cls(enabled=enabled)
+# EMAIL VERIFICATION REMOVED - Let Instantly handle verification internally
 
 class SystemConfig:
     """Main configuration class that aggregates all config sections."""
@@ -129,7 +111,6 @@ class SystemConfig:
         self.bigquery = BigQueryConfig()
         self.rate_limits = RateLimitConfig()
         self.processing = ProcessingConfig()
-        self.verification = EmailVerificationConfig.load()
         
         # System settings
         self.dry_run = os.getenv('DRY_RUN', 'false').lower() == 'true'
@@ -164,7 +145,6 @@ class SystemConfig:
         logger.info("🔧 System Configuration:")
         logger.info(f"   Dry Run: {self.dry_run}")
         logger.info(f"   Target Leads/Run: {self.processing.target_new_leads_per_run}")
-        logger.info(f"   Email Verification: {self.verification.enabled}")
         logger.info(f"   Pagination Delay: {self.rate_limits.pagination_delay}s")
         logger.info(f"   DELETE Delay: {self.rate_limits.delete_delay}s")
 
@@ -178,7 +158,7 @@ MIDSIZE_CAMPAIGN_ID = config.campaigns.midsize_campaign_id
 PROJECT_ID = config.bigquery.project_id
 DATASET_ID = config.bigquery.dataset_id
 TARGET_NEW_LEADS_PER_RUN = config.processing.target_new_leads_per_run
-VERIFICATION_VALID_STATUSES = config.verification.valid_statuses
+# VERIFICATION_VALID_STATUSES removed - no longer needed
 
 def get_instantly_headers() -> Dict[str, str]:
     """Backward compatibility function."""

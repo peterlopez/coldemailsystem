@@ -49,14 +49,12 @@ except ImportError as e:
     logger.warning(f"📴 Notification system not available: {e}")
 
 # OPTIMIZED: Use centralized configuration
-from shared_config import config, DRY_RUN, SMB_CAMPAIGN_ID, MIDSIZE_CAMPAIGN_ID, PROJECT_ID, DATASET_ID, TARGET_NEW_LEADS_PER_RUN, VERIFICATION_VALID_STATUSES
+from shared_config import config, DRY_RUN, SMB_CAMPAIGN_ID, MIDSIZE_CAMPAIGN_ID, PROJECT_ID, DATASET_ID, TARGET_NEW_LEADS_PER_RUN
 
 # Legacy variable mappings for backward compatibility
 INSTANTLY_CAP_GUARD = config.processing.inventory_cap_guard
 BATCH_SIZE = config.processing.bigquery_batch_size
 BATCH_SLEEP_SECONDS = int(os.getenv('BATCH_SLEEP_SECONDS', '10'))  # Keep for backward compatibility
-VERIFY_EMAILS_BEFORE_CREATION = config.verification.enabled
-VERIFICATION_TIMEOUT = int(os.getenv('VERIFICATION_TIMEOUT', '10'))  # Max wait for pending
 LEAD_INVENTORY_MULTIPLIER = float(os.getenv('LEAD_INVENTORY_MULTIPLIER', '3.5'))  # Conservative start
 
 # Drain testing configuration - limit total leads processed for testing  
@@ -999,66 +997,7 @@ def _bulk_insert_dnc_list(leads: List[InstantlyLead]) -> None:
     bq_client.query(bulk_dnc_query).result()
     logger.info(f"🚫 Bulk added {len(leads)} unsubscribes to permanent DNC list")
 
-def _bulk_track_verification_failures(failed_verification_leads: List[tuple], campaign_id: str) -> None:
-    """OPTIMIZED: Single bulk operation for tracking verification failures."""
-    if not failed_verification_leads:
-        return
-    
-    # Build VALUES clause for all failed verifications
-    values_rows = []
-    for lead, verification in failed_verification_leads:
-        safe_email = lead.email.replace("'", "''")
-        safe_status = verification.get('status', 'unknown').replace("'", "''")
-        catch_all = str(verification.get('catch_all', False)).upper()
-        credits_used = verification.get('credits_used', 1)
-        
-        values_rows.append(f"""(
-            '{safe_email}', 
-            '{campaign_id}', 
-            'verification_failed',
-            '{safe_status}',
-            {catch_all},
-            {credits_used},
-            CURRENT_TIMESTAMP(),
-            CURRENT_TIMESTAMP(),
-            CURRENT_TIMESTAMP()
-        )""")
-    
-    values_clause = ",\n    ".join(values_rows)
-    
-    # Single MERGE query for all verification failures
-    bulk_verification_query = f"""
-    MERGE `{PROJECT_ID}.{DATASET_ID}.ops_inst_state` T
-    USING (
-        SELECT email, campaign_id, status, verification_status, 
-               verification_catch_all, verification_credits_used,
-               verified_at, added_at, updated_at
-        FROM UNNEST([
-            {values_clause}
-        ]) AS S(email, campaign_id, status, verification_status, 
-                verification_catch_all, verification_credits_used,
-                verified_at, added_at, updated_at)
-    ) S
-    ON T.email = S.email AND T.campaign_id = S.campaign_id
-    WHEN MATCHED THEN
-        UPDATE SET 
-            status = S.status,
-            verification_status = S.verification_status,
-            verification_catch_all = S.verification_catch_all,
-            verification_credits_used = S.verification_credits_used,
-            verified_at = S.verified_at,
-            updated_at = S.updated_at
-    WHEN NOT MATCHED THEN
-        INSERT (email, campaign_id, status, verification_status,
-                verification_catch_all, verification_credits_used,
-                verified_at, added_at, updated_at)
-        VALUES (S.email, S.campaign_id, S.status, S.verification_status,
-                S.verification_catch_all, S.verification_credits_used,
-                S.verified_at, S.added_at, S.updated_at)
-    """
-    
-    bq_client.query(bulk_verification_query).result()
-    logger.info(f"✅ Bulk tracked {len(failed_verification_leads)} verification failures")
+# VERIFICATION FAILURE TRACKING REMOVED - No longer needed
 
 def delete_leads_from_instantly(leads: List[InstantlyLead]) -> None:
     """Delete finished leads from Instantly to free inventory with proper rate limiting."""
@@ -1334,71 +1273,7 @@ def split_leads_by_segment(leads: List[Lead]) -> Tuple[List[Lead], List[Lead]]:
     midsize_leads = [l for l in leads if l.sequence_target == 'Midsize']
     return smb_leads, midsize_leads
 
-def verify_email(email: str) -> dict:
-    """Verify email using Instantly.ai verification API - OPTIMIZED with rate limiting."""
-    try:
-        # Skip verification in dry run mode
-        if DRY_RUN:
-            return {
-                'email': email,
-                'status': 'valid',
-                'catch_all': False,
-                'credits_used': 0
-            }
-        
-        # OPTIMIZATION: Add small delay between verification calls
-        verification_delay = config.rate_limits.verification_delay if config else 0.2
-        time.sleep(verification_delay)
-        
-        data = {'email': email}
-        response = call_instantly_api('/api/v2/email-verification', 
-                                    method='POST', 
-                                    data=data)
-        
-        # ENHANCED DEBUG: Log full verification response to understand failure patterns
-        logger.info(f"📧 VERIFICATION DEBUG - API response for {email}: {json.dumps(response)}")
-        
-        # Additional specific debugging for common fields
-        verification_status = response.get('verification_status', 'unknown')
-        is_role_based = response.get('role_based', False)
-        is_disposable = response.get('disposable', False)
-        mx_records = response.get('mx_records', False)
-        logger.info(f"📧 VERIFICATION DETAILS - {email}: status={verification_status}, role_based={is_role_based}, disposable={is_disposable}, mx_records={mx_records}")
-        
-        # Handle pending status with polling (optimized timeout)
-        if response.get('verification_status') == 'pending':
-            logger.info(f"Verification pending for {email}, waiting...")
-            time.sleep(2)  # Wait before checking status
-            response = call_instantly_api(f'/api/v2/email-verification/{email}', 
-                                        method='GET')
-            logger.info(f"📧 VERIFICATION DEBUG (GET) - API response for {email}: {json.dumps(response)}")
-        
-        # Extract all verification details for better tracking
-        verification_result = {
-            'email': email,
-            'status': response.get('verification_status', 'unknown'),
-            'catch_all': response.get('catch_all', False),
-            'credits_used': int(float(response.get('credits_used', 1))),  # Convert decimal to integer for BigQuery
-            'disposable': response.get('disposable', False),
-            'role_based': response.get('role_based', False),
-            'free_email': response.get('free_email', False),
-            'mx_records': response.get('mx_records', False),
-            'smtp_check': response.get('smtp_check', False)
-        }
-        
-        # Log verification result details
-        if verification_result['status'] not in VERIFICATION_VALID_STATUSES:
-            logger.info(f"❌ Verification failed for {email}: status={verification_result['status']}, "
-                       f"disposable={verification_result['disposable']}, "
-                       f"role_based={verification_result['role_based']}, "
-                       f"mx_records={verification_result['mx_records']}")
-        
-        return verification_result
-        
-    except Exception as e:
-        logger.error(f"Email verification failed for {email}: {e}")
-        log_dead_letter('verification', email, None, None, None, str(e))
-        return {'email': email, 'status': 'error', 'error': str(e)}
+# EMAIL VERIFICATION REMOVED - Let Instantly handle verification internally
 
 def create_lead_in_instantly(lead: Lead, campaign_id: str) -> Optional[str]:
     """Create a single lead in Instantly campaign with proper campaign assignment."""
@@ -1534,51 +1409,18 @@ def update_ops_state(leads: List[Lead], campaign_id: str, lead_ids: List[str],
         logger.error(f"Failed to update ops state: {e}")
 
 def process_lead_batch(leads: List[Lead], campaign_id: str) -> int:
-    """Process a batch of leads for a specific campaign with email verification."""
+    """Process a batch of leads for a specific campaign - NO VERIFICATION."""
     if not leads:
         return 0
     
     logger.info(f"Processing batch of {len(leads)} leads for campaign {campaign_id}")
-    
-    # Verification phase
-    verified_leads = []
-    verification_results = []
-    
-    if VERIFY_EMAILS_BEFORE_CREATION:
-        logger.info(f"Verifying {len(leads)} email addresses...")
-        failed_verification_leads = []
-        
-        for lead in leads:
-            verification = verify_email(lead.email)
-            verification_results.append(verification)
-            
-            if verification['status'] in VERIFICATION_VALID_STATUSES:
-                verified_leads.append(lead)
-                logger.debug(f"✅ {lead.email} verified as {verification['status']}")
-            else:
-                logger.info(f"❌ Skipping {lead.email}: {verification['status']}")
-                failed_verification_leads.append((lead, verification))
-        
-        logger.info(f"Verified {len(verified_leads)}/{len(leads)} leads as valid")
-        
-        # OPTIMIZED: Track failed verifications in BigQuery with bulk operation
-        if failed_verification_leads:
-            logger.info(f"Tracking {len(failed_verification_leads)} failed verifications in ops_inst_state with bulk operation")
-            try:
-                _bulk_track_verification_failures(failed_verification_leads, campaign_id)
-            except Exception as e:
-                logger.error(f"Failed to track verification failures: {e}")
-                
-    else:
-        # Skip verification if disabled
-        verified_leads = leads
-        logger.info("Email verification disabled, processing all leads")
+    logger.info("📤 Processing all leads directly (verification handled by Instantly)")
     
     successful_ids = []
     
     # Process in smaller batches to respect rate limits
-    for i in range(0, len(verified_leads), BATCH_SIZE):
-        batch = verified_leads[i:i + BATCH_SIZE]
+    for i in range(0, len(leads), BATCH_SIZE):
+        batch = leads[i:i + BATCH_SIZE]
         batch_ids = []
         
         for lead in batch:
@@ -1588,27 +1430,16 @@ def process_lead_batch(leads: List[Lead], campaign_id: str) -> int:
         
         successful_ids.extend(batch_ids)
         
-        # Update ops_state with verification results
-        if verification_results:
-            # Only pass verification results for the current batch
-            batch_verifications = []
-            for lead in batch:
-                # Find matching verification result
-                for v in verification_results:
-                    if v['email'] == lead.email:
-                        batch_verifications.append(v)
-                        break
-            update_ops_state(batch, campaign_id, batch_ids, batch_verifications)
-        else:
-            update_ops_state(batch, campaign_id, batch_ids)
+        # Update ops_state without verification results
+        update_ops_state(batch, campaign_id, batch_ids)
         
-        if i + BATCH_SIZE < len(verified_leads):  # Not the last batch
+        if i + BATCH_SIZE < len(leads):  # Not the last batch
             logger.info(f"Sleeping {BATCH_SLEEP_SECONDS}s between batches...")
             time.sleep(BATCH_SLEEP_SECONDS)
     
     # NOTIFICATION FIX: Count all non-None IDs as successful (includes existing leads)
     successful_count = len([id for id in successful_ids if id is not None])
-    logger.info(f"✅ Successfully processed {successful_count}/{len(verified_leads)} verified leads")
+    logger.info(f"✅ Successfully processed {successful_count}/{len(leads)} leads")
     logger.info(f"📊 Notification will report {successful_count} leads added to campaign")
     return successful_count
 
@@ -1664,67 +1495,8 @@ def housekeeping() -> Dict:
         result = bq_client.query(query).result()
         eligible_count = next(result).count
         
-        # Get verification metrics if enabled
+        # VERIFICATION METRICS REMOVED - Let Instantly handle verification internally
         verification_stats = {}
-        if VERIFY_EMAILS_BEFORE_CREATION:
-            try:
-                verification_query = f'''
-                SELECT 
-                    verification_status,
-                    COUNT(*) as count,
-                    COALESCE(SUM(verification_credits_used), 0) as total_credits
-                FROM `{PROJECT_ID}.{DATASET_ID}.ops_inst_state`
-                WHERE verified_at > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
-                  AND verification_status IS NOT NULL
-                GROUP BY verification_status
-                '''
-                
-                verification_result = bq_client.query(verification_query).result()
-                
-                logger.info("📊 Verification Stats (Last 24h):")
-                total_verified = 0
-                total_credits = 0
-                
-                for row in verification_result:
-                    status = row.verification_status
-                    count = row.count
-                    credits = row.total_credits
-                    
-                    verification_stats[status] = {
-                        'count': count,
-                        'credits': credits
-                    }
-                    
-                    total_verified += count
-                    total_credits += credits
-                    
-                    logger.info(f"  - {status}: {count} emails, {credits} credits")
-                
-                if total_verified > 0:
-                    valid_count = sum(stats['count'] for status, stats in verification_stats.items() 
-                                    if status in VERIFICATION_VALID_STATUSES)
-                    valid_rate = (valid_count / total_verified * 100) if total_verified > 0 else 0
-                    logger.info(f"  - Total verified: {total_verified}, Valid rate: {valid_rate:.1f}%")
-                    logger.info(f"  - Credits used: {total_credits}")
-                    
-                    # ENHANCED DEBUG: Analyze why emails are failing verification
-                    failed_statuses = [status for status in verification_stats.keys() 
-                                     if status not in VERIFICATION_VALID_STATUSES]
-                    if failed_statuses:
-                        failed_count = sum(stats['count'] for status, stats in verification_stats.items() 
-                                         if status not in VERIFICATION_VALID_STATUSES)
-                        logger.warning(f"📊 VERIFICATION ANALYSIS: {failed_count} emails failed ({(failed_count/total_verified*100):.1f}%)")
-                        logger.warning(f"📊 ACCEPTABLE STATUSES: {VERIFICATION_VALID_STATUSES}")
-                        logger.warning(f"📊 REJECTED STATUSES: {failed_statuses}")
-                        
-                        # Show specific failure reasons
-                        for status in failed_statuses:
-                            count = verification_stats[status]['count']
-                            pct = (count / total_verified * 100) if total_verified > 0 else 0
-                            logger.warning(f"   - {status}: {count} emails ({pct:.1f}%)")
-                
-            except Exception as e:
-                logger.warning(f"Could not get verification metrics: {e}")
         
         # Calculate utilization metrics
         capacity_utilization = (inventory / safe_inventory_limit * 100) if safe_inventory_limit > 0 else 0
@@ -1740,9 +1512,7 @@ def housekeeping() -> Dict:
             'capacity_utilization_pct': round(capacity_utilization, 1),
             'lead_multiplier': LEAD_INVENTORY_MULTIPLIER,
             'cap_guard': INSTANTLY_CAP_GUARD,
-            'dry_run': DRY_RUN,
-            'verification_enabled': VERIFY_EMAILS_BEFORE_CREATION,
-            'verification_stats': verification_stats
+            'dry_run': DRY_RUN
         }
         
         logger.info(f"Summary:")
@@ -1751,7 +1521,7 @@ def housekeeping() -> Dict:
         logger.info(f"  - Mailboxes: {mailbox_count} ({daily_capacity} emails/day)")
         logger.info(f"  - Safe capacity: {safe_inventory_limit:,} leads (utilization: {capacity_utilization:.1f}%)")
         logger.info(f"  - Legacy cap guard: {INSTANTLY_CAP_GUARD:,}")
-        logger.info(f"  - Verification: {'ENABLED' if VERIFY_EMAILS_BEFORE_CREATION else 'DISABLED'}")
+        logger.info(f"  - Verification: DISABLED (handled by Instantly)")
         
         return metrics
     
@@ -1777,15 +1547,7 @@ def main():
             "smb_campaign": {"campaign_id": SMB_CAMPAIGN_ID, "leads_added": 0, "campaign_name": "SMB"},
             "midsize_campaign": {"campaign_id": MIDSIZE_CAMPAIGN_ID, "leads_added": 0, "campaign_name": "Midsize"}
         },
-        "verification_results": {
-            "total_attempted": 0,
-            "verified_successful": 0,
-            "verification_failed": 0,
-            "failed_reasons": {},
-            "failed_disposition": "Added to ops_dead_letters table for review",
-            "credits_used": 0.0,
-            "success_rate_percentage": 0.0
-        },
+        # VERIFICATION_RESULTS REMOVED - Let Instantly handle verification internally
         "final_inventory": {"instantly_total": 0, "bigquery_eligible": 0},
         "performance": {"api_success_rate": 0.0, "processing_rate_per_minute": 0.0},
         "errors": [],

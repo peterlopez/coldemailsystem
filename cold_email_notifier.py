@@ -211,7 +211,6 @@ class ColdEmailNotifier:
             # Extract data with safe defaults
             capacity = data.get('capacity_status', {})
             leads = data.get('leads_processed', {})
-            verification = data.get('verification_results', {})
             inventory = data.get('final_inventory', {})
             performance = data.get('performance', {})
             errors = data.get('errors', [])
@@ -225,12 +224,6 @@ class ColdEmailNotifier:
             midsize_added = leads.get('midsize_campaign', {}).get('leads_added', 0)
             total_added = smb_added + midsize_added
             
-            verification_success = verification.get('verified_successful', 0)
-            verification_total = verification.get('total_attempted', 0)
-            verification_rate = verification.get('success_rate_percentage', 0)
-            verification_failed = verification.get('verification_failed', 0)
-            credits_used = verification.get('credits_used', 0)
-            
             instantly_total = inventory.get('instantly_total', current_inventory)
             bigquery_eligible = inventory.get('bigquery_eligible', 0)
             
@@ -240,7 +233,6 @@ class ColdEmailNotifier:
             
             # Determine status emojis
             capacity_emoji = "🟢" if utilization < 70 else "🟡" if utilization < 90 else "🔴"
-            verification_emoji = "✨" if verification_rate >= 90 else "⚠️" if verification_rate >= 80 else "🚨"
             
             # Build formatted message - STREAMLINED to remove redundancy
             content = f"""🔄 **Cold Email Sync Complete** | {self._format_timestamp(data.get('timestamp', ''))}
@@ -248,18 +240,13 @@ class ColdEmailNotifier:
 📊 **System Status**
 {capacity_emoji} Current: {current_inventory:,} / {max_capacity:,} leads ({utilization:.1f}% utilized)
 • Available capacity: ~{max_capacity - current_inventory:,} leads remaining
-• Added this run: +{total_added} verified leads
+• Added this run: +{total_added} leads
 • BigQuery eligible: {bigquery_eligible:,} ready
 
 📈 **Campaign Breakdown**  
 • SMB Campaign: {smb_added} leads added
 • Midsize Campaign: {midsize_added} leads added
-• Total processed: {total_added}/{verification_total} attempted
-
-{verification_emoji} **Email Verification**
-• Success: {verification_success}/{verification_total} ({verification_rate:.1f}%) 
-• Failed: {verification_failed} leads → Dead letters for review
-• Credits used: ${credits_used:.2f}
+• Total processed: {total_added} leads (verification handled by Instantly)
 
 ⚡ **Performance**
 • Duration: {self._format_duration(duration)}
