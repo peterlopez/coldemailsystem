@@ -147,19 +147,31 @@ def trigger_verification_for_new_leads(lead_data: List[Dict], campaign_id: str) 
                 
                 response = call_instantly_api('/api/v2/email-verification', method='POST', data=verification_data)
                 
-                if response:
-                    # ✅ Store verification job with instantly_lead_id
+                if response and response.get('status') == 'success':
+                    # ✅ Store verification result immediately (API returns immediate results)
+                    verification_status = response.get('verification_status', 'pending')
+                    credits_used = response.get('credits_used', 0.25)
+                    
                     store_verification_job(
                         email=lead['email'],
                         instantly_lead_id=lead['instantly_lead_id'],
                         campaign_id=campaign_id,
-                        verification_status=response.get('verification_status', 'pending'),
-                        credits_used=response.get('credits_used', 1)
+                        verification_status=verification_status,
+                        credits_used=credits_used
                     )
                     successful_triggers += 1
-                    logger.debug(f"✅ Verification triggered: {lead['email']}")
+                    logger.debug(f"✅ Verification completed: {lead['email']} -> {verification_status}")
+                    
+                    # ✅ If email is invalid, trigger deletion immediately
+                    if verification_status in ['invalid', 'risky']:
+                        logger.info(f"🗑️ Email {lead['email']} is {verification_status}, triggering deletion")
+                        deletion_success = delete_invalid_lead(lead['email'], lead['instantly_lead_id'])
+                        if deletion_success:
+                            # Update status to show it was deleted
+                            update_verification_status(lead['email'], 'invalid_deleted', response)
+                            logger.info(f"✅ Deleted and DNC'd invalid email: {lead['email']}")
                 else:
-                    logger.warning(f"⚠️ Verification trigger failed: {lead['email']}")
+                    logger.warning(f"⚠️ Verification failed: {lead['email']}")
                 
                 # ✅ Simple rate limiting
                 time.sleep(0.5)
