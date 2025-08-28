@@ -17,9 +17,12 @@ import json
 import time
 import logging
 import requests
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional
 from google.cloud import bigquery
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Add current directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -28,8 +31,15 @@ from shared_config import InstantlyConfig, PROJECT_ID, DATASET_ID, DRY_RUN
 
 logger = logging.getLogger(__name__)
 
-def call_instantly_api(endpoint: str, method: str = 'GET', data: Optional[Dict] = None) -> Dict:
-    """Call Instantly API with error handling - standalone version for verification."""
+def is_uuid4(s: str) -> bool:
+    """Check if string is a valid UUID v4"""
+    try:
+        return uuid.UUID(s).version == 4
+    except Exception:
+        return False
+
+def call_instantly_api(endpoint: str, method: str = 'GET', data: Optional[Dict] = None, use_session: bool = False) -> Dict:
+    """Call Instantly API with enhanced logging and session management"""
     # Try to get API key from shared config first, then environment
     api_key = os.getenv('INSTANTLY_API_KEY')
     if not api_key:
@@ -53,31 +63,66 @@ def call_instantly_api(endpoint: str, method: str = 'GET', data: Optional[Dict] 
         logger.info(f"DRY RUN: Would call {method} {url}")
         return {'success': True, 'dry_run': True}
     
+    # Set timeout based on method (3s for DELETE, 30s for others)
+    timeout = (3, 3) if method == 'DELETE' else 30
+    
     try:
-        if method == 'GET':
-            response = requests.get(url, headers=headers, timeout=30)
-        elif method == 'POST':
-            response = requests.post(url, headers=headers, json=data, timeout=30)
-        elif method == 'DELETE':
-            response = requests.delete(url, headers=headers, timeout=30)
+        if use_session and method == 'DELETE':
+            # Use session with retry adapter for DELETE operations
+            session = requests.Session()
+            session.headers.update(headers)
+            
+            # Only retry on 429/5xx errors, not 400s
+            retries = Retry(
+                total=2,
+                backoff_factor=0.5,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["DELETE"]
+            )
+            session.mount("https://", HTTPAdapter(max_retries=retries))
+            response = session.delete(url, timeout=timeout)
         else:
-            raise ValueError(f"Unsupported method: {method}")
+            # Standard requests for non-DELETE or when session not requested
+            if method == 'GET':
+                response = requests.get(url, headers=headers, timeout=timeout)
+            elif method == 'POST':
+                response = requests.post(url, headers=headers, json=data, timeout=timeout)
+            elif method == 'DELETE':
+                response = requests.delete(url, headers=headers, timeout=timeout)
+            else:
+                raise ValueError(f"Unsupported method: {method}")
         
-        if response.status_code == 404 and method == 'DELETE':
-            # Treat 404 on DELETE as success (already deleted)
-            return {'success': True}
+        # Enhanced logging for DELETE operations
+        if method == 'DELETE':
+            rid = response.headers.get("X-Request-Id", "none")
+            body = response.text[:800] if response.text else ""
+            lead_id = endpoint.split('/')[-1] if '/' in endpoint else "unknown"
+            logger.warning(f"DELETE {response.status_code} id={lead_id} rid={rid} body={body}")
+        
+        # Treat 404/409 on DELETE as success (already deleted/conflict)
+        if response.status_code in [404, 409] and method == 'DELETE':
+            return {'success': True, 'status_code': response.status_code}
         
         response.raise_for_status()
         
         # Handle empty response for DELETE operations
         if method == 'DELETE' and not response.content:
-            return {'success': True}
+            return {'success': True, 'status_code': response.status_code}
             
         return response.json()
     
     except requests.exceptions.RequestException as e:
-        logger.error(f"API call failed {method} {url}: {e}")
-        return None
+        # Enhanced error logging for DELETE operations
+        if method == 'DELETE' and hasattr(e, 'response') and e.response is not None:
+            rid = e.response.headers.get("X-Request-Id", "none")
+            body = e.response.text[:800] if e.response.text else str(e)
+            lead_id = endpoint.split('/')[-1] if '/' in endpoint else "unknown"
+            status_code = getattr(e.response, 'status_code', 0)
+            logger.error(f"DELETE {status_code} id={lead_id} rid={rid} body={body}")
+            return {'success': False, 'status_code': status_code, 'error': body}
+        else:
+            logger.error(f"API call failed {method} {url}: {e}")
+            return None
 
 # Initialize BigQuery client
 try:
@@ -353,7 +398,7 @@ def store_verification_job(email: str, instantly_lead_id: str, campaign_id: str,
 
 def poll_verification_results() -> Dict[str, int]:
     """
-    Process deletion queue and re-verify stale pending emails
+    Process verifications first, then deletion queue (reordered for priority)
     
     Returns:
         Dict with counts of processed operations
@@ -377,33 +422,33 @@ def poll_verification_results() -> Dict[str, int]:
     
     results = {'deletes_processed': 0, 'verifications_checked': 0, 'errors': 0}
     
-    # Process deletion queue first
-    deletion_results = process_deletion_queue()
-    results['deletes_processed'] = deletion_results.get('processed', 0)
-    results['errors'] += deletion_results.get('errors', 0)
-    
-    # Then re-verify stale pending emails
+    # Process verifications FIRST to prevent starvation
     verification_results = process_stale_verifications()
     results['verifications_checked'] = verification_results.get('checked', 0)
     results['errors'] += verification_results.get('errors', 0)
     
-    logger.info(f"📊 Polling complete: deletions={results['deletes_processed']}, verifications={results['verifications_checked']}, errors={results['errors']}")
+    # Then process deletion queue with circuit breaker
+    deletion_results = process_deletion_queue()
+    results['deletes_processed'] = deletion_results.get('processed', 0)
+    results['errors'] += deletion_results.get('errors', 0)
+    
+    logger.info(f"📊 Polling complete: verifications={results['verifications_checked']}, deletions={results['deletes_processed']}, errors={results['errors']}")
     return results
 
 def process_deletion_queue() -> Dict[str, int]:
-    """Process queued deletions with retry logic"""
+    """Process queued deletions with UUID validation, capping, and circuit breaker"""
     if not bq_client:
         return {'processed': 0, 'errors': 0}
     
     try:
-        # Get up to 50 queued deletions
+        # Get up to 30 queued deletions (capped to prevent starvation)
         query = """
         SELECT email, instantly_lead_id, deletion_attempts
         FROM `{}.{}.ops_inst_state`
         WHERE deletion_status = 'queued'
           AND deletion_attempts < 5
         ORDER BY COALESCE(last_deletion_attempt, updated_at) ASC
-        LIMIT 50
+        LIMIT 30
         """.format(PROJECT_ID, DATASET_ID)
         
         results = list(bq_client.query(query).result())
@@ -412,24 +457,49 @@ def process_deletion_queue() -> Dict[str, int]:
             logger.debug("ℹ️ No queued deletions to process")
             return {'processed': 0, 'errors': 0}
         
-        logger.info(f"🗑️ Processing {len(results)} queued deletions")
+        logger.info(f"🗑️ Processing {len(results)} queued deletions (capped at 30)")
         
         processed = 0
         errors = 0
+        skipped_invalid_uuid = 0
         
         for row in results:
             email = row.email
             instantly_lead_id = row.instantly_lead_id
             attempts = row.deletion_attempts
             
+            # UUID validation - skip invalid UUIDs
+            if not is_uuid4(instantly_lead_id):
+                logger.warning(f"⚠️ Skipping invalid UUID for {email}: {instantly_lead_id}")
+                # Mark as failed due to invalid UUID
+                increment_deletion_attempts_with_error(
+                    email, instantly_lead_id, 400, "Invalid UUID format"
+                )
+                skipped_invalid_uuid += 1
+                errors += 1
+                continue
+            
             try:
-                # Attempt deletion
-                response = call_instantly_api(f'/api/v2/leads/{instantly_lead_id}', method='DELETE')
+                # Attempt deletion with session retry adapter
+                response = call_instantly_api(
+                    f'/api/v2/leads/{instantly_lead_id}', 
+                    method='DELETE',
+                    use_session=True
+                )
                 
-                # Check if deletion was successful
-                success = response is not None and (
+                if not response:
+                    # No response indicates failure
+                    increment_deletion_attempts_with_error(
+                        email, instantly_lead_id, 0, "No response from API"
+                    )
+                    errors += 1
+                    continue
+                
+                # Check for success (including 404/409 as success)
+                success = (
                     response.get('success', False) or 
-                    response.get('status') == 'success'
+                    response.get('status') == 'success' or
+                    response.get('status_code') in [404, 409]
                 )
                 
                 if success:
@@ -439,26 +509,34 @@ def process_deletion_queue() -> Dict[str, int]:
                     logger.info(f"✅ Successfully deleted: {email}")
                     processed += 1
                 else:
-                    # Log response body and increment attempts
-                    logger.warning(f"⚠️ DELETE failed for {email}: {response}")
-                    increment_deletion_attempts(email, instantly_lead_id, str(response))
+                    # Extract error details and increment attempts
+                    status_code = response.get('status_code', 0)
+                    error_message = response.get('error', str(response))
+                    increment_deletion_attempts_with_error(
+                        email, instantly_lead_id, status_code, error_message
+                    )
                     errors += 1
                     
             except Exception as e:
-                # Handle 404 as success (already deleted)
-                if '404' in str(e):
-                    mark_deletion_complete(email, instantly_lead_id)
-                    add_to_dnc_list(email, 'invalid_verification')
-                    logger.info(f"✅ Lead already deleted (404): {email}")
-                    processed += 1
-                else:
-                    # Log error and increment attempts
-                    logger.error(f"❌ DELETE error for {email}: {e}")
-                    increment_deletion_attempts(email, instantly_lead_id, str(e))
-                    errors += 1
+                # Handle exceptions with error tracking
+                logger.error(f"❌ DELETE error for {email}: {e}")
+                increment_deletion_attempts_with_error(
+                    email, instantly_lead_id, 0, str(e)
+                )
+                errors += 1
+            
+            # Circuit breaker: stop if failure rate > 80%
+            if processed + errors > 5:  # Only check after 5+ attempts
+                failure_rate = errors / (processed + errors)
+                if failure_rate > 0.8:
+                    logger.warning(f"🔴 Circuit breaker engaged: {failure_rate:.1%} failure rate after {processed + errors} deletions")
+                    break
             
             # Rate limiting between deletions
             time.sleep(0.5)
+        
+        if skipped_invalid_uuid > 0:
+            logger.info(f"⚠️ Skipped {skipped_invalid_uuid} deletions due to invalid UUIDs")
         
         return {'processed': processed, 'errors': errors}
         
@@ -580,8 +658,8 @@ def mark_deletion_complete(email: str, instantly_lead_id: str):
     except Exception as e:
         logger.error(f"❌ Failed to mark deletion complete for {email}: {e}")
 
-def increment_deletion_attempts(email: str, instantly_lead_id: str, error_message: str):
-    """Increment deletion attempts and set to failed after 3 attempts"""
+def increment_deletion_attempts_with_error(email: str, instantly_lead_id: str, status_code: int, error_message: str):
+    """Increment deletion attempts and store error details"""
     if not bq_client:
         return
     
@@ -605,24 +683,31 @@ def increment_deletion_attempts(email: str, instantly_lead_id: str, error_messag
         current_attempts = results[0].deletion_attempts if results else 0
         new_attempts = current_attempts + 1
         
-        # Update attempts and status
+        # Truncate error message to prevent BigQuery field size issues
+        truncated_error = error_message[:1000] if error_message else ""
+        
+        # Update attempts, status, and error details
         if new_attempts >= 5:
             # Mark as failed after 5 attempts
             update_query = """
             UPDATE `{}.{}.ops_inst_state`
             SET deletion_attempts = @new_attempts,
                 deletion_status = 'failed',
+                deletion_last_error_code = @error_code,
+                deletion_last_error_message = @error_message,
                 last_deletion_attempt = CURRENT_TIMESTAMP(),
                 updated_at = CURRENT_TIMESTAMP()
             WHERE email = @email
               AND instantly_lead_id = @instantly_lead_id
             """.format(PROJECT_ID, DATASET_ID)
-            logger.warning(f"⚠️ Marking {email} as deletion failed after {new_attempts} attempts")
+            logger.warning(f"⚠️ Marking {email} as deletion failed after {new_attempts} attempts (code: {status_code})")
         else:
-            # Just increment attempts
+            # Just increment attempts and store error details
             update_query = """
             UPDATE `{}.{}.ops_inst_state`
             SET deletion_attempts = @new_attempts,
+                deletion_last_error_code = @error_code,
+                deletion_last_error_message = @error_message,
                 last_deletion_attempt = CURRENT_TIMESTAMP(),
                 updated_at = CURRENT_TIMESTAMP()
             WHERE email = @email
@@ -633,17 +718,24 @@ def increment_deletion_attempts(email: str, instantly_lead_id: str, error_messag
             query_parameters=[
                 bigquery.ScalarQueryParameter("email", "STRING", email),
                 bigquery.ScalarQueryParameter("instantly_lead_id", "STRING", instantly_lead_id),
-                bigquery.ScalarQueryParameter("new_attempts", "INTEGER", new_attempts)
+                bigquery.ScalarQueryParameter("new_attempts", "INTEGER", new_attempts),
+                bigquery.ScalarQueryParameter("error_code", "INTEGER", status_code),
+                bigquery.ScalarQueryParameter("error_message", "STRING", truncated_error)
             ]
         )
         
         bq_client.query(update_query, job_config=job_config).result()
         
-        # Log the error to dead letters
-        log_dead_letter('delete_lead', email, error_message, 0, error_message)
+        # Log the error to dead letters for additional debugging
+        log_dead_letter('delete_lead', email, error_message, status_code, truncated_error)
         
     except Exception as e:
         logger.error(f"❌ Failed to increment deletion attempts for {email}: {e}")
+
+# Keep the old function for backwards compatibility
+def increment_deletion_attempts(email: str, instantly_lead_id: str, error_message: str):
+    """Legacy function - use increment_deletion_attempts_with_error instead"""
+    increment_deletion_attempts_with_error(email, instantly_lead_id, 0, error_message)
 
 def store_verification_with_attempts(email: str, instantly_lead_id: str, campaign_id: str, 
                                    verification_status: str, credits_used: float, attempts: int):

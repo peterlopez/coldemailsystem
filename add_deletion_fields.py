@@ -55,6 +55,39 @@ def add_deletion_fields():
     else:
         print("ℹ️ verification_attempts already exists")
     
+    if 'deletion_last_error_code' not in existing_fields:
+        fields_to_add.append(bigquery.SchemaField(
+            'deletion_last_error_code',
+            'INTEGER',
+            mode='NULLABLE',
+            description='Last HTTP error code from deletion attempt'
+        ))
+        print("✅ Will add deletion_last_error_code field")
+    else:
+        print("ℹ️ deletion_last_error_code already exists")
+    
+    if 'deletion_last_error_message' not in existing_fields:
+        fields_to_add.append(bigquery.SchemaField(
+            'deletion_last_error_message',
+            'STRING',
+            mode='NULLABLE',
+            description='Last error message from deletion attempt (truncated)'
+        ))
+        print("✅ Will add deletion_last_error_message field")
+    else:
+        print("ℹ️ deletion_last_error_message already exists")
+        
+    if 'last_deletion_attempt' not in existing_fields:
+        fields_to_add.append(bigquery.SchemaField(
+            'last_deletion_attempt',
+            'TIMESTAMP',
+            mode='NULLABLE',
+            description='Timestamp of last deletion attempt'
+        ))
+        print("✅ Will add last_deletion_attempt field")
+    else:
+        print("ℹ️ last_deletion_attempt already exists")
+    
     if fields_to_add:
         # Use ALTER TABLE statements for each field
         for field in fields_to_add:
