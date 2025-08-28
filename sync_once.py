@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import requests
 from google.cloud import bigquery
 from tenacity import retry, stop_after_attempt, wait_exponential
+from dateutil import parser as date_parser
 
 # Configure logging FIRST
 log_format = '%(asctime)s - %(levelname)s - %(message)s'
@@ -722,6 +723,11 @@ def get_finished_leads() -> List[InstantlyLead]:
             # Rate limit retry tracking  
             consecutive_429_errors = 0
             
+            # PHASE 1 OPTIMIZATION: Early exit counters
+            empty_pages_in_row = 0  # Count consecutive pages with no new candidates
+            from datetime import datetime, timezone, timedelta
+            current_time = datetime.now(timezone.utc)
+            
             while True:
                 # Use proper cursor-based pagination
                 url = f"{INSTANTLY_BASE_URL}/api/v2/leads/list"
@@ -781,6 +787,10 @@ def get_finished_leads() -> List[InstantlyLead]:
                     page_lead_ids_list = [lead.get('id') for lead in leads if lead.get('id')]
                     leads_check_results = batch_check_leads_for_drain(page_lead_ids_list)
                     
+                    # PHASE 1 OPTIMIZATION: Track candidates and oldest update time on this page
+                    new_candidates_on_page = 0
+                    oldest_updated_on_page = current_time  # Start with current time, will be reduced
+                    
                     # Process leads that need evaluation
                     for lead in leads:
                         lead_id = lead.get('id', '')
@@ -792,6 +802,21 @@ def get_finished_leads() -> List[InstantlyLead]:
                             
                         # Check if lead needs evaluation (from batch results or force check)
                         needs_check = FORCE_DRAIN_CHECK or leads_check_results.get(lead_id, True)  # Default to True if not found
+                        
+                        # PHASE 1 OPTIMIZATION: Track if this is a new candidate
+                        if needs_check:
+                            new_candidates_on_page += 1
+                        
+                        # PHASE 1 OPTIMIZATION: Track oldest update time on page
+                        try:
+                            updated_at_str = lead.get('updated_at', '')
+                            if updated_at_str:
+                                lead_updated_at = date_parser.parse(updated_at_str)
+                                if lead_updated_at < oldest_updated_on_page:
+                                    oldest_updated_on_page = lead_updated_at
+                        except Exception as e:
+                            logger.debug(f"Could not parse updated_at for {email}: {e}")
+                        
                         if needs_check:
                             leads_needing_check += 1
                             total_leads_evaluated += 1
@@ -860,6 +885,23 @@ def get_finished_leads() -> List[InstantlyLead]:
                         logger.info(f"🧪 Stopping pagination for {campaign_name} due to test limit")
                         break
                     
+                    # PHASE 1 OPTIMIZATION: Early exit logic - stop when no new candidates found
+                    if new_candidates_on_page == 0:
+                        empty_pages_in_row += 1
+                        logger.debug(f"📄 Page {page_count}: 0 new candidates (consecutive empty pages: {empty_pages_in_row})")
+                        
+                        # Calculate time difference (26 hours = 26 * 60 * 60 seconds)
+                        time_threshold = current_time - timedelta(hours=26)
+                        
+                        if oldest_updated_on_page < time_threshold:
+                            logger.info(f"⚡ EARLY EXIT: {campaign_name} - No new candidates on page {page_count} and oldest update ({oldest_updated_on_page.strftime('%Y-%m-%d %H:%M:%S')}) is older than 26h threshold. Stopping pagination to optimize performance.")
+                            break
+                        else:
+                            logger.debug(f"📄 Page {page_count}: No candidates but recent updates found (oldest: {oldest_updated_on_page.strftime('%Y-%m-%d %H:%M:%S')}), continuing...")
+                    else:
+                        empty_pages_in_row = 0  # Reset counter when we find candidates
+                        logger.debug(f"📄 Page {page_count}: {new_candidates_on_page} new candidates found")
+                    
                     # Get cursor for next page
                     starting_after = data.get('next_starting_after')
                     if not starting_after:
@@ -871,9 +913,10 @@ def get_finished_leads() -> List[InstantlyLead]:
                         logger.info(f"🧪 TESTING LIMIT: Reached {MAX_PAGES_TO_PROCESS} pages for {campaign_name} (processed {total_leads_accessed} leads)")
                         break
                     
-                    # Safety check to prevent infinite loops (now with proper limit)
-                    if page_count >= 60:  # Max 60 pages (3,000 leads per campaign with 50/page)
-                        logger.warning(f"⚠️ Reached safety limit of 60 pages for {campaign_name} (processed {total_leads_accessed} leads)")
+                    # Safety check to prevent infinite loops (configurable, reduced for drain efficiency)
+                    max_pages_limit = int(os.getenv('DRAIN_MAX_PAGES_PER_CAMPAIGN', 20))  # Reduced from 60 to 20
+                    if page_count >= max_pages_limit:
+                        logger.warning(f"⚠️ Reached safety limit of {max_pages_limit} pages for {campaign_name} (processed {total_leads_accessed} leads)")
                         break
                 
                 elif response.status_code == 401:
