@@ -370,22 +370,34 @@ def batch_check_leads_for_drain(lead_ids: list) -> dict:
             logger.debug(f"📊 Processing BigQuery batch {i//BIGQUERY_BATCH_SIZE + 1}: {len(batch_ids)} leads")
             
             try:
-                # Create parameterized query for batch
-                # Use safe table reference construction
+                # PHASE 3 FIX: Robust parameterized array SELECT query to prevent syntax errors
+                # Using explicit UNNEST with proper formatting for consistency
                 query = f"""
                 SELECT 
                     instantly_lead_id,
                     last_drain_check,
                     TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), last_drain_check, HOUR) as hours_since_check
                 FROM `{PROJECT_ID}.{DATASET_ID}.ops_inst_state`
-                WHERE instantly_lead_id IN UNNEST(@lead_ids)
+                WHERE instantly_lead_id IN (
+                    SELECT lead_id 
+                    FROM UNNEST(@lead_ids) AS lead_id
+                )
                 """
+                
+                # Ensure all lead_ids are strings and not None/empty
+                clean_batch_ids = [str(lead_id) for lead_id in batch_ids if lead_id]
+                
+                if not clean_batch_ids:
+                    logger.debug(f"⚠️ No valid lead IDs in batch, skipping...")
+                    # Add empty results for these leads as fallback
+                    for lead_id in batch_ids:
+                        all_results[lead_id] = True
+                    continue
                 
                 job_config = bigquery.QueryJobConfig(
                     query_parameters=[
-                        bigquery.ArrayQueryParameter("lead_ids", "STRING", batch_ids),
+                        bigquery.ArrayQueryParameter("lead_ids", "STRING", clean_batch_ids),
                     ]
-                    # Note: QueryJobConfig doesn't accept timeout parameters - use result() timeout instead
                 )
                 
                 query_job = bq_client.query(query, job_config=job_config)
@@ -501,18 +513,30 @@ def batch_update_drain_timestamps(lead_ids: list) -> bool:
             logger.debug(f"📊 Batch updating timestamps: batch {i//BATCH_SIZE + 1}, {len(batch_ids)} leads")
             
             try:
-                # Create batch update query - only update existing records, don't insert new ones  
+                # PHASE 3 FIX: Robust parameterized array UPDATE query to prevent syntax errors
+                # Using explicit UNNEST with proper formatting to avoid parsing issues
                 query = f"""
                 UPDATE `{PROJECT_ID}.{DATASET_ID}.ops_inst_state`
-                SET last_drain_check = CURRENT_TIMESTAMP(), updated_at = CURRENT_TIMESTAMP()
-                WHERE instantly_lead_id IN UNNEST(@lead_ids)
+                SET 
+                    last_drain_check = CURRENT_TIMESTAMP(),
+                    updated_at = CURRENT_TIMESTAMP()
+                WHERE instantly_lead_id IN (
+                    SELECT lead_id 
+                    FROM UNNEST(@lead_ids) AS lead_id
+                )
                 """
+                
+                # Ensure all lead_ids are strings and not None/empty
+                clean_batch_ids = [str(lead_id) for lead_id in batch_ids if lead_id]
+                
+                if not clean_batch_ids:
+                    logger.debug(f"⚠️ No valid lead IDs in batch, skipping...")
+                    continue
                 
                 job_config = bigquery.QueryJobConfig(
                     query_parameters=[
-                        bigquery.ArrayQueryParameter("lead_ids", "STRING", batch_ids),
+                        bigquery.ArrayQueryParameter("lead_ids", "STRING", clean_batch_ids),
                     ]
-                    # Note: QueryJobConfig doesn't accept timeout parameters
                 )
                 
                 query_job = bq_client.query(query, job_config=job_config)
