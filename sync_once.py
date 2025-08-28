@@ -1941,11 +1941,14 @@ def main():
             logger.info(f"   - eligible_leads from housekeeping: {eligible_leads}")
             logger.info(f"   - metrics keys available: {list(metrics.keys())}")
             
+            # Use actual calculated safe inventory limit instead of hardcoded cap
+            safe_inventory_limit = metrics.get('safe_inventory_limit', INSTANTLY_CAP_GUARD)
+            
             notification_data["capacity_status"] = {
                 "current_inventory": current_inventory,
-                "max_capacity": INSTANTLY_CAP_GUARD,
-                "utilization_percentage": round((current_inventory / INSTANTLY_CAP_GUARD) * 100, 1),
-                "estimated_capacity_remaining": INSTANTLY_CAP_GUARD - current_inventory
+                "max_capacity": safe_inventory_limit,
+                "utilization_percentage": round((current_inventory / safe_inventory_limit) * 100, 1),
+                "estimated_capacity_remaining": safe_inventory_limit - current_inventory
             }
             
             notification_data["final_inventory"] = {
@@ -1978,7 +1981,14 @@ def main():
                 "success_rate_percentage": 100.0,
                 "credits_used": total_added * 0.25  # Estimated credits
             })
-            notification_data["performance"]["api_success_rate"] = 95.0  # Estimated
+            # Calculate actual API success rate from adaptive rate limiter
+            total_api_calls = adaptive_rate_limiter.success_count + adaptive_rate_limiter.failure_count
+            if total_api_calls > 0:
+                actual_success_rate = (adaptive_rate_limiter.success_count / total_api_calls) * 100
+                notification_data["performance"]["api_success_rate"] = round(actual_success_rate, 1)
+                logger.info(f"📊 Actual API success rate: {actual_success_rate:.1f}% ({adaptive_rate_limiter.success_count}/{total_api_calls} calls)")
+            else:
+                notification_data["performance"]["api_success_rate"] = 100.0  # No API calls made
         
         # Send notification
         if NOTIFICATIONS_AVAILABLE:
