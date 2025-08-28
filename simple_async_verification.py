@@ -100,19 +100,36 @@ def call_instantly_api(endpoint: str, method: str = 'GET', data: Optional[Dict] 
             rid = response.headers.get("X-Request-Id", "none")
             body = response.text[:800] if response.text else ""
             lead_id = endpoint.split('/')[-1] if '/' in endpoint else "unknown"
-            logger.warning(f"DELETE {response.status_code} id={lead_id} rid={rid} body={body}")
-        
-        # Treat 404/409 on DELETE as success (already deleted/conflict)
-        if response.status_code in [404, 409] and method == 'DELETE':
-            return {'success': True, 'status_code': response.status_code}
-        
-        response.raise_for_status()
-        
-        # Handle empty response for DELETE operations
-        if method == 'DELETE' and not response.content:
-            return {'success': True, 'status_code': response.status_code}
             
-        return response.json()
+            # Log successful DELETEs as INFO, failures as WARNING
+            if 200 <= response.status_code < 300 or response.status_code == 404:
+                logger.info(f"DELETE {response.status_code} id={lead_id} rid={rid} body={body}")
+            else:
+                logger.warning(f"DELETE {response.status_code} id={lead_id} rid={rid} body={body}")
+        
+        # Always return structured response with status code for better success detection
+        structured_response = {
+            'status_code': response.status_code,
+            'text': response.text,
+            'json': None
+        }
+        
+        # Treat 404/409 on DELETE as success (already deleted/conflict)  
+        if response.status_code in [404, 409] and method == 'DELETE':
+            return structured_response
+        
+        # Don't raise_for_status - let caller handle status codes
+        if response.status_code >= 400:
+            return structured_response
+            
+        # Parse JSON if available
+        try:
+            if response.content:
+                structured_response['json'] = response.json()
+        except:
+            pass  # Keep json as None if parsing fails
+            
+        return structured_response
     
     except requests.exceptions.RequestException as e:
         # Enhanced error logging for DELETE operations
@@ -122,7 +139,11 @@ def call_instantly_api(endpoint: str, method: str = 'GET', data: Optional[Dict] 
             lead_id = endpoint.split('/')[-1] if '/' in endpoint else "unknown"
             status_code = getattr(e.response, 'status_code', 0)
             logger.error(f"DELETE {status_code} id={lead_id} rid={rid} body={body}")
-            return {'success': False, 'status_code': status_code, 'error': body}
+            return {
+                'status_code': status_code,
+                'text': body,
+                'json': None
+            }
         else:
             logger.error(f"API call failed {method} {url}: {e}")
             return None
@@ -498,12 +519,9 @@ def process_deletion_queue() -> Dict[str, int]:
                     errors += 1
                     continue
                 
-                # Check for success (including 404/409 as success)
-                success = (
-                    response.get('success', False) or 
-                    response.get('status') == 'success' or
-                    response.get('status_code') in [404, 409]
-                )
+                # Check for success using status code (2xx or 404)
+                status_code = response.get('status_code', 0)
+                success = (200 <= status_code < 300) or status_code == 404
                 
                 if success:
                     # Mark as done and add to DNC
@@ -513,8 +531,7 @@ def process_deletion_queue() -> Dict[str, int]:
                     processed += 1
                 else:
                     # Extract error details and increment attempts
-                    status_code = response.get('status_code', 0)
-                    error_message = response.get('error', str(response))
+                    error_message = response.get('text', str(response))[:1000]
                     increment_deletion_attempts_with_error(
                         email, instantly_lead_id, status_code, error_message
                     )
@@ -589,8 +606,10 @@ def process_stale_verifications() -> Dict[str, int]:
                     errors += 1
                     continue
                 
-                status = response.get('verification_status', '')
-                credits_used = response.get('credits_used', 0.25)
+                # Extract from JSON response if available
+                response_data = response.get('json', response) if isinstance(response, dict) and 'json' in response else response
+                status = response_data.get('verification_status', '') if response_data else ''
+                credits_used = response_data.get('credits_used', 0.25) if response_data else 0.25
                 
                 # Handle empty string results
                 if not status or status.strip() == '':
@@ -847,9 +866,15 @@ def delete_invalid_lead(email: str, instantly_lead_id: str) -> bool:
         # ✅ Use instantly_lead_id for deletion (efficient)
         response = call_instantly_api(f'/api/v2/leads/{instantly_lead_id}', method='DELETE')
         
-        # ✅ Treat 404 as success
-        deletion_successful = True
-        logger.debug(f"🗑️ DELETE API call completed for {email}")
+        if not response:
+            logger.error(f"❌ No response from DELETE API for {email}")
+            return False
+        
+        # Check for success using status code (2xx or 404)
+        status_code = response.get('status_code', 0)
+        deletion_successful = (200 <= status_code < 300) or status_code == 404
+        
+        logger.debug(f"🗑️ DELETE API call completed for {email} (status: {status_code})")
         
         if deletion_successful:
             # Add to DNC list
@@ -859,12 +884,6 @@ def delete_invalid_lead(email: str, instantly_lead_id: str) -> bool:
         return deletion_successful
         
     except Exception as e:
-        # ✅ Handle 404 as success
-        if '404' in str(e) or 'not found' in str(e).lower():
-            logger.info(f"🗑️ Lead already deleted (404): {email}")
-            add_to_dnc_list(email, 'invalid_verification')
-            return True
-        
         logger.error(f"❌ Failed to delete invalid lead {email}: {e}")
         return False
 
@@ -984,7 +1003,9 @@ def test_verification_endpoints() -> bool:
         # Test GET /api/v2/email-verification/{email}
         try:
             response = call_instantly_api(f'/api/v2/email-verification/{test_email}', method='GET')
-            get_works = response is not None and 'verification_status' in response
+            # Check if response has json data with verification_status
+            response_data = response.get('json', response) if isinstance(response, dict) and 'json' in response else response
+            get_works = response is not None and response_data and 'verification_status' in response_data
             logger.info(f"✅ GET /api/v2/email-verification/{{email}}: {'WORKS' if get_works else 'FAILED'}")
         except Exception as e:
             logger.warning(f"⚠️ GET /api/v2/email-verification/{{email}} failed: {e}")
