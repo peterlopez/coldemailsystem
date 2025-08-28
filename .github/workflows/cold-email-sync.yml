@@ -208,7 +208,7 @@ jobs:
             exit $exit_code
           }
           
-          echo "✅ Lead creation complete with verify_on_import=true" | tee -a workflow.log
+          echo "✅ Lead creation complete (no sync verification; async verifier disabled)" | tee -a workflow.log
       
       - name: Send logs to external service
         if: always()
