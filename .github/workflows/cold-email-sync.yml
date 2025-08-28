@@ -4,11 +4,10 @@ name: Cold Email Sync
 
 on:
   schedule:
-    # TEMPORARILY REDUCED FREQUENCY: Run every 6 hours while fixing verification issues
-    - cron: '0 */6 * * *'  # Every 6 hours, 7 days a week
-    # Previous schedule (30 min intervals) commented out during maintenance
-    # - cron: '0,30 13-23 * * 1-5'  # UTC times for EST business hours  
-    # - cron: '0 */2 * * 0,6'
+    # Run every hour during business hours (9 AM - 6 PM EST, Mon-Fri)
+    - cron: '0 13-23 * * 1-5'  # UTC times for EST business hours (9am-6pm EST = 1pm-11pm UTC)
+    # Run every 2 hours on weekends
+    - cron: '0 */2 * * 0,6'  # Weekends
   workflow_dispatch:  # Allow manual triggers
     inputs:
       dry_run:
