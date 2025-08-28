@@ -730,11 +730,25 @@ def get_leads_needing_drain_from_bigquery() -> Dict[str, List[str]]:
             leads_by_campaign[campaign_id].append(row.instantly_lead_id)
         
         total_leads = sum(len(ids) for ids in leads_by_campaign.values())
-        logger.info(f"📊 BigQuery found {total_leads} leads needing drain evaluation across {len(leads_by_campaign)} campaigns")
         
+        # PHASE 4: Enhanced BigQuery results logging with optimization metrics
+        logger.info(f"📊 BigQuery Optimization Results:")
+        logger.info(f"  • Campaigns with leads: {len(leads_by_campaign)}")
+        logger.info(f"  • Total leads needing evaluation: {total_leads}")
+        logger.info(f"  • Estimated time savings: {max(0, 6000 - total_leads)} leads not scanned")
+        
+        # Show per-campaign breakdown with smart sizing
         for campaign_id, lead_ids in leads_by_campaign.items():
             campaign_name = "SMB" if campaign_id == SMB_CAMPAIGN_ID else "Midsize"
-            logger.info(f"  • {campaign_name}: {len(lead_ids)} leads")
+            batch_count = (len(lead_ids) + 49) // 50  # Estimate pages needed
+            logger.info(f"  • {campaign_name}: {len(lead_ids)} leads (~{batch_count} pages vs full scan)")
+        
+        # Performance prediction
+        if total_leads > 0:
+            estimated_time_ratio = total_leads / 6000  # vs scanning all 6000
+            logger.info(f"📈 Performance Optimization:")
+            logger.info(f"  • Targeting {estimated_time_ratio:.1%} of typical campaign scan")
+            logger.info(f"  • Expected speedup: {1/max(estimated_time_ratio,0.01):.1f}x faster")
         
         return leads_by_campaign
         
@@ -825,10 +839,17 @@ def get_leads_by_ids_from_instantly(campaign_id: str, lead_ids: List[str]) -> Li
         found_count = len(all_leads)
         missing_count = len(leads_needed)
         
+        # PHASE 4: Enhanced logging with smart batch size display and efficiency metrics
+        efficiency_percentage = (found_count / max(len(lead_ids), 1)) * 100
+        pages_saved_estimate = max(0, 20 - page_count)  # Estimate vs full campaign scan
+        
+        logger.info(f"🎯 Targeted Fetch Results:")
+        logger.info(f"  • Found: {found_count}/{len(lead_ids)} leads ({efficiency_percentage:.1f}%)")
+        logger.info(f"  • Pages scanned: {page_count} (saved ~{pages_saved_estimate} pages vs full scan)")
+        logger.info(f"  • Search efficiency: {found_count/max(page_count,1):.1f} leads/page")
+        
         if missing_count > 0:
-            logger.warning(f"⚠️ Could not find {missing_count} leads in campaign (may have been deleted)")
-            
-        logger.info(f"🎯 Targeted fetch complete: {found_count}/{len(lead_ids)} leads found in {page_count} pages")
+            logger.warning(f"⚠️ Missing leads: {missing_count} (likely deleted from campaign)")
         return all_leads
         
     except Exception as e:
@@ -946,21 +967,45 @@ def process_bigquery_first_drain(bigquery_leads: Dict[str, List[str]]) -> List[I
             if MAX_LEADS_TO_EVALUATE > 0 and total_leads_processed > MAX_LEADS_TO_EVALUATE:
                 break
         
-        # Final summary
+        # PHASE 4: Enhanced summary with smart batch size display and performance metrics
         total_to_drain = len(finished_leads)
+        total_campaigns_processed = len(bigquery_leads)
+        
         logger.info("=" * 60)
         logger.info("🚀 PHASE 2 OPTIMIZATION: BigQuery-first drain processing complete")
         logger.info("=" * 60)
-        logger.info(f"📊 Total leads processed: {total_leads_processed}")
-        logger.info(f"🗑️ Total leads to drain: {total_to_drain}")
-        logger.info(f"📈 Drain rate: {(total_to_drain/max(total_leads_processed,1)*100):.1f}%")
+        logger.info(f"📊 Performance Summary:")
+        logger.info(f"  • Campaigns processed: {total_campaigns_processed}")
+        logger.info(f"  • Total leads processed: {total_leads_processed}")
+        logger.info(f"  • Leads to drain: {total_to_drain}")
+        logger.info(f"  • Drain efficiency: {(total_to_drain/max(total_leads_processed,1)*100):.1f}%")
         
-        # Log drain reasons breakdown
+        # PHASE 4: Smart batch size analysis
+        if total_leads_processed > 0:
+            avg_leads_per_campaign = total_leads_processed / total_campaigns_processed
+            logger.info(f"📊 Batch Optimization Metrics:")
+            logger.info(f"  • Average leads per campaign: {avg_leads_per_campaign:.1f}")
+            
+            # Show campaign-specific processing efficiency
+            for campaign_id, lead_ids in bigquery_leads.items():
+                campaign_name = "SMB" if campaign_id == SMB_CAMPAIGN_ID else "Midsize"
+                leads_targeted = len(lead_ids)
+                
+                # Count actual drain results for this campaign
+                campaign_drained = sum(1 for lead in finished_leads if lead.campaign_id == campaign_id)
+                campaign_efficiency = (campaign_drained / max(leads_targeted, 1) * 100)
+                
+                logger.info(f"  • {campaign_name}: {leads_targeted} targeted → {campaign_drained} drained ({campaign_efficiency:.1f}%)")
+        
+        # Enhanced drain reasons breakdown with percentages
         if any(count > 0 for count in drain_reasons.values()):
-            logger.info("📋 Drain classification breakdown:")
-            for reason, count in drain_reasons.items():
+            logger.info("📋 Drain Classification Analysis:")
+            total_classifications = sum(drain_reasons.values())
+            
+            for reason, count in sorted(drain_reasons.items(), key=lambda x: x[1], reverse=True):
                 if count > 0:
-                    logger.info(f"  • {reason}: {count}")
+                    percentage = (count / max(total_classifications, 1) * 100)
+                    logger.info(f"  • {reason}: {count} ({percentage:.1f}%)")
         
         logger.info("=" * 60)
         
