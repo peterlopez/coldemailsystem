@@ -25,7 +25,7 @@ except ImportError:
 try:
     from sync_once import (
         get_finished_leads, update_bigquery_state, 
-        DRY_RUN, InstantlyLead, delete_lead_from_instantly,
+        DRY_RUN, InstantlyLead, call_instantly_api,
         log_dead_letter
     )
     print("✅ Successfully imported from sync_once")
@@ -94,42 +94,57 @@ logger = drain_logger
 # logs will go to drain log. This is actually a good separation of concerns.
 
 def delete_single_lead_with_retry(lead: InstantlyLead, max_retries: int = 1) -> Tuple[bool, str]:
-    """Delete a single lead - simplified to avoid retry conflicts.
+    """Delete a single lead using standardized call_instantly_api() helper.
     
     Returns:
         Tuple of (success, status_code) where status_code is 'ok', '404', '429', '5xx', or '4xx'
     """
     
+    if DRY_RUN:
+        logger.info(f"🧪 DRY RUN: Would delete lead {lead.email} (ID: {lead.id})")
+        return True, 'ok'
+    
     try:
-        # Use the working delete function from sync_once.py (it handles errors properly)
-        success = delete_lead_from_instantly(lead)
+        # ✅ Use the same HTTP helper as verification poller for consistency
+        logger.debug(f"🔄 Deleting lead {lead.email} via DELETE /api/v2/leads/{lead.id}")
+        response = call_instantly_api(f'/api/v2/leads/{lead.id}', method='DELETE')
         
-        if success:
-            logger.debug(f"✅ Successfully deleted {lead.email}")
+        if not response:
+            logger.error(f"❌ No response from DELETE API for {lead.email}")
+            log_dead_letter("drain", lead.email, f"DELETE {lead.id}", 0, "No response from API")
+            return False, '5xx'
+        
+        # ✅ Same success logic as verification poller: 2xx or 404 = success
+        status_code = response.get('status_code', 0)
+        
+        if 200 <= status_code < 300:
+            logger.debug(f"✅ Successfully deleted {lead.email} (status: {status_code})")
             return True, 'ok'
+        elif status_code == 404:
+            # 404 means lead already deleted - idempotent success
+            logger.debug(f"✅ Lead {lead.email} already deleted (404 = idempotent success)")
+            return True, '404'
+        elif status_code == 429:
+            logger.warning(f"⏳ Rate limited for {lead.email} (429)")
+            log_dead_letter("drain", lead.email, f"DELETE {lead.id}", 429, "Rate limited")
+            return False, '429'
+        elif 400 <= status_code < 500:
+            logger.error(f"❌ Client error deleting {lead.email} (status: {status_code})")
+            log_dead_letter("drain", lead.email, f"DELETE {lead.id}", status_code, f"Client error: {status_code}")
+            return False, '4xx'
+        elif status_code >= 500:
+            logger.error(f"❌ Server error deleting {lead.email} (status: {status_code})")
+            log_dead_letter("drain", lead.email, f"DELETE {lead.id}", status_code, f"Server error: {status_code}")
+            return False, '5xx'
         else:
-            logger.error(f"❌ Failed to delete {lead.email}")
-            log_dead_letter("drain", lead.email, f"DELETE {lead.id}", 400, "Delete function returned False")
-            return False, '4xx'  # Generic 4xx for failed deletions
+            logger.error(f"❌ Unexpected status code for {lead.email}: {status_code}")
+            log_dead_letter("drain", lead.email, f"DELETE {lead.id}", status_code, f"Unexpected status: {status_code}")
+            return False, '4xx'
             
     except Exception as e:
-        error_str = str(e)
-        logger.error(f"❌ Delete error for {lead.email}: {e}")
-        
-        # Try to extract status code from error message for circuit breaker
-        if '429' in error_str:
-            status_code = '429'
-        elif '404' in error_str:
-            status_code = '404'
-            # 404 is actually success for idempotent operations
-            return True, '404'
-        elif any(code in error_str for code in ['500', '502', '503', '504']):
-            status_code = '5xx'
-        else:
-            status_code = '4xx'
-            
+        logger.error(f"❌ Delete exception for {lead.email}: {e}")
         log_dead_letter("drain", lead.email, f"DELETE {lead.id}", 0, str(e))
-        return False, status_code
+        return False, '5xx'  # Network/connection errors
 
 def delete_leads_from_instantly_enhanced(leads: List[InstantlyLead]) -> Tuple[int, List[InstantlyLead], dict]:
     """Delete leads with enhanced rate limiting designed for DELETE operations.
