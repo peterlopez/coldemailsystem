@@ -246,7 +246,23 @@ class ColdEmailNotifier:
 📈 **Campaign Breakdown**  
 • SMB Campaign: {smb_added} leads added
 • Midsize Campaign: {midsize_added} leads added
-• Total processed: {total_added} leads (verification handled by Instantly)
+• Total processed: {total_added} leads"""
+
+            # Add async verification status if available
+            verification_data = data.get('async_verification', {})
+            if verification_data:
+                verification_triggered = verification_data.get('triggered', False)
+                verification_count = verification_data.get('lead_count', 0)
+                if verification_triggered and verification_count > 0:
+                    content += f"\n• 🔍 Async verification triggered for {verification_count} leads"
+                elif verification_count > 0:
+                    content += f"\n• ⚠️ Verification trigger failed for {verification_count} leads"
+                else:
+                    content += f"\n• 📴 No verification triggers (dry run or no new leads)"
+            else:
+                content += f"\n• 🔍 Verification handled by Instantly internally"
+
+            content += f"""
 
 ⚡ **Performance**
 • Duration: {self._format_duration(duration)}
