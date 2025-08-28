@@ -3,12 +3,17 @@ name: Drain Finished Leads
 # Dedicated workflow for processing finished leads with enhanced rate limiting
 # Runs independently from main sync to prevent DELETE rate limiting from blocking new lead acquisition
 
+# Prevent conflicts with other Instantly workflows
+concurrency:
+  group: instantly-ops
+  cancel-in-progress: false
+
 on:
   schedule:
-    # Every 2 hours during business hours (9 AM - 6 PM EST, Mon-Fri)
-    - cron: '0 13,15,17,19,21,23 * * 1-5'  # UTC times for EST business hours
-    # Every 4 hours on weekends (lighter schedule)
-    - cron: '0 */4 * * 0,6'
+    # Every 2 hours during business hours (9 AM - 6 PM EST, Mon-Fri) at :17 past the hour
+    - cron: '17 13,15,17,19,21,23 * * 1-5'  # UTC times for EST business hours, offset from poller
+    # Every 4 hours on weekends (lighter schedule) at :17 past the hour  
+    - cron: '17 */4 * * 0,6'
   workflow_dispatch:  # Allow manual triggers
     inputs:
       dry_run:

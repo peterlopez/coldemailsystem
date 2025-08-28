@@ -9,8 +9,9 @@ import os
 import sys
 import time
 import logging
+from collections import deque
 from datetime import datetime
-from typing import List
+from typing import List, Tuple
 
 # OPTIMIZED: Use shared configuration
 try:
@@ -92,8 +93,12 @@ logger = drain_logger
 # This means get_finished_leads() logs will go to sync log, but our drain-specific
 # logs will go to drain log. This is actually a good separation of concerns.
 
-def delete_single_lead_with_retry(lead: InstantlyLead, max_retries: int = 1) -> bool:
-    """Delete a single lead - simplified to avoid retry conflicts."""
+def delete_single_lead_with_retry(lead: InstantlyLead, max_retries: int = 1) -> Tuple[bool, str]:
+    """Delete a single lead - simplified to avoid retry conflicts.
+    
+    Returns:
+        Tuple of (success, status_code) where status_code is 'ok', '404', '429', '5xx', or '4xx'
+    """
     
     try:
         # Use the working delete function from sync_once.py (it handles errors properly)
@@ -101,21 +106,39 @@ def delete_single_lead_with_retry(lead: InstantlyLead, max_retries: int = 1) -> 
         
         if success:
             logger.debug(f"✅ Successfully deleted {lead.email}")
-            return True
+            return True, 'ok'
         else:
             logger.error(f"❌ Failed to delete {lead.email}")
             log_dead_letter("drain", lead.email, f"DELETE {lead.id}", 400, "Delete function returned False")
-            return False
+            return False, '4xx'  # Generic 4xx for failed deletions
             
     except Exception as e:
+        error_str = str(e)
         logger.error(f"❌ Delete error for {lead.email}: {e}")
+        
+        # Try to extract status code from error message for circuit breaker
+        if '429' in error_str:
+            status_code = '429'
+        elif '404' in error_str:
+            status_code = '404'
+            # 404 is actually success for idempotent operations
+            return True, '404'
+        elif any(code in error_str for code in ['500', '502', '503', '504']):
+            status_code = '5xx'
+        else:
+            status_code = '4xx'
+            
         log_dead_letter("drain", lead.email, f"DELETE {lead.id}", 0, str(e))
-        return False
+        return False, status_code
 
-def delete_leads_from_instantly_enhanced(leads: List[InstantlyLead]) -> int:
-    """Delete leads with enhanced rate limiting designed for DELETE operations."""
+def delete_leads_from_instantly_enhanced(leads: List[InstantlyLead]) -> Tuple[int, List[InstantlyLead], dict]:
+    """Delete leads with enhanced rate limiting designed for DELETE operations.
+    
+    Returns:
+        Tuple of (successful_count, successfully_deleted_leads, circuit_breaker_info)
+    """
     if not leads:
-        return 0
+        return 0, [], {"activated": False, "reason": None, "leads_not_processed": 0}
     
     logger.info(f"🗑️ Starting enhanced deletion of {len(leads)} leads...")
     
@@ -134,6 +157,13 @@ def delete_leads_from_instantly_enhanced(leads: List[InstantlyLead]) -> int:
     DELETE_DELAY = config.rate_limits.delete_delay if config else 1.0  # OPTIMIZED: Use centralized config
     successful_deletions = 0
     failed_deletions = 0
+    successfully_deleted_leads = []  # Track successful deletions for BigQuery updates
+    
+    # Circuit breaker implementation
+    recent_results = deque(maxlen=10)  # Store True/False for last 10 attempts
+    rate_limited_streak = 0
+    circuit_breaker_activated = False
+    circuit_breaker_reason = None
     
     for i, lead in enumerate(leads):
         reason = lead.status if hasattr(lead, 'status') and lead.status else 'unknown'
@@ -144,32 +174,79 @@ def delete_leads_from_instantly_enhanced(leads: List[InstantlyLead]) -> int:
             logger.debug(f"⏸️ Enhanced DELETE rate limiting: waiting {DELETE_DELAY}s...")
             time.sleep(DELETE_DELAY)
         
-        # Attempt deletion with retry
-        if delete_single_lead_with_retry(lead):
+        # Attempt deletion with retry and circuit breaker monitoring
+        success, status_code = delete_single_lead_with_retry(lead)
+        recent_results.append(success)
+        
+        if success:
             successful_deletions += 1
-            logger.info(f"   ✅ SUCCESS: {lead.email} deleted")
+            successfully_deleted_leads.append(lead)  # Track successful deletion
+            logger.info(f"   ✅ SUCCESS: {lead.email} deleted (status: {status_code})")
+            # Reset rate limit streak on success
+            if status_code != '429':
+                rate_limited_streak = 0
         else:
             failed_deletions += 1
-            logger.warning(f"   ❌ FAILED: {lead.email} deletion failed")
+            logger.warning(f"   ❌ FAILED: {lead.email} deletion failed (status: {status_code})")
+        
+        # Circuit breaker logic
+        if status_code == '429':
+            rate_limited_streak += 1
+        
+        # Check circuit breaker conditions
+        if len(recent_results) == 10:
+            failure_rate = sum(1 for result in recent_results if not result) / 10.0
+            if failure_rate > 0.8:
+                circuit_breaker_reason = f">80% recent DELETE failures (failure rate: {failure_rate:.1%})"
+                logger.warning(f"🔴 Circuit breaker activated: {circuit_breaker_reason} — pausing drain.")
+                circuit_breaker_activated = True
+                break
+        
+        if rate_limited_streak >= 3:
+            circuit_breaker_reason = f"{rate_limited_streak} consecutive 429 rate limits"
+            logger.warning(f"🔴 Circuit breaker activated: {circuit_breaker_reason} — pausing drain.")
+            circuit_breaker_activated = True
+            break
     
     # ENHANCED LOGGING: Summary of deletion results
     logger.info("=" * 60)
     logger.info("🗑️ DELETION RESULTS SUMMARY")
     logger.info("=" * 60)
-    logger.info(f"📋 Total deletion attempts: {len(leads)}")
+    logger.info(f"📋 Total leads processed: {i+1}/{len(leads)}")
     logger.info(f"✅ Successful deletions: {successful_deletions}")
     logger.info(f"❌ Failed deletions: {failed_deletions}")
-    logger.info(f"📈 Success rate: {(successful_deletions/max(len(leads),1)*100):.1f}%")
+    logger.info(f"📈 Success rate: {(successful_deletions/max(i+1,1)*100):.1f}%")
+    if circuit_breaker_activated:
+        logger.warning("🔴 Circuit breaker activated - drain stopped early to prevent cascade failures")
+        remaining_leads = len(leads) - (i + 1)
+        if remaining_leads > 0:
+            logger.info(f"⏸️ {remaining_leads} leads not processed due to circuit breaker activation")
     logger.info("=" * 60)
     
-    return successful_deletions
+    # Prepare circuit breaker info
+    leads_not_processed = len(leads) - (i + 1) if circuit_breaker_activated else 0
+    circuit_breaker_info = {
+        "activated": circuit_breaker_activated,
+        "reason": circuit_breaker_reason,
+        "leads_not_processed": leads_not_processed
+    }
+    
+    return successful_deletions, successfully_deleted_leads, circuit_breaker_info
 
-def drain_finished_leads_enhanced() -> int:
-    """Enhanced drain with aggressive rate limiting for DELETE operations."""
+def drain_finished_leads_enhanced(finished_leads: List[InstantlyLead] = None) -> Tuple[int, dict]:
+    """Enhanced drain with aggressive rate limiting for DELETE operations.
+    
+    Returns:
+        Tuple of (total_drained, circuit_breaker_info)
+    """
     logger.info("=== ENHANCED DRAIN MODE ===")
     
-    # Get finished leads (this already has 1s pagination rate limiting from recent fix)
-    finished_leads = get_finished_leads()
+    # Use provided leads or fetch if not provided (backward compatibility)
+    if finished_leads is None:
+        logger.debug("No leads provided, fetching...")
+        finished_leads = get_finished_leads()
+    else:
+        logger.debug(f"Using provided leads list with {len(finished_leads)} leads")
     
     if not finished_leads:
         logger.info("✅ No finished leads to drain")
@@ -183,6 +260,7 @@ def drain_finished_leads_enhanced() -> int:
     
     total_drained = 0
     batch_count = (len(finished_leads) + DRAIN_BATCH_SIZE - 1) // DRAIN_BATCH_SIZE
+    circuit_breaker_info = {"activated": False, "reason": None, "leads_not_processed": 0}
     
     logger.info(f"📦 Processing in {batch_count} batches of {DRAIN_BATCH_SIZE} leads each")
     
@@ -198,22 +276,33 @@ def drain_finished_leads_enhanced() -> int:
             time.sleep(DRAIN_BATCH_DELAY)
         
         # Delete batch with individual delays and retries
-        successful_in_batch = delete_leads_from_instantly_enhanced(batch)
+        successful_in_batch, successfully_deleted_batch, batch_circuit_breaker_info = delete_leads_from_instantly_enhanced(batch)
         
-        # Update BigQuery tracking for the entire batch (including failed deletions)
-        # This ensures our tracking reflects the drain attempt even if API deletion fails
-        try:
-            update_bigquery_state(batch)
-            logger.info(f"📊 Updated BigQuery tracking for batch {batch_num}")
-        except Exception as e:
-            logger.error(f"❌ Failed to update BigQuery for batch {batch_num}: {e}")
-            # Continue processing - don't fail entire batch for BigQuery issues
+        # Update BigQuery tracking ONLY for successful deletions (improved accuracy)
+        if successfully_deleted_batch:
+            try:
+                update_bigquery_state(successfully_deleted_batch)
+                logger.info(f"📊 Updated BigQuery tracking for {len(successfully_deleted_batch)} successfully deleted leads in batch {batch_num}")
+            except Exception as e:
+                logger.error(f"❌ Failed to update BigQuery for batch {batch_num}: {e}")
+                # Continue processing - don't fail entire batch for BigQuery issues
+        else:
+            logger.info(f"📊 No successful deletions in batch {batch_num}, skipping BigQuery update")
         
         total_drained += successful_in_batch
         logger.info(f"✅ Batch {batch_num} complete: {successful_in_batch}/{len(batch)} deleted, {total_drained}/{len(finished_leads)} total processed")
+        
+        # Check if circuit breaker was activated in this batch
+        if batch_circuit_breaker_info["activated"]:
+            circuit_breaker_info.update(batch_circuit_breaker_info)
+            # Calculate remaining leads across all remaining batches
+            remaining_leads_total = len(finished_leads) - (i + len(batch))
+            circuit_breaker_info["leads_not_processed"] += remaining_leads_total
+            logger.warning(f"🔴 Circuit breaker activated - stopping drain process. {remaining_leads_total} leads across remaining batches not processed.")
+            break
     
     logger.info(f"🏁 Enhanced drain complete: {total_drained}/{len(finished_leads)} leads successfully deleted")
-    return total_drained
+    return total_drained, circuit_breaker_info
 
 def main():
     """Dedicated drain execution with enhanced rate limiting."""
@@ -266,6 +355,11 @@ def main():
             "classification_accuracy": 99.0,  # Estimated
             "processing_rate_per_minute": 0.0
         },
+        "circuit_breaker": {
+            "activated": False,
+            "reason": None,
+            "leads_not_processed": 0
+        },
         "errors": [],
         "github_run_url": f"{os.getenv('GITHUB_SERVER_URL', '')}/{os.getenv('GITHUB_REPOSITORY', '')}/actions/runs/{os.getenv('GITHUB_RUN_ID', '')}"
     }
@@ -283,8 +377,8 @@ def main():
         # For now, classify all as "completed" - you can enhance this with actual classification logic
         notification_data["drain_classifications"]["completed"] = total_leads_found
         
-        # Enhanced drain with aggressive rate limiting
-        drained = drain_finished_leads_enhanced()
+        # Enhanced drain with aggressive rate limiting (pass fetched leads to avoid double-fetch)
+        drained, circuit_breaker_info = drain_finished_leads_enhanced(finished_leads)
         
         # Update notification data with results
         notification_data["deletion_results"]["attempted_deletions"] = total_leads_found
@@ -295,6 +389,9 @@ def main():
             notification_data["deletion_results"]["success_rate_percentage"] = round((drained / total_leads_found) * 100, 1)
         
         notification_data["inventory_impact"]["leads_removed"] = drained
+        
+        # Update circuit breaker information
+        notification_data["circuit_breaker"] = circuit_breaker_info
         
         # Calculate timing and performance
         end_time = time.time()

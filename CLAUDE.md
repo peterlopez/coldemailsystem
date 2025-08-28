@@ -44,7 +44,7 @@ This is a fully automated pipeline that synchronizes lead data between BigQuery 
 - Creates leads with company data, async verification system handles email validation
 - Respects 24,000 lead inventory cap
 
-#### **Async Verification Workflow (Every 15 Minutes)**
+#### **Async Verification Workflow (Every 5 Minutes)**
 - **Simple Polling System:** Checks pending verification results from Instantly API
 - **Critical Safeguards:** 24-hour duplicate guard, respects DRY_RUN mode
 - **Efficient Deletion:** Uses instantly_lead_id for fast removal of invalid emails
@@ -58,6 +58,12 @@ This is a fully automated pipeline that synchronizes lead data between BigQuery 
 - Manages error logging
 
 ## 🏗️ Technical Architecture
+
+### **Modular Shared Components**
+The system now uses a shared component architecture:
+- **`shared/api_client.py`** - Centralized Instantly API operations
+- **`shared/bigquery_utils.py`** - BigQuery connection and query management  
+- **`shared/models.py`** - Data models and type definitions
 
 ### **BigQuery Tables Created**
 ```sql
@@ -95,7 +101,7 @@ v_ready_for_instantly -- Combines all filtering logic
 ## 🛠️ System Components
 
 ### **Core Script: sync_once.py**
-- **1200+ lines** of production-hardened Python code  
+- **1,991 lines** of production-hardened Python code  
 - Handles all API interactions with Instantly.ai V2 with enhanced reliability
 - **Working Drain System:** Uses discovered POST `/api/v2/leads/list` endpoint with pagination
 - **Smart Lead Classification:** Implements 8-scenario logic for drain decisions
@@ -132,11 +138,23 @@ v_ready_for_instantly -- Combines all filtering logic
 - **Enhanced rate limiting:** Prevents DELETE API conflicts
 
 #### **Async Verification Poller** (`.github/workflows/async-verification-poller.yml`)
-- **Automated scheduling:** Every 15 minutes (9 AM - 6 PM EST weekdays)
-- **Off-hours schedule:** Every hour during weekends and outside business hours  
+- **Automated scheduling:** Every 5 minutes (9 AM - 6 PM EST weekdays)
+- **Off-hours schedule:** Every 30 minutes during weekends and outside business hours  
 - **Purpose:** Polls verification results and deletes invalid emails
-- **Manual triggers:** Available with dry run and max leads parameters
+- **Manual triggers:** Available with dry run and max leads parameters (up to 500)
 - **Simple & Reliable:** Focused on core verification polling functionality
+
+#### **BigQuery Diagnostics Workflow** (`.github/workflows/bigquery-diagnostics.yml`)
+- **Manual trigger only:** On-demand system diagnostics
+- **Purpose:** Pre-flight BigQuery health checks before schema updates  
+- **Features:** Permission validation, table/view verification, verbose output option
+- **Timeout:** 5 minutes with comprehensive error logging
+
+### **Production Workflows (4 Total):**
+1. **Cold Email Sync** - Main sync every 30 minutes  
+2. **Drain Leads** - Lead removal every 2 hours
+3. **Async Verification Poller** - Every 5 minutes during business hours
+4. **BigQuery Diagnostics** - Manual troubleshooting workflow
 
 #### **Shared Features:**
 - **Environment validation:** Pre-flight checks before execution
@@ -148,9 +166,9 @@ v_ready_for_instantly -- Combines all filtering logic
 - `config/secrets/bigquery-credentials.json` - Service account credentials
 - `requirements.txt` - Python dependencies
 - `setup.py` - Initial table creation script
-- `sync_once.py` - Main sync script (1200+ lines)
+- `sync_once.py` - Main sync script (1,991 lines)
 - `drain_once.py` - Dedicated drain script with enhanced rate limiting
-- `simple_async_verification.py` - Simple async verification system (500+ lines)
+- `simple_async_verification.py` - Simple async verification system (1,066 lines)
 - `shared_config.py` - Centralized configuration management
 
 ## 📧 Simple Async Email Verification System
@@ -171,7 +189,7 @@ v_ready_for_instantly -- Combines all filtering logic
 5. **DNC Protection:** Invalid emails automatically added to permanent Do Not Contact list
 
 ### **Implementation Details**
-- **Module:** `simple_async_verification.py` - Lightweight verification system (500+ lines)
+- **Module:** `simple_async_verification.py` - Lightweight verification system (1,066 lines)
 - **Integration:** Imported and used in `sync_once.py` when `ASYNC_VERIFICATION_AVAILABLE = True`
 - **Critical Safeguards:** 24-hour duplicate guard, DRY_RUN respect, efficient deletion path
 - **Rate Limiting:** Built-in delays (0.5s between operations) to respect API limits
@@ -236,6 +254,27 @@ Both campaigns are **ACTIVE** but have **NO SENDING DAYS CONFIGURED**:
 - **DNC List Size:** 11,726 (595 from Instantly unsubscribes)
 - **Processing Capacity:** ~2,400 leads/day potential
 - **SMB Threshold:** $1,000,000 (configurable in BigQuery)
+
+## 🔧 Production Enhancements
+
+### **System Scale**
+- **Main Script Size:** 1,991 lines (production-hardened)
+- **Async Verification:** 1,066 lines (enhanced system)  
+- **Total Production Files:** 111+ tracked files
+- **Core Production Scripts:** sync_once.py, simple_async_verification.py, drain_once.py
+
+### **Diagnostic & Testing Suite**
+The system includes comprehensive diagnostic tools:
+- **BigQuery diagnostics workflow** for system health checks
+- **Enhanced logging** with file-based logging in GitHub Actions
+- **Validation scripts** for environment and API connectivity
+- **Modular architecture** with shared components for maintainability
+
+### **API Client Improvements**
+- **Centralized API management** via shared/api_client.py
+- **Enhanced error handling** with retry logic
+- **Session management** for improved performance
+- **Fallback configuration** loading from both environment and config files
 
 ## 🔐 Security & Compliance
 
@@ -323,6 +362,18 @@ Both campaigns are **ACTIVE** but have **NO SENDING DAYS CONFIGURED**:
 - **Status:** ✅ Fixed with AdaptiveRateLimit system
 - **New behavior:** Delays adjust based on success/failure patterns (0.5s-10s range)
 - **Monitor:** Look for "Rate limit optimized" or "Rate limit increased" debug messages
+
+### **New Diagnostic Tools**
+
+#### **"System health check needed"**
+- **Solution:** Use new BigQuery Diagnostics workflow
+- **Access:** Manual trigger in GitHub Actions with verbose option
+- **Capabilities:** Permission validation, table structure verification, connectivity testing
+
+#### **"Verification polling too slow"**
+- **Status:** ✅ Fixed - Now polls every 5 minutes during business hours
+- **Previous:** Every 15 minutes
+- **Benefit:** Faster lead processing and quicker invalid email removal
 
 ### **Debug Queries**
 ```sql
@@ -546,8 +597,9 @@ The Cold Email System is **fully implemented and tested** with **dual workflow a
 - Provide comprehensive logging and error tracking
 
 **Total development time:** 4 days + 2 hours (email verification) + 4 hours (drain system) + workflow separation + 6 hours (notification system) + 4 hours (system hardening)  
-**Lines of code:** 1700+ (production-hardened with verification + dual workflows + notifications + security enhancements)  
-**Test coverage:** Comprehensive with multiple validation layers + drain classification tests + notification testing + failure handling tests  
+**Lines of code:** 3,057+ (sync: 1,991 + verification: 1,066 + shared components + diagnostics)  
+**System architecture:** Modular shared components with 111+ tracked production files  
+**Workflows:** 4 production GitHub Actions workflows with enhanced diagnostics  
 **Email verification:** ✅ Active and filtering invalid emails  
 **Drain functionality:** ✅ Fully operational with dedicated workflow and smart classification  
 **Workflow architecture:** ✅ Dual GitHub Actions workflows prevent API conflicts  

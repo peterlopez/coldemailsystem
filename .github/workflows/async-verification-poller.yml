@@ -1,5 +1,10 @@
 name: "Async Email Verification Poller"
 
+# Prevent conflicts with other Instantly workflows
+concurrency:
+  group: instantly-ops
+  cancel-in-progress: false
+
 on:
   schedule:
     # Run every 5 minutes during business hours (9 AM - 6 PM EST, Mon-Fri)

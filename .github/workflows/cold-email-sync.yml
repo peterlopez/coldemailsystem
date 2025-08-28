@@ -2,6 +2,11 @@ name: Cold Email Sync
 
 # Automated pipeline to sync leads from BigQuery to Instantly.ai
 
+# Prevent conflicts with other Instantly workflows
+concurrency:
+  group: instantly-ops
+  cancel-in-progress: false
+
 on:
   schedule:
     # Run every hour during extended business hours (3 AM - 9 PM EST, Mon-Fri)
