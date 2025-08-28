@@ -380,8 +380,8 @@ def process_deletion_queue() -> Dict[str, int]:
         SELECT email, instantly_lead_id, deletion_attempts
         FROM `{}.{}.ops_inst_state`
         WHERE deletion_status = 'queued'
-          AND deletion_attempts < 3
-        ORDER BY updated_at ASC
+          AND deletion_attempts < 5
+        ORDER BY COALESCE(last_deletion_attempt, updated_at) ASC
         LIMIT 50
         """.format(PROJECT_ID, DATASET_ID)
         
@@ -456,7 +456,7 @@ def process_stale_verifications() -> Dict[str, int]:
         SELECT email, instantly_lead_id, campaign_id, verification_attempts
         FROM `{}.{}.ops_inst_state`
         WHERE verification_status IN ('', 'pending')
-          AND verification_triggered_at <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 20 MINUTE)
+          AND verification_triggered_at <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 10 MINUTE)
           AND COALESCE(verification_attempts, 0) < 2
         ORDER BY verification_triggered_at ASC
         LIMIT 100
@@ -541,6 +541,7 @@ def mark_deletion_complete(email: str, instantly_lead_id: str):
         UPDATE `{}.{}.ops_inst_state`
         SET deletion_status = 'done',
             status = 'deleted',
+            last_deletion_attempt = CURRENT_TIMESTAMP(),
             updated_at = CURRENT_TIMESTAMP()
         WHERE email = @email
           AND instantly_lead_id = @instantly_lead_id
@@ -584,12 +585,13 @@ def increment_deletion_attempts(email: str, instantly_lead_id: str, error_messag
         new_attempts = current_attempts + 1
         
         # Update attempts and status
-        if new_attempts >= 3:
-            # Mark as failed after 3 attempts
+        if new_attempts >= 5:
+            # Mark as failed after 5 attempts
             update_query = """
             UPDATE `{}.{}.ops_inst_state`
             SET deletion_attempts = @new_attempts,
                 deletion_status = 'failed',
+                last_deletion_attempt = CURRENT_TIMESTAMP(),
                 updated_at = CURRENT_TIMESTAMP()
             WHERE email = @email
               AND instantly_lead_id = @instantly_lead_id
@@ -600,6 +602,7 @@ def increment_deletion_attempts(email: str, instantly_lead_id: str, error_messag
             update_query = """
             UPDATE `{}.{}.ops_inst_state`
             SET deletion_attempts = @new_attempts,
+                last_deletion_attempt = CURRENT_TIMESTAMP(),
                 updated_at = CURRENT_TIMESTAMP()
             WHERE email = @email
               AND instantly_lead_id = @instantly_lead_id
