@@ -1441,14 +1441,16 @@ def split_leads_by_segment(leads: List[Lead]) -> Tuple[List[Lead], List[Lead]]:
 # EMAIL VERIFICATION REMOVED - Let Instantly handle verification internally
 
 def create_lead_in_instantly(lead: Lead, campaign_id: str) -> Optional[str]:
-    """Create a single lead in Instantly campaign with proper campaign assignment."""
+    """Create a single lead in Instantly campaign with direct campaign assignment - FIXED."""
     try:
-        # Step 1: Create the lead with Instantly's verification enabled
-        basic_data = {
+        # ✅ FIXED: Single-step creation with direct campaign assignment
+        payload = {
             'email': lead.email,
             'first_name': '',  # Not available in our data
             'last_name': '',   # Not available in our data
             'company_name': lead.merchant_name,
+            'campaign': campaign_id,  # ✅ CORRECTED: 'campaign' not 'campaign_id' per API docs
+            # ✅ DO NOT include verify_leads_on_import (keep verification fully async)
             'custom_variables': {
                 'company': lead.merchant_name,
                 'domain': lead.platform_domain,
@@ -1457,12 +1459,13 @@ def create_lead_in_instantly(lead: Lead, campaign_id: str) -> Optional[str]:
             }
         }
         
-        # Create lead without campaign assignment first
-        logger.debug(f"Creating lead {lead.email} (Step 1/2)")
-        response = call_instantly_api('/api/v2/leads', method='POST', data=basic_data)
-        
         if DRY_RUN:
+            logger.info(f"🔄 DRY RUN: Would create {lead.email} in campaign {campaign_id}")
             return 'dry-run-id'
+        
+        # Create lead with direct campaign assignment
+        logger.debug(f"Creating lead {lead.email} directly in campaign {campaign_id}")
+        response = call_instantly_api('/api/v2/leads', method='POST', data=payload)
         
         # Check for successful creation
         lead_id = response.get('id')
@@ -1471,99 +1474,27 @@ def create_lead_in_instantly(lead: Lead, campaign_id: str) -> Optional[str]:
             logger.error(f"📋 Create response: {json.dumps(response)}")
             return None
         
-        logger.info(f"✅ Created lead {lead.email} with ID {lead_id}")
+        # ✅ VERIFICATION: Immediate per-lead GET to confirm campaign assignment
+        logger.debug(f"Verifying campaign assignment for lead {lead.email}")
+        verify_response = call_instantly_api(f'/api/v2/leads/{lead_id}', method='GET')
         
-        # Small delay between creation and assignment to prevent race conditions
-        time.sleep(0.2)
-        
-        # Step 2: Move lead to the specified campaign
-        logger.debug(f"Assigning lead {lead.email} to campaign (Step 2/2)")
-        move_data = {
-            'ids': [lead_id],
-            'to_campaign_id': campaign_id
-        }
-        
-        move_response = call_instantly_api('/api/v2/leads/move', method='POST', data=move_data)
-        
-        # Robust success check: API call succeeded and returned a valid response
-        if isinstance(move_response, dict):
-            # Check for explicit success indicators or assume success if no error
-            success_indicators = [
-                move_response.get('status') == 'pending',  # Original expected response
-                move_response.get('success', True),        # Explicit success field
-                'error' not in move_response,              # No error field present
-                move_response.get('status') == 'success'   # Alternative success status
-            ]
-            
-            if any(success_indicators):
-                logger.info(f"🎯 Lead {lead.email} successfully assigned to campaign")
-                logger.debug(f"📋 Move response: {json.dumps(move_response)}")
-                return lead_id
-            else:
-                # Response indicates failure
-                logger.error(f"❌ Campaign assignment FAILED for {lead.email}")
-                logger.error(f"📋 Move response indicates failure: {json.dumps(move_response)}")
-        else:
-            # Invalid response type (likely None or error)
-            logger.error(f"❌ Campaign assignment FAILED for {lead.email} - invalid response")
-            logger.error(f"📋 Move response type: {type(move_response)}, value: {move_response}")
-        
-        # Assignment failed - implement graduated failure handling
-        logger.error(f"🎯 Target campaign: {campaign_id}")
-        
-        # Check if this lead has failed before by querying dead letters
-        failure_count = get_lead_failure_count(lead.email, "campaign_assignment")
-        
-        if failure_count < 2:  # Allow up to 2 retries before deletion
-            logger.warning(f"💀 Lead {lead_id} assignment failed (attempt #{failure_count + 1}) - adding to dead letters for retry")
-            
-            try:
-                record_dead_letter(
-                    phase="TOP-UP",
-                    email=lead.email,
-                    http_status=0,
-                    error_text=f"Campaign assignment failed (attempt #{failure_count + 1}): {json.dumps(move_response) if isinstance(move_response, dict) else str(move_response)}",
-                    retry_count=failure_count
-                )
-            except Exception as dl_error:
-                logger.error(f"Failed to record dead letter for {lead.email}: {dl_error}")
-            
-            # Do NOT delete - keep lead for potential retry in next run
-            logger.info(f"🔄 Keeping lead {lead_id} for retry in next sync run")
-            return None  # Return None but don't delete
-            
-        else:
-            # Too many failures - time to delete
-            logger.error(f"💀 Lead {lead_id} assignment failed {failure_count + 1} times - deleting after multiple retry attempts")
-            
-            try:
-                record_dead_letter(
-                    phase="TOP-UP",
-                    email=lead.email,
-                    http_status=0,
-                    error_text=f"Campaign assignment failed permanently (attempt #{failure_count + 1}) - deleting lead: {json.dumps(move_response) if isinstance(move_response, dict) else str(move_response)}",
-                    retry_count=failure_count
-                )
-            except Exception as dl_error:
-                logger.error(f"Failed to record final dead letter for {lead.email}: {dl_error}")
-            
-            # Delete after multiple failures
-            try:
-                delete_response = call_instantly_api(f'/api/v2/leads/{lead_id}', method='DELETE')
-                logger.info(f"🗑️ Deleted persistently failing lead {lead.email} after {failure_count + 1} attempts")
-            except Exception as delete_error:
-                logger.error(f"Failed to delete persistently failing lead {lead.email}: {delete_error}")
-            
+        if not verify_response:
+            logger.error(f"❌ Failed to verify lead {lead.email} (GET request failed)")
             return None
+        
+        actual_campaign = verify_response.get('campaign')
+        if actual_campaign != campaign_id:
+            logger.error(f"❌ Lead {lead.email} created but assignment FAILED")
+            logger.error(f"   Expected campaign: {campaign_id}")
+            logger.error(f"   Actual campaign: {actual_campaign}")
+            return None
+        
+        logger.info(f"✅ Lead {lead.email} created and verified in campaign {campaign_id}")
+        return lead_id
     
     except Exception as e:
-        if '409' in str(e) or 'already exists' in str(e).lower():
-            # Lead already exists, try to move it
-            logger.info(f"Lead {lead.email} already exists, attempting move")
-            return move_lead_to_campaign(lead, campaign_id)
-        else:
-            logger.error(f"Failed to create lead {lead.email}: {e}")
-            return None
+        logger.error(f"❌ Exception creating lead {lead.email}: {e}")
+        return None
 
 def move_lead_to_campaign(lead: Lead, campaign_id: str) -> Optional[str]:
     """Move existing lead to target campaign using proper Instantly API."""
