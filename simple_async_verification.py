@@ -205,8 +205,9 @@ def should_skip_verification(email: str) -> bool:
         if row.verification_status in ['verified', 'invalid', 'invalid_deleted']:
             return True
         
-        # ✅ Skip if updated within 24 hours (last verification attempt)
-        if row.updated_at:
+        # ✅ Skip if verification was attempted within 24 hours
+        # Only skip if there was an actual verification attempt (not just lead creation)
+        if row.verification_status and row.updated_at:
             hours_ago = (datetime.now(timezone.utc) - row.updated_at).total_seconds() / 3600
             if hours_ago < 24:
                 return True
