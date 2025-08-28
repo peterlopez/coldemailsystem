@@ -253,7 +253,7 @@ def store_verification_job(email: str, instantly_lead_id: str, campaign_id: str,
                 bigquery.ScalarQueryParameter("campaign_id", "STRING", campaign_id),
                 bigquery.ScalarQueryParameter("verification_status", "STRING", verification_status),
                 bigquery.ScalarQueryParameter("triggered_at", "TIMESTAMP", now),
-                bigquery.ScalarQueryParameter("credits_used", "INT64", credits_used)
+                bigquery.ScalarQueryParameter("credits_used", "FLOAT64", credits_used)
             ]
         )
         
