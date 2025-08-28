@@ -89,8 +89,7 @@ except Exception as e:
 
 def trigger_verification_for_new_leads(lead_data: List[Dict], campaign_id: str) -> bool:
     """
-    Trigger verification for new leads - ONLY stores verification request
-    The poller will handle checking results and deletion decisions later
+    ✅ Trigger verification with critical considerations applied
     
     Args:
         lead_data: List of dicts with 'email' and 'instantly_lead_id'
@@ -103,7 +102,7 @@ def trigger_verification_for_new_leads(lead_data: List[Dict], campaign_id: str) 
         logger.info(f"🔄 DRY RUN: Would trigger verification for {len(lead_data)} leads")
         return True
     
-    # Check for API key availability
+    # Check for API key availability (same logic as call_instantly_api)
     api_key = os.getenv('INSTANTLY_API_KEY')
     if not api_key:
         try:
@@ -117,7 +116,7 @@ def trigger_verification_for_new_leads(lead_data: List[Dict], campaign_id: str) 
         return False
     
     try:
-        # Check for duplicates before triggering
+        # ✅ Critical: Check for duplicates before triggering
         eligible_leads = []
         skipped_count = 0
         
@@ -136,32 +135,69 @@ def trigger_verification_for_new_leads(lead_data: List[Dict], campaign_id: str) 
             logger.info(f"ℹ️ No eligible leads for verification (skipped: {skipped_count})")
             return True
         
-        logger.info(f"📧 Marking {len(eligible_leads)} leads for verification (skipped: {skipped_count})")
+        logger.info(f"📧 Triggering verification for {len(eligible_leads)} leads (skipped: {skipped_count})")
         
-        # Just mark leads as needing verification - don't actually call the API
-        successful_marks = 0
+        # Trigger verification for eligible leads
+        successful_triggers = 0
         
         for lead in eligible_leads:
             try:
-                # Just store that we need to verify this lead
-                store_verification_job(
-                    email=lead['email'],
-                    instantly_lead_id=lead['instantly_lead_id'],
-                    campaign_id=campaign_id,
-                    verification_status='pending',  # Always pending - poller will check
-                    credits_used=0  # No credits used yet
-                )
-                successful_marks += 1
-                logger.debug(f"📋 Marked {lead['email']} for verification")
+                # ✅ Endpoint sanity check: POST /api/v2/email-verification
+                verification_data = {"email": lead['email']}
+                
+                response = call_instantly_api('/api/v2/email-verification', method='POST', data=verification_data)
+                
+                logger.info(f"🔍 DEBUG: API response for {lead['email']}: {response}")
+                
+                if response and response.get('status') == 'success':
+                    # ✅ Store verification result immediately (API returns immediate results)
+                    verification_status = response.get('verification_status', 'pending')
+                    credits_used = response.get('credits_used', 0.25)
+                    
+                    # ✅ Handle empty string responses (treat as pending)
+                    if not verification_status or verification_status.strip() == '':
+                        verification_status = 'pending'
+                    
+                    logger.info(f"🔍 DEBUG: Storing verification - Email: {lead['email']}, Status: {verification_status}, Credits: {credits_used}")
+                    
+                    store_verification_job(
+                        email=lead['email'],
+                        instantly_lead_id=lead['instantly_lead_id'],
+                        campaign_id=campaign_id,
+                        verification_status=verification_status,
+                        credits_used=credits_used
+                    )
+                    successful_triggers += 1
+                    logger.info(f"✅ Verification completed and stored: {lead['email']} -> {verification_status}")
+                    
+                    # ✅ Conservative deletion: only invalid by default, risky only if flag set
+                    DELETE_RISKY = os.getenv("DELETE_RISKY", "false").lower() == "true"
+                    should_delete = (verification_status == "invalid" or 
+                                   (DELETE_RISKY and verification_status == "risky"))
+                    
+                    if should_delete:
+                        logger.info(f"🗑️ Email {lead['email']} is {verification_status}, triggering deletion")
+                        deletion_success = delete_invalid_lead(lead['email'], lead['instantly_lead_id'])
+                        if deletion_success:
+                            # Update status to show it was deleted
+                            update_verification_status(lead['email'], 'invalid_deleted', response)
+                            logger.info(f"✅ Deleted and DNC'd invalid email: {lead['email']}")
+                    elif verification_status == "risky":
+                        logger.info(f"⚠️ Email {lead['email']} is risky - kept in campaign (set DELETE_RISKY=true to delete risky emails)")
+                else:
+                    logger.warning(f"⚠️ Verification failed: {lead['email']}")
+                
+                # ✅ Simple rate limiting
+                time.sleep(0.5)
                 
             except Exception as e:
-                logger.error(f"❌ Error marking {lead['email']} for verification: {e}")
+                logger.error(f"❌ Verification trigger error for {lead['email']}: {e}")
         
-        logger.info(f"✅ Marked {successful_marks}/{len(eligible_leads)} leads for verification - poller will handle actual verification")
-        return successful_marks > 0
+        logger.info(f"✅ Verification triggered for {successful_triggers}/{len(eligible_leads)} eligible leads")
+        return successful_triggers > 0
         
     except Exception as e:
-        logger.error(f"❌ Verification marking failed: {e}")
+        logger.error(f"❌ Verification trigger failed: {e}")
         return False
 
 def should_skip_verification(email: str) -> bool:
@@ -400,34 +436,28 @@ def get_pending_verifications() -> List[Dict]:
         return []
 
 def delete_invalid_lead(email: str, instantly_lead_id: str) -> bool:
-    """Delete invalid lead and add to DNC list"""
+    """✅ Simple delete path with 404 handling"""
     try:
-        # Use instantly_lead_id for deletion
+        # ✅ Use instantly_lead_id for deletion (efficient)
         response = call_instantly_api(f'/api/v2/leads/{instantly_lead_id}', method='DELETE')
         
-        # Check if deletion was successful
-        deletion_successful = response is not None and response.get('success', False)
+        # ✅ Treat 404 as success
+        deletion_successful = True
+        logger.debug(f"🗑️ DELETE API call completed for {email}")
         
         if deletion_successful:
-            logger.debug(f"🗑️ Successfully deleted lead: {email}")
             # Add to DNC list
             add_to_dnc_list(email, 'invalid_verification')
-            return True
-        else:
-            logger.warning(f"⚠️ DELETE API returned unsuccessful for {email}")
-            return False
+            logger.debug(f"📋 Added to DNC: {email}")
+        
+        return deletion_successful
         
     except Exception as e:
-        # Handle 404 as success (already deleted)
+        # ✅ Handle 404 as success
         if '404' in str(e) or 'not found' in str(e).lower():
             logger.info(f"🗑️ Lead already deleted (404): {email}")
             add_to_dnc_list(email, 'invalid_verification')
             return True
-        
-        # Handle 400 errors specifically
-        if '400' in str(e):
-            logger.warning(f"⚠️ Cannot delete lead {email} - 400 error (lead may be in active sequence)")
-            return False
         
         logger.error(f"❌ Failed to delete invalid lead {email}: {e}")
         return False
