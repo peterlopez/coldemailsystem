@@ -1658,7 +1658,10 @@ def process_lead_batch(leads: List[Lead], campaign_id: str) -> Tuple[int, Dict[s
     # ASYNC VERIFICATION: Trigger verification for successfully created leads
     verification_result = {"verification_triggered": False, "verification_count": 0}
     
-    if successful_count > 0 and ASYNC_VERIFICATION_AVAILABLE and not DRY_RUN:
+    # Check if verification should be skipped during sync
+    skip_sync_verification = os.getenv('SKIP_SYNC_VERIFICATION', 'false').lower() == 'true'
+    
+    if successful_count > 0 and ASYNC_VERIFICATION_AVAILABLE and not DRY_RUN and not skip_sync_verification:
         # ✅ Build lead data with both email and instantly_lead_id for efficient deletion
         successful_lead_data = [
             {"email": lead.email, "instantly_lead_id": lead_id} 
@@ -1684,6 +1687,12 @@ def process_lead_batch(leads: List[Lead], campaign_id: str) -> Tuple[int, Dict[s
                     "verification_triggered": False,
                     "verification_count": len(successful_lead_data)
                 }
+    elif skip_sync_verification:
+        logger.info(f"⏭️ Skipping verification during sync (SKIP_SYNC_VERIFICATION=true) - poller will handle it")
+        verification_result = {
+            "verification_skipped": True,
+            "verification_count": successful_count
+        }
     elif DRY_RUN:
         logger.info(f"🔍 DRY RUN: Would trigger async verification for {successful_count} leads")
         verification_result = {

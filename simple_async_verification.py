@@ -405,11 +405,16 @@ def get_pending_verifications() -> List[Dict]:
         query = """
         SELECT email, instantly_lead_id, campaign_id, verification_triggered_at
         FROM `{}.{}.ops_inst_state`
-        WHERE verification_status IN ('pending', 'unknown')
+        WHERE (verification_status IN ('pending', 'unknown') OR verification_status IS NULL)
           AND status != 'deleted'
           AND instantly_lead_id IS NOT NULL
-          AND verification_triggered_at <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
-        ORDER BY verification_triggered_at ASC
+          AND (
+            -- Never verified
+            verification_triggered_at IS NULL
+            -- Or verified more than 24 hours ago
+            OR verification_triggered_at <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+          )
+        ORDER BY COALESCE(verification_triggered_at, added_at) ASC
         LIMIT 100
         """.format(PROJECT_ID, DATASET_ID)
         

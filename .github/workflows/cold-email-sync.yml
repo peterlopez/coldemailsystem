@@ -29,7 +29,7 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     
     steps:
       - name: Checkout repository
@@ -161,12 +161,13 @@ jobs:
           INSTANTLY_API_KEY: ${{ secrets.INSTANTLY_API_KEY }}
           
           # Configuration
-          TARGET_NEW_LEADS_PER_RUN: ${{ github.event.inputs.target_leads || '100' }}
+          TARGET_NEW_LEADS_PER_RUN: ${{ github.event.inputs.target_leads || '50' }}
           INSTANTLY_CAP_GUARD: '24000'
           BATCH_SIZE: '50'  # Conservative for startup
           BATCH_SLEEP_SECONDS: '10'
           LEAD_INVENTORY_MULTIPLIER: '10'  # Increased from 3.5 to allow testing with higher inventory
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          SKIP_SYNC_VERIFICATION: 'true'  # Skip verification during sync, let poller handle it
           
           # Notification settings
           SLACK_NOTIFICATION_CHANNEL: ${{ secrets.SLACK_NOTIFICATION_CHANNEL }}

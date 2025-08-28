@@ -2,11 +2,11 @@ name: "Async Email Verification Poller"
 
 on:
   schedule:
-    # Run every 15 minutes during business hours (9 AM - 6 PM EST, Mon-Fri)
-    - cron: '*/15 9-18 * * 1-5'
-    # Run every hour during weekends and off-hours
-    - cron: '0 * * * 0,6'
-    - cron: '0 0-8,19-23 * * 1-5'
+    # Run every 5 minutes during business hours (9 AM - 6 PM EST, Mon-Fri)
+    - cron: '*/5 9-18 * * 1-5'
+    # Run every 30 minutes during weekends and off-hours
+    - cron: '*/30 * * * 0,6'
+    - cron: '*/30 0-8,19-23 * * 1-5'
   
   workflow_dispatch:
     inputs:
