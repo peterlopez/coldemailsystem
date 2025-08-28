@@ -48,14 +48,14 @@ except ImportError as e:
     NOTIFICATIONS_AVAILABLE = False
     logger.warning(f"📴 Notification system not available: {e}")
 
-# Import async verification system
+# Import simple async verification system
 try:
-    from async_email_verification import trigger_verification_for_new_leads
+    from simple_async_verification import trigger_verification_for_new_leads
     ASYNC_VERIFICATION_AVAILABLE = True
-    logger.info("🔍 Async verification system loaded")
+    logger.info("🔍 Simple async verification system loaded")
 except ImportError as e:
     ASYNC_VERIFICATION_AVAILABLE = False
-    logger.warning(f"📴 Async verification system not available: {e}")
+    logger.warning(f"📴 Simple async verification system not available: {e}")
 
 # OPTIMIZED: Use centralized configuration
 from shared_config import config, DRY_RUN, SMB_CAMPAIGN_ID, MIDSIZE_CAMPAIGN_ID, PROJECT_ID, DATASET_ID, TARGET_NEW_LEADS_PER_RUN
@@ -1659,14 +1659,19 @@ def process_lead_batch(leads: List[Lead], campaign_id: str) -> Tuple[int, Dict[s
     verification_result = {"verification_triggered": False, "verification_count": 0}
     
     if successful_count > 0 and ASYNC_VERIFICATION_AVAILABLE and not DRY_RUN:
-        successful_emails = [lead.email for lead, lead_id in zip(leads, successful_ids) if lead_id is not None]
-        if successful_emails:
-            logger.info(f"🔍 Triggering async verification for {len(successful_emails)} successfully created leads")
+        # ✅ Build lead data with both email and instantly_lead_id for efficient deletion
+        successful_lead_data = [
+            {"email": lead.email, "instantly_lead_id": lead_id} 
+            for lead, lead_id in zip(leads, successful_ids) 
+            if lead_id is not None
+        ]
+        if successful_lead_data:
+            logger.info(f"🔍 Triggering async verification for {len(successful_lead_data)} successfully created leads")
             try:
-                verification_triggered = trigger_verification_for_new_leads(successful_emails)
+                verification_triggered = trigger_verification_for_new_leads(successful_lead_data, campaign_id)
                 verification_result = {
                     "verification_triggered": verification_triggered,
-                    "verification_count": len(successful_emails)
+                    "verification_count": len(successful_lead_data)
                 }
                 if verification_triggered:
                     logger.info(f"✅ Async verification triggered successfully")
@@ -1677,7 +1682,7 @@ def process_lead_batch(leads: List[Lead], campaign_id: str) -> Tuple[int, Dict[s
                 logger.info("📧 Leads were created successfully but verification trigger failed")
                 verification_result = {
                     "verification_triggered": False,
-                    "verification_count": len(successful_emails)
+                    "verification_count": len(successful_lead_data)
                 }
     elif DRY_RUN:
         logger.info(f"🔍 DRY RUN: Would trigger async verification for {successful_count} leads")

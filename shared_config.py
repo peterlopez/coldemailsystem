@@ -100,7 +100,14 @@ class ProcessingConfig:
     stale_lead_days: int = 90  # Days before lead considered stale
     bounce_grace_days: int = 7  # Grace period for hard bounces
 
-# EMAIL VERIFICATION REMOVED - Let Instantly handle verification internally
+# InstantlyConfig class for async verification compatibility
+class InstantlyConfig:
+    """Configuration class for Instantly API access - needed for async verification"""
+    
+    def __init__(self):
+        self.api_key = config.api.instantly_api_key
+        self.base_url = config.api.instantly_base_url
+        self.timeout = config.api.timeout_seconds
 
 class SystemConfig:
     """Main configuration class that aggregates all config sections."""

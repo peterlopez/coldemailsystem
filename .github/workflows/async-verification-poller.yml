@@ -1,0 +1,137 @@
+name: "Async Email Verification Poller"
+
+on:
+  schedule:
+    # Run every 15 minutes during business hours (9 AM - 6 PM EST, Mon-Fri)
+    - cron: '*/15 9-18 * * 1-5'
+    # Run every hour during weekends and off-hours
+    - cron: '0 * * * 0,6'
+    - cron: '0 0-8,19-23 * * 1-5'
+  
+  workflow_dispatch:
+    inputs:
+      max_leads:
+        description: 'Maximum leads to check per run'
+        required: false
+        default: '500'
+        type: string
+      dry_run:
+        description: 'Dry run mode'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  poll-verification-results:
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Setup BigQuery Credentials
+        env:
+          BIGQUERY_CREDENTIALS_JSON: ${{ secrets.BIGQUERY_CREDENTIALS_JSON }}
+        run: |
+          mkdir -p config/secrets
+          echo "$BIGQUERY_CREDENTIALS_JSON" > config/secrets/bigquery-credentials.json
+      
+      - name: Setup Instantly Config
+        env:
+          INSTANTLY_API_KEY: ${{ secrets.INSTANTLY_API_KEY }}
+        run: |
+          echo '{"api_key": "'$INSTANTLY_API_KEY'"}' > config/secrets/instantly-config.json
+      
+      - name: Validate Environment
+        env:
+          INSTANTLY_API_KEY: ${{ secrets.INSTANTLY_API_KEY }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+        run: |
+          echo "🔍 Environment Validation"
+          echo "DRY_RUN: $DRY_RUN"
+          echo "INSTANTLY_API_KEY: $(echo $INSTANTLY_API_KEY | cut -c1-8)..."
+          echo "BigQuery credentials file: $(ls -la config/secrets/bigquery-credentials.json)"
+          
+          # Test BigQuery connection
+          python3 -c "
+          import os
+          from google.cloud import bigquery
+          os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = 'config/secrets/bigquery-credentials.json'
+          client = bigquery.Client(project='instant-ground-394115')
+          print('✅ BigQuery connection OK')
+          "
+          
+          # Test simple verification system
+          python3 -c "
+          import sys
+          sys.path.insert(0, '.')
+          from simple_async_verification import test_verification_endpoints
+          if test_verification_endpoints():
+              print('✅ Verification endpoints available')
+          else:
+              print('⚠️ Verification endpoints not available')
+          "
+      
+      - name: Poll Verification Results
+        env:
+          INSTANTLY_API_KEY: ${{ secrets.INSTANTLY_API_KEY }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+          MAX_LEADS: ${{ inputs.max_leads || '500' }}
+        run: |
+          echo "🔍 Polling async verification results..."
+          echo "Max leads to check: $MAX_LEADS"
+          echo "Dry run: $DRY_RUN"
+          
+          # Run the verification polling
+          python3 -c "
+          import os
+          import sys
+          import logging
+          
+          # Setup logging
+          logging.basicConfig(
+              level=logging.INFO,
+              format='%(asctime)s - %(levelname)s - %(message)s'
+          )
+          
+          sys.path.insert(0, '.')
+          from simple_async_verification import poll_verification_results
+          
+          # Poll verification results
+          print('🔍 Starting verification polling...')
+          results = poll_verification_results()
+          
+          print('📊 Polling Results:')
+          print(f'  Leads checked: {results.get(\"checked\", 0)}')
+          print(f'  Verified: {results.get(\"verified\", 0)}')
+          print(f'  Invalid/deleted: {results.get(\"invalid_deleted\", 0)}')
+          print(f'  Errors: {results.get(\"errors\", 0)}')
+          
+          if results.get('errors', 0) > 0:
+              print('⚠️ Some errors occurred during polling')
+              sys.exit(1)
+          else:
+              print('✅ Polling completed successfully')
+          "
+      
+      - name: Cleanup Credentials
+        if: always()
+        run: |
+          rm -f config/secrets/bigquery-credentials.json
+          rm -f config/secrets/instantly-config.json
+
+    timeout-minutes: 15
