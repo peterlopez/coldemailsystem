@@ -135,68 +135,88 @@ def trigger_verification_for_new_leads(lead_data: List[Dict], campaign_id: str) 
             logger.info(f"ℹ️ No eligible leads for verification (skipped: {skipped_count})")
             return True
         
-        logger.info(f"📧 Triggering verification for {len(eligible_leads)} leads (skipped: {skipped_count})")
+        logger.info(f"📧 Fire-and-forget verification for {len(eligible_leads)} leads (skipped: {skipped_count})")
         
-        # Trigger verification for eligible leads
+        # Fire-and-forget verification for eligible leads
         successful_triggers = 0
         
         for lead in eligible_leads:
             try:
-                # ✅ Endpoint sanity check: POST /api/v2/email-verification
-                verification_data = {"email": lead['email']}
+                email = lead['email']
+                instantly_lead_id = lead['instantly_lead_id']
                 
-                response = call_instantly_api('/api/v2/email-verification', method='POST', data=verification_data)
+                # Step 1: Store as pending FIRST (recovery guarantee)
+                store_verification_job_as_pending(
+                    email=email,
+                    instantly_lead_id=instantly_lead_id,
+                    campaign_id=campaign_id
+                )
                 
-                logger.info(f"🔍 DEBUG: API response for {lead['email']}: {response}")
+                # Step 2: Fire POST request (don't wait for/parse response)
+                verification_data = {"email": email}
+                try:
+                    call_instantly_api('/api/v2/email-verification', method='POST', data=verification_data)
+                    logger.debug(f"🚀 Fired verification request: {email}")
+                except Exception as api_error:
+                    logger.warning(f"⚠️ API request failed for {email}: {api_error}")
+                    # Continue - poller will retry since we marked as pending
                 
-                if response and response.get('status') == 'success':
-                    # ✅ Store verification result immediately (API returns immediate results)
-                    verification_status = response.get('verification_status', 'pending')
-                    credits_used = response.get('credits_used', 0.25)
-                    
-                    # ✅ Handle empty string responses (treat as pending)
-                    if not verification_status or verification_status.strip() == '':
-                        verification_status = 'pending'
-                    
-                    logger.info(f"🔍 DEBUG: Storing verification - Email: {lead['email']}, Status: {verification_status}, Credits: {credits_used}")
-                    
-                    store_verification_job(
-                        email=lead['email'],
-                        instantly_lead_id=lead['instantly_lead_id'],
-                        campaign_id=campaign_id,
-                        verification_status=verification_status,
-                        credits_used=credits_used
-                    )
-                    successful_triggers += 1
-                    logger.info(f"✅ Verification completed and stored: {lead['email']} -> {verification_status}")
-                    
-                    # ✅ Conservative deletion: only invalid by default, risky only if flag set
-                    DELETE_RISKY = os.getenv("DELETE_RISKY", "false").lower() == "true"
-                    should_delete = (verification_status == "invalid" or 
-                                   (DELETE_RISKY and verification_status == "risky"))
-                    
-                    if should_delete:
-                        logger.info(f"🗑️ Email {lead['email']} is {verification_status}, queueing for deletion")
-                        # Queue for deletion instead of deleting immediately
-                        queue_for_deletion(lead['email'], lead['instantly_lead_id'])
-                        logger.info(f"📋 Queued {lead['email']} for deletion")
-                    elif verification_status == "risky":
-                        logger.info(f"⚠️ Email {lead['email']} is risky - kept in campaign (set DELETE_RISKY=true to delete risky emails)")
-                else:
-                    logger.warning(f"⚠️ Verification failed: {lead['email']}")
-                
-                # ✅ Simple rate limiting
-                time.sleep(0.5)
+                successful_triggers += 1
                 
             except Exception as e:
                 logger.error(f"❌ Verification trigger error for {lead['email']}: {e}")
         
-        logger.info(f"✅ Verification triggered for {successful_triggers}/{len(eligible_leads)} eligible leads")
+        logger.info(f"✅ Fired verification requests for {successful_triggers}/{len(eligible_leads)} eligible leads - poller will handle results")
         return successful_triggers > 0
         
     except Exception as e:
         logger.error(f"❌ Verification trigger failed: {e}")
         return False
+
+def store_verification_job_as_pending(email: str, instantly_lead_id: str, campaign_id: str):
+    """Store verification job as pending and increment attempts (recovery guarantee)"""
+    if not bq_client or DRY_RUN:
+        logger.info(f"🔍 DEBUG: Skipping store_verification_job_as_pending - DRY_RUN: {DRY_RUN}")
+        return
+    
+    try:
+        now = datetime.now(timezone.utc)
+        
+        # MERGE to upsert the pending status and increment attempts
+        query = """
+        MERGE `{}.{}.ops_inst_state` AS target
+        USING (
+            SELECT @email as email, @instantly_lead_id as instantly_lead_id
+        ) AS source
+        ON target.email = source.email AND target.instantly_lead_id = source.instantly_lead_id
+        WHEN MATCHED THEN
+            UPDATE SET
+                verification_status = 'pending',
+                verification_triggered_at = @triggered_at,
+                verification_attempts = COALESCE(verification_attempts, 0) + 1,
+                updated_at = @triggered_at
+        WHEN NOT MATCHED THEN
+            INSERT (email, instantly_lead_id, campaign_id, status, verification_status, 
+                   verification_triggered_at, verification_attempts, added_at, updated_at)
+            VALUES (@email, @instantly_lead_id, @campaign_id, 'active', 'pending',
+                   @triggered_at, 1, @triggered_at, @triggered_at)
+        """.format(PROJECT_ID, DATASET_ID)
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("email", "STRING", email),
+                bigquery.ScalarQueryParameter("instantly_lead_id", "STRING", instantly_lead_id),
+                bigquery.ScalarQueryParameter("campaign_id", "STRING", campaign_id),
+                bigquery.ScalarQueryParameter("triggered_at", "TIMESTAMP", now)
+            ]
+        )
+        
+        bq_client.query(query, job_config=job_config).result()
+        logger.debug(f"✅ Stored {email} as pending (attempts incremented)")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to store {email} as pending: {e}")
+        raise  # Re-raise to stop processing this lead
 
 def queue_for_deletion(email: str, instantly_lead_id: str):
     """Queue a lead for deletion by updating deletion_status"""
@@ -228,16 +248,16 @@ def queue_for_deletion(email: str, instantly_lead_id: str):
         logger.error(f"❌ Failed to queue {email} for deletion: {e}")
 
 def should_skip_verification(email: str) -> bool:
-    """✅ Check 24-hour guard against duplicate triggers"""
+    """Check de-duplication conditions to avoid unnecessary verification requests"""
     if not bq_client:
         return False
     
     try:
         query = """
-        SELECT verification_status, verification_triggered_at, verified_at
+        SELECT verification_status, verification_triggered_at, verification_attempts
         FROM `{}.{}.ops_inst_state`
         WHERE email = @email
-        ORDER BY COALESCE(verification_triggered_at, verified_at, updated_at) DESC
+        ORDER BY COALESCE(verification_triggered_at, updated_at) DESC
         LIMIT 1
         """.format(PROJECT_ID, DATASET_ID)
         
@@ -250,31 +270,32 @@ def should_skip_verification(email: str) -> bool:
         results = list(bq_client.query(query, job_config=job_config).result())
         
         if not results:
-            return False  # No previous verification
+            return False  # No previous record - don't skip
         
         row = results[0]
         
-        # ✅ Skip if already in finished states (avoid double charges)
-        if row.verification_status in ['verified', 'invalid', 'invalid_deleted']:
+        # Skip condition 1: Already in finished states
+        if row.verification_status in ['verified', 'invalid', 'risky', 'no_result']:
+            logger.debug(f"⏭️ Skipping {email} - already {row.verification_status}")
             return True
         
-        # ✅ Skip if verification was triggered within 24 hours (avoid double charges)
-        if row.verification_triggered_at:
-            hours_ago = (datetime.now(timezone.utc) - row.verification_triggered_at).total_seconds() / 3600
-            if hours_ago < 24:
-                return True
+        # Skip condition 2: Recent pending (within 10 minutes)
+        if (row.verification_status in ['pending', ''] and 
+            row.verification_triggered_at and
+            (datetime.now(timezone.utc) - row.verification_triggered_at).total_seconds() < 600):  # 10 minutes
+            logger.debug(f"⏭️ Skipping {email} - recently triggered ({row.verification_triggered_at})")
+            return True
         
-        # ✅ Fallback: Skip if any verification activity within 24 hours
-        most_recent_activity = row.verification_triggered_at or row.verified_at
-        if most_recent_activity:
-            hours_ago = (datetime.now(timezone.utc) - most_recent_activity).total_seconds() / 3600
-            if hours_ago < 24:
-                return True
+        # Skip condition 3: Too many attempts
+        attempts = row.verification_attempts or 0
+        if attempts >= 3:
+            logger.debug(f"⏭️ Skipping {email} - max attempts reached ({attempts})")
+            return True
         
-        return False
+        return False  # Don't skip - this email is eligible
         
     except Exception as e:
-        logger.error(f"Error checking verification guard for {email}: {e}")
+        logger.error(f"Error checking verification skip conditions for {email}: {e}")
         return False  # Don't skip on error
 
 def store_verification_job(email: str, instantly_lead_id: str, campaign_id: str, 
@@ -492,12 +513,12 @@ def process_stale_verifications() -> Dict[str, int]:
                 
                 # Handle empty string results
                 if not status or status.strip() == '':
-                    # After 2 attempts with empty results, mark as unknown
-                    if attempts >= 1:
-                        status = 'unknown'
-                        logger.info(f"🤷 Marking {email} as unknown after {attempts + 1} attempts")
+                    # After 3 total attempts with empty results, mark as no_result
+                    if attempts >= 2:  # attempts is 0-indexed, so 2 means 3rd attempt
+                        status = 'no_result'
+                        logger.info(f"🤷 Marking {email} as no_result after {attempts + 1} attempts")
                     else:
-                        status = 'pending'
+                        status = 'pending'  # Keep as pending for retry
                 
                 # Store verification result and increment attempts
                 store_verification_with_attempts(
