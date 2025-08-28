@@ -663,8 +663,292 @@ def classify_lead_for_drain(lead: dict, campaign_name: str) -> dict:
             'keep_reason': f'Classification error - keeping safely: {str(e)}'
         }
 
+def get_leads_needing_drain_from_bigquery() -> Dict[str, List[str]]:
+    """
+    PHASE 2 OPTIMIZATION: BigQuery-first approach to find leads that need drain evaluation.
+    
+    Returns:
+        Dict mapping campaign_id -> list of instantly_lead_ids that need checking
+    """
+    try:
+        logger.info("📊 PHASE 2: Querying BigQuery for leads needing drain evaluation...")
+        
+        # Query leads that haven't been checked in 24+ hours OR never checked
+        # AND are currently active in campaigns
+        query = f"""
+        SELECT 
+            instantly_lead_id,
+            campaign_id,
+            email,
+            status
+        FROM `{PROJECT_ID}.{DATASET_ID}.ops_inst_state`
+        WHERE (
+            last_drain_check IS NULL 
+            OR TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), last_drain_check, HOUR) >= 24
+        )
+        AND status IN ('active', 'pending')  -- Only check leads that might still be in campaigns
+        AND campaign_id IN ('{SMB_CAMPAIGN_ID}', '{MIDSIZE_CAMPAIGN_ID}')
+        ORDER BY 
+            COALESCE(last_drain_check, TIMESTAMP('1970-01-01')) ASC,  -- Oldest checks first
+            email ASC  -- Deterministic ordering
+        LIMIT 1000  -- Reasonable limit to avoid overwhelming the system
+        """
+        
+        query_job = bq_client.query(query)
+        results = list(query_job.result(timeout=60))
+        
+        # Group leads by campaign for efficient processing
+        leads_by_campaign = {}
+        for row in results:
+            campaign_id = row.campaign_id
+            if campaign_id not in leads_by_campaign:
+                leads_by_campaign[campaign_id] = []
+            leads_by_campaign[campaign_id].append(row.instantly_lead_id)
+        
+        total_leads = sum(len(ids) for ids in leads_by_campaign.values())
+        logger.info(f"📊 BigQuery found {total_leads} leads needing drain evaluation across {len(leads_by_campaign)} campaigns")
+        
+        for campaign_id, lead_ids in leads_by_campaign.items():
+            campaign_name = "SMB" if campaign_id == SMB_CAMPAIGN_ID else "Midsize"
+            logger.info(f"  • {campaign_name}: {len(lead_ids)} leads")
+        
+        return leads_by_campaign
+        
+    except Exception as e:
+        logger.error(f"❌ BigQuery-first approach failed: {e}")
+        logger.info("🔄 Will fall back to current pagination method")
+        return {}
+
+
+def get_leads_by_ids_from_instantly(campaign_id: str, lead_ids: List[str]) -> List[dict]:
+    """
+    PHASE 2 OPTIMIZATION: Query Instantly for specific lead IDs instead of paginating through all.
+    
+    Args:
+        campaign_id: The campaign ID to query
+        lead_ids: List of specific lead IDs to fetch
+    
+    Returns:
+        List of lead dictionaries from Instantly API
+    """
+    try:
+        if not lead_ids:
+            return []
+            
+        logger.debug(f"🎯 Fetching {len(lead_ids)} specific leads from Instantly campaign {campaign_id}")
+        
+        # Instantly API doesn't support fetching specific lead IDs directly
+        # But we can use the list endpoint with pagination and filter client-side more efficiently
+        # This is still better than full pagination because we know exactly which leads we want
+        
+        all_leads = []
+        leads_found = set()
+        leads_needed = set(lead_ids)
+        
+        # Use pagination but stop early when we find all needed leads
+        starting_after = None
+        page_count = 0
+        
+        while leads_needed and page_count < 20:  # Safety limit for targeted search
+            url = f"{INSTANTLY_BASE_URL}/api/v2/leads/list"
+            payload = {
+                "campaign_id": campaign_id,
+                "limit": 50
+            }
+            
+            if starting_after:
+                payload["starting_after"] = starting_after
+            
+            adaptive_rate_limiter.wait()
+            
+            response = requests.post(
+                url,
+                headers=get_instantly_headers(), 
+                json=payload,
+                timeout=30
+            )
+            
+            if response.status_code != 200:
+                logger.warning(f"⚠️ API error {response.status_code} during targeted lead fetch")
+                break
+                
+            data = response.json()
+            leads = data.get('items', [])
+            
+            if not leads:
+                break
+                
+            page_count += 1
+            
+            # Filter to only leads we need
+            for lead in leads:
+                lead_id = lead.get('id', '')
+                if lead_id in leads_needed:
+                    all_leads.append(lead)
+                    leads_found.add(lead_id)
+                    leads_needed.remove(lead_id)
+                    logger.debug(f"✅ Found needed lead: {lead.get('email', lead_id)}")
+            
+            # Early exit optimization
+            if not leads_needed:
+                logger.info(f"🎯 Found all {len(lead_ids)} needed leads in {page_count} pages (vs full pagination)")
+                break
+                
+            starting_after = data.get('next_starting_after')
+            if not starting_after:
+                break
+        
+        found_count = len(all_leads)
+        missing_count = len(leads_needed)
+        
+        if missing_count > 0:
+            logger.warning(f"⚠️ Could not find {missing_count} leads in campaign (may have been deleted)")
+            
+        logger.info(f"🎯 Targeted fetch complete: {found_count}/{len(lead_ids)} leads found in {page_count} pages")
+        return all_leads
+        
+    except Exception as e:
+        logger.error(f"❌ Targeted lead fetch failed: {e}")
+        return []
+
+
+def process_bigquery_first_drain(bigquery_leads: Dict[str, List[str]]) -> List[InstantlyLead]:
+    """
+    PHASE 2 OPTIMIZATION: Process drain using BigQuery-first approach.
+    
+    Args:
+        bigquery_leads: Dict mapping campaign_id -> list of instantly_lead_ids to check
+        
+    Returns:
+        List of InstantlyLead objects that should be drained
+    """
+    try:
+        finished_leads = []
+        total_leads_processed = 0
+        
+        # Enhanced tracking like the original function
+        drain_reasons = {
+            'replied': 0,
+            'completed': 0, 
+            'bounced_hard': 0,
+            'unsubscribed': 0,
+            'stale_active': 0,
+            'auto_reply_detected': 0,
+            'kept_active': 0,
+            'kept_paused': 0,
+            'kept_other': 0
+        }
+        
+        # Process each campaign's leads using targeted approach
+        for campaign_id, lead_ids in bigquery_leads.items():
+            campaign_name = "SMB" if campaign_id == SMB_CAMPAIGN_ID else "Midsize"
+            
+            logger.info(f"🎯 Processing {len(lead_ids)} targeted leads from {campaign_name} campaign...")
+            
+            # Fetch specific leads from Instantly
+            instantly_leads = get_leads_by_ids_from_instantly(campaign_id, lead_ids)
+            
+            logger.info(f"📊 Retrieved {len(instantly_leads)} leads from Instantly for {campaign_name}")
+            
+            # Process each lead using existing classification logic
+            leads_to_update_timestamps = []
+            
+            for lead in instantly_leads:
+                total_leads_processed += 1
+                
+                lead_id = lead.get('id', '')
+                email = lead.get('email', '')
+                
+                if not lead_id:
+                    logger.debug(f"⚠️ Skipping lead with no ID: {email}")
+                    continue
+                
+                # Apply testing limit if configured
+                if MAX_LEADS_TO_EVALUATE > 0 and total_leads_processed > MAX_LEADS_TO_EVALUATE:
+                    logger.info(f"🧪 TESTING LIMIT REACHED: Processed {total_leads_processed} leads, stopping")
+                    break
+                
+                # Classify lead using existing drain logic
+                classification = classify_lead_for_drain(lead, campaign_name)
+                
+                if classification['should_drain']:
+                    instantly_lead = InstantlyLead(
+                        id=lead_id,
+                        email=email,
+                        campaign_id=campaign_id,
+                        status=classification['drain_reason']
+                    )
+                    finished_leads.append(instantly_lead)
+                    
+                    # Track drain reason
+                    drain_reason = classification.get('drain_reason', 'unknown')
+                    drain_reasons[drain_reason] = drain_reasons.get(drain_reason, 0) + 1
+                    
+                    details = classification.get('details', '')
+                    logger.info(f"🗑️ DRAIN: {email} → {drain_reason} | {details}")
+                else:
+                    # Track keep reasons
+                    keep_reason = str(classification.get('keep_reason', 'unknown reason'))
+                    status = lead.get('status', 0)
+                    
+                    is_auto_reply = ('auto-reply' in keep_reason.lower() if isinstance(keep_reason, str) else False) or \
+                                   classification.get('auto_reply', False) == True
+                    
+                    if is_auto_reply:
+                        drain_reasons['auto_reply_detected'] += 1
+                        logger.debug(f"🤖 KEEP: {email} → auto-reply detected | {keep_reason}")
+                    elif status == 1:
+                        drain_reasons['kept_active'] += 1
+                        logger.debug(f"⚡ KEEP: {email} → active sequence | {keep_reason}")
+                    elif status == 2:
+                        drain_reasons['kept_paused'] += 1  
+                        logger.debug(f"⏸️ KEEP: {email} → paused sequence | {keep_reason}")
+                    else:
+                        drain_reasons['kept_other'] += 1
+                        logger.debug(f"📋 KEEP: {email} → other reason | {keep_reason}")
+                
+                # Queue for timestamp update
+                leads_to_update_timestamps.append(lead_id)
+            
+            # Batch update timestamps for this campaign
+            if leads_to_update_timestamps:
+                try:
+                    batch_update_drain_timestamps(leads_to_update_timestamps)
+                    logger.info(f"📊 Updated drain check timestamps for {len(leads_to_update_timestamps)} leads in {campaign_name}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to update timestamps for {campaign_name}: {e}")
+            
+            # Break if testing limit reached
+            if MAX_LEADS_TO_EVALUATE > 0 and total_leads_processed > MAX_LEADS_TO_EVALUATE:
+                break
+        
+        # Final summary
+        total_to_drain = len(finished_leads)
+        logger.info("=" * 60)
+        logger.info("🚀 PHASE 2 OPTIMIZATION: BigQuery-first drain processing complete")
+        logger.info("=" * 60)
+        logger.info(f"📊 Total leads processed: {total_leads_processed}")
+        logger.info(f"🗑️ Total leads to drain: {total_to_drain}")
+        logger.info(f"📈 Drain rate: {(total_to_drain/max(total_leads_processed,1)*100):.1f}%")
+        
+        # Log drain reasons breakdown
+        if any(count > 0 for count in drain_reasons.values()):
+            logger.info("📋 Drain classification breakdown:")
+            for reason, count in drain_reasons.items():
+                if count > 0:
+                    logger.info(f"  • {reason}: {count}")
+        
+        logger.info("=" * 60)
+        
+        return finished_leads
+        
+    except Exception as e:
+        logger.error(f"❌ BigQuery-first drain processing failed: {e}")
+        raise
+
+
 def get_finished_leads() -> List[InstantlyLead]:
-    """Get leads with terminal status from Instantly using proper cursor-based pagination and time filtering."""
+    """Get leads with terminal status from Instantly using BigQuery-first optimization with fallback."""
     try:
         logger.info("🔄 DRAIN: Fetching finished leads from Instantly campaigns...")
         
@@ -676,6 +960,19 @@ def get_finished_leads() -> List[InstantlyLead]:
         
         if FORCE_DRAIN_CHECK:
             logger.info(f"🧪 TESTING MODE: Forcing drain check on all leads (bypassing 24hr limit)")
+        
+        # PHASE 2 OPTIMIZATION: Try BigQuery-first approach
+        bigquery_leads = get_leads_needing_drain_from_bigquery()
+        
+        if bigquery_leads and not FORCE_DRAIN_CHECK:
+            logger.info("🚀 PHASE 2: Using BigQuery-first optimization for targeted drain processing")
+            return process_bigquery_first_drain(bigquery_leads)
+        else:
+            if not bigquery_leads:
+                logger.info("🔄 BigQuery-first approach returned no results, using current pagination method")
+            if FORCE_DRAIN_CHECK:
+                logger.info("🧪 FORCE_DRAIN_CHECK enabled, using current pagination method to scan all leads")
+            logger.info("🔄 FALLBACK: Using current pagination-based drain processing")
         
         finished_leads = []
         total_leads_evaluated = 0  # Track total across all campaigns
