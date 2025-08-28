@@ -166,7 +166,7 @@ jobs:
           INSTANTLY_CAP_GUARD: '24000'
           BATCH_SIZE: '50'  # Conservative for startup
           BATCH_SLEEP_SECONDS: '10'
-          LEAD_INVENTORY_MULTIPLIER: '3.5'  # Smart capacity management
+          LEAD_INVENTORY_MULTIPLIER: '10'  # Increased from 3.5 to allow testing with higher inventory
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           
           # Notification settings

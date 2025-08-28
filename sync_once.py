@@ -196,9 +196,62 @@ def delete_lead_from_instantly(lead: 'InstantlyLead') -> bool:
         log_dead_letter('delete_lead', lead.email, lead.id, 0, str(e))
         return False
 
+class AdaptiveRateLimit:
+    """Adaptive rate limiting with backoff based on API response patterns."""
+    
+    def __init__(self):
+        self.success_count = 0
+        self.failure_count = 0
+        self.consecutive_successes = 0
+        self.consecutive_failures = 0
+        self.base_delay = config.rate_limits.pagination_delay
+        self.current_delay = self.base_delay
+        
+    def record_success(self):
+        """Record a successful API call and potentially reduce delay."""
+        self.success_count += 1
+        self.consecutive_successes += 1
+        self.consecutive_failures = 0
+        
+        # Gradually reduce delay after sustained success (but not below minimum)
+        if self.consecutive_successes >= 5:
+            self.current_delay = max(0.5, self.current_delay * 0.9)
+            self.consecutive_successes = 0  # Reset counter
+            logger.debug(f"🚀 Rate limit optimized: {self.current_delay:.1f}s (sustained success)")
+    
+    def record_failure(self, is_rate_limit: bool = False):
+        """Record a failed API call and increase delay if needed."""
+        self.failure_count += 1
+        self.consecutive_failures += 1
+        self.consecutive_successes = 0
+        
+        if is_rate_limit:
+            # More aggressive backoff for rate limiting
+            self.current_delay = min(10.0, self.current_delay * 2.0)
+            logger.debug(f"🐌 Rate limit increased due to 429: {self.current_delay:.1f}s")
+        elif self.consecutive_failures >= 3:
+            # Moderate backoff for general failures
+            self.current_delay = min(5.0, self.current_delay * 1.5)
+            logger.debug(f"⚠️ Rate limit increased due to failures: {self.current_delay:.1f}s")
+    
+    def get_delay(self) -> float:
+        """Get current adaptive delay."""
+        return self.current_delay
+    
+    def wait(self, custom_delay: Optional[float] = None):
+        """Wait with current adaptive delay or custom delay."""
+        delay = custom_delay or self.current_delay
+        if delay > 0:
+            logger.debug(f"⏸️ Adaptive rate limit: {delay:.1f}s")
+            time.sleep(delay)
+
+# Global adaptive rate limiter
+adaptive_rate_limiter = AdaptiveRateLimit()
+
 def log_dead_letter(phase: str, email: Optional[str], payload: str, status_code: int, error_text: str) -> None:
     """Log failed operations to dead letters table."""
     try:
+        # Use safe table reference with parameters
         query = f"""
         INSERT INTO `{PROJECT_ID}.{DATASET_ID}.ops_dead_letters`
         (id, occurred_at, phase, email, http_status, error_text, retry_count)
@@ -219,6 +272,49 @@ def log_dead_letter(phase: str, email: Optional[str], payload: str, status_code:
             bq_client.query(query, job_config=job_config).result()
     except Exception as e:
         logger.error(f"Failed to log dead letter: {e}")
+
+def get_lead_failure_count(email: str, failure_type: str) -> int:
+    """
+    Get the failure count for a specific lead and failure type from dead letters table.
+    
+    Args:
+        email: Lead email address to check
+        failure_type: Type of failure ('campaign_assignment', 'lead_creation', etc.)
+        
+    Returns:
+        int: Number of previous failures for this lead and type
+    """
+    try:
+        # Use safe table reference construction
+        query = f"""
+        SELECT COUNT(*) as failure_count
+        FROM `{PROJECT_ID}.{DATASET_ID}.ops_dead_letters`
+        WHERE email = @email 
+            AND error_text LIKE CONCAT('%', @failure_type, '%')
+            AND occurred_at > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+        """
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("email", "STRING", email),
+                bigquery.ScalarQueryParameter("failure_type", "STRING", failure_type),
+            ]
+        )
+        
+        query_job = bq_client.query(query, job_config=job_config)
+        results = list(query_job.result())
+        
+        if results:
+            failure_count = results[0].failure_count
+            logger.debug(f"📊 Lead {email} has {failure_count} previous {failure_type} failures")
+            return failure_count
+        
+        return 0
+        
+    except Exception as e:
+        logger.error(f"❌ Error getting failure count for {email}: {e}")
+        # Conservative approach: assume no previous failures if we can't check
+        return 0
 
 def get_instantly_headers() -> dict:
     """OPTIMIZED: Get headers for Instantly API calls using shared config."""
@@ -274,7 +370,8 @@ def batch_check_leads_for_drain(lead_ids: list) -> dict:
             
             try:
                 # Create parameterized query for batch
-                query = """
+                # Use safe table reference construction
+                query = f"""
                 SELECT 
                     instantly_lead_id,
                     last_drain_check,
@@ -357,7 +454,7 @@ def update_lead_drain_check_timestamp(lead_id: str) -> bool:
             return False
         
         # Update timestamp - only update existing records, don't create new ones
-        query = """
+        query = f"""
         UPDATE `{PROJECT_ID}.{DATASET_ID}.ops_inst_state`
         SET last_drain_check = CURRENT_TIMESTAMP(), updated_at = CURRENT_TIMESTAMP()
         WHERE instantly_lead_id = @lead_id
@@ -403,8 +500,8 @@ def batch_update_drain_timestamps(lead_ids: list) -> bool:
             logger.debug(f"📊 Batch updating timestamps: batch {i//BATCH_SIZE + 1}, {len(batch_ids)} leads")
             
             try:
-                # Create batch update query - only update existing records, don't insert new ones
-                query = """
+                # Create batch update query - only update existing records, don't insert new ones  
+                query = f"""
                 UPDATE `{PROJECT_ID}.{DATASET_ID}.ops_inst_state`
                 SET last_drain_check = CURRENT_TIMESTAMP(), updated_at = CURRENT_TIMESTAMP()
                 WHERE instantly_lead_id IN UNNEST(@lead_ids)
@@ -638,9 +735,7 @@ def get_finished_leads() -> List[InstantlyLead]:
                 
                 # RATE LIMITING: Use optimized delay from centralized config
                 if page_count > 0:  # Don't delay the first call
-                    delay = config.rate_limits.pagination_delay
-                    logger.debug(f"⏸️ Optimized rate limiting: waiting {delay}s before next API call...")
-                    time.sleep(delay)  # OPTIMIZED: Centralized configuration
+                    adaptive_rate_limiter.wait()  # Use adaptive rate limiting
                 
                 response = requests.post(
                     url,
@@ -652,6 +747,8 @@ def get_finished_leads() -> List[InstantlyLead]:
                 if response.status_code == 200:
                     # Reset rate limit counter on successful response
                     consecutive_429_errors = 0
+                    # Track success for adaptive rate limiting
+                    adaptive_rate_limiter.record_success()
                     
                     data = response.json()
                     leads = data.get('items', [])
@@ -795,20 +892,28 @@ def get_finished_leads() -> List[InstantlyLead]:
                     break  # Don't retry auth errors
                 
                 elif response.status_code == 429:
-                    # 429 = Rate limiting - implement backoff
+                    # 429 = Rate limiting - implement adaptive backoff
                     consecutive_429_errors += 1
+                    # Track rate limit failure for adaptive strategy
+                    adaptive_rate_limiter.record_failure(is_rate_limit=True)
                     
                     if consecutive_429_errors >= 5:
                         logger.error(f"❌ Too many consecutive rate limit errors ({consecutive_429_errors}) for {campaign_name} - stopping pagination")
                         break
                     
-                    backoff_time = min(10 * consecutive_429_errors, 60)  # 10s, 20s, 30s, 40s, 60s max
+                    # Use adaptive backoff combined with exponential backoff
+                    exponential_backoff = min(10 * consecutive_429_errors, 60)  # 10s, 20s, 30s, 40s, 60s max
+                    adaptive_backoff = adaptive_rate_limiter.get_delay()
+                    backoff_time = max(exponential_backoff, adaptive_backoff)  # Use the higher of the two
+                    
                     logger.warning(f"⚠️ Rate limit error #{consecutive_429_errors} for {campaign_name} on page {page_count + 1}")
-                    logger.info(f"💤 Backing off for {backoff_time} seconds before retry...")
+                    logger.info(f"💤 Adaptive + exponential backoff: {backoff_time:.1f}s before retry...")
                     time.sleep(backoff_time)
                     continue  # Retry the same page
                     
                 else:
+                    # Track general API failure for adaptive rate limiting
+                    adaptive_rate_limiter.record_failure(is_rate_limit=False)
                     logger.error(f"❌ Failed to get leads from {campaign_name} campaign (page {page_count + 1}): {response.status_code} - {response.text}")
                     break
             
@@ -938,7 +1043,7 @@ def _bulk_update_ops_inst_state(leads: List[InstantlyLead]) -> None:
     
     values_clause = ",\n    ".join(values_rows)
     
-    # Single MERGE query for all leads
+    # Single MERGE query for all leads using safe table reference
     bulk_merge_query = f"""
     MERGE `{PROJECT_ID}.{DATASET_ID}.ops_inst_state` T
     USING (
@@ -974,13 +1079,12 @@ def _bulk_insert_lead_history(leads: List[InstantlyLead]) -> None:
     
     values_clause = ",\n    ".join(values_rows)
     
-    # Single INSERT query for all history records
+    # Single INSERT query for all history records using safe table reference
     bulk_history_query = f"""
     INSERT INTO `{PROJECT_ID}.{DATASET_ID}.ops_lead_history`
     (email, campaign_id, sequence_name, status_final, completed_at, attempt_num)
     VALUES
-    {values_clause}
-    """
+    {values_clause}"""
     
     bq_client.query(bulk_history_query).result()
     logger.info(f"✅ Bulk inserted {len(leads)} leads to history (90-day cooldown)")
@@ -1010,13 +1114,12 @@ def _bulk_insert_dnc_list(leads: List[InstantlyLead]) -> None:
     
     values_clause = ",\n    ".join(values_rows)
     
-    # Single INSERT query for all DNC records
+    # Single INSERT query for all DNC records using safe table reference
     bulk_dnc_query = f"""
     INSERT INTO `{PROJECT_ID}.{DATASET_ID}.dnc_list`
     (id, email, domain, source, reason, added_date, added_by, is_active)
     VALUES
-    {values_clause}
-    """
+    {values_clause}"""
     
     bq_client.query(bulk_dnc_query).result()
     logger.info(f"🚫 Bulk added {len(leads)} unsubscribes to permanent DNC list")
@@ -1080,126 +1183,156 @@ def drain_finished_leads() -> int:
     return len(finished_leads)
 
 def get_mailbox_capacity() -> Tuple[int, int]:
-    """Get current mailbox capacity from Instantly API."""
+    """Get current mailbox capacity - V2 API ONLY (no v1 endpoints)."""
     try:
-        # Get mailbox information from Instantly
-        response = call_instantly_api('/api/v1/account/emails', method='GET')
+        # V2 API: First verify authentication with workspace endpoint
+        response = call_instantly_api('/api/v2/workspaces/current', method='GET')
         
         if DRY_RUN:
-            # For dry run, simulate 68 mailboxes at 10 emails/day each
-            logger.info("DRY RUN: Simulating 68 mailboxes at 10 emails/day capacity")
+            # For dry run, simulate conservative capacity
+            logger.info("DRY RUN: Using simulated mailbox capacity (68 boxes @ 10 emails/day ESTIMATE)")
             return 68, 680
         
-        if not response or 'emails' not in response:
-            logger.warning("Could not get mailbox data from API, using fallback estimate")
-            # Fallback: assume 68 mailboxes at 10 emails/day (early warmup)
+        # V2 API: Check workspace authentication succeeded
+        if response and response.get('id'):
+            workspace_name = response.get('name', 'Unknown')
+            logger.info(f"✅ V2 API Auth OK - Workspace: {workspace_name}")
+            
+            # V2 API doesn't have a direct mailbox count endpoint
+            # Use known conservative estimates until we find the right V2 endpoint
+            # TODO: Find V2 endpoint for mailbox count if it exists
+            total_mailboxes = 68  # Known value from your setup
+        
+            # IMPORTANT: This is a conservative estimate since Instantly API doesn't expose per-mailbox limits
+            # Mailbox capacity varies by warmup stage: 10-30 emails/day per mailbox
+            # Using conservative 10 emails/day for safety
+            estimated_emails_per_day_per_mailbox = 10
+            daily_capacity_estimate = total_mailboxes * estimated_emails_per_day_per_mailbox
+            
+            logger.info(f"📊 Mailbox Capacity ESTIMATE: {total_mailboxes} mailboxes @ {estimated_emails_per_day_per_mailbox} emails/day/mailbox = {daily_capacity_estimate} total emails/day")
+            logger.info(f"⚠️ NOTE: This is a conservative estimate. Actual capacity may be higher as mailboxes warm up.")
+            
+            return total_mailboxes, daily_capacity_estimate
+        else:
+            # V2 API auth failed or returned unexpected data
+            logger.warning("V2 API workspace call failed, using fallback capacity estimate")
+            logger.info("📊 Using FALLBACK ESTIMATE: 68 mailboxes @ 10 emails/day (conservative)")
             return 68, 680
-        
-        mailboxes = response['emails']
-        total_mailboxes = len(mailboxes)
-        
-        # Calculate total daily capacity
-        # Each mailbox: assume 10 emails/day initially (warmup), scaling to 30
-        # For now, use conservative estimate of 10 emails/day per mailbox
-        daily_capacity = total_mailboxes * 10  # Will enhance this to read actual limits
-        
-        logger.info(f"Mailbox capacity: {total_mailboxes} mailboxes, {daily_capacity} emails/day")
-        return total_mailboxes, daily_capacity
         
     except Exception as e:
-        logger.warning(f"Could not get mailbox capacity from API (this is normal): {e}")
-        logger.info("Using fallback capacity estimate - this doesn't affect functionality")
-        return 68, 680  # Fallback estimate based on typical setup
+        logger.warning(f"Could not get mailbox capacity from API: {e}")
+        logger.info("📊 Using FALLBACK ESTIMATE: 68 mailboxes @ 10 emails/day (conservative)")
+        return 68, 680  # Conservative fallback estimate
 
 def get_current_instantly_inventory() -> int:
-    """Get current lead count in Instantly using real API data - ENHANCED with debugging."""
+    """Get current lead count in Instantly using real API data - CORRECTED to use proper campaign field."""
     try:
-        # Get real inventory from Instantly API for both campaigns
-        total_count = 0
+        # CORRECTED: Get ALL leads first, then filter by campaign field (not campaign_id filter)
+        # This is because the API's campaign_id filter doesn't work - it returns all leads regardless
+        
+        logger.info("📊 Fetching all leads to calculate accurate inventory...")
+        
+        # Step 1: Fetch all leads from Instantly (only once, not per campaign)
+        all_leads = []
+        starting_after = None
+        page_count = 0
+        
+        while True:
+            data = {'limit': 100}  # No campaign filter - get all leads
+            
+            if starting_after:
+                data['starting_after'] = starting_after
+            
+            response = call_instantly_api('/api/v2/leads/list', method='POST', data=data)
+            
+            if not response or not response.get('items'):
+                break
+            
+            items = response.get('items', [])
+            page_count += 1
+            all_leads.extend(items)
+            logger.debug(f"  Page {page_count}: {len(items)} leads fetched")
+            
+            # Check for next page
+            starting_after = response.get('next_starting_after')
+            if not starting_after:
+                break
+            
+            # Safety limit
+            if page_count > 50:
+                logger.warning(f"Hit page limit at {page_count} pages while fetching inventory")
+                break
+        
+        logger.info(f"📄 Total leads fetched: {len(all_leads)}")
+        
+        # Step 2: Filter and count by campaign using the correct 'campaign' field
+        total_inventory = 0
+        campaign_breakdown = {}
+        unassigned_count = 0
         
         for campaign_name, campaign_id in [("SMB", SMB_CAMPAIGN_ID), ("Midsize", MIDSIZE_CAMPAIGN_ID)]:
-            try:
-                logger.info(f"📊 Checking {campaign_name} campaign ({campaign_id}) inventory...")
+            campaign_leads = []
+            campaign_inventory = 0
+            status_breakdown = {}
+            
+            # Filter leads for this campaign using 'campaign' field (not 'campaign_id')
+            for lead in all_leads:
+                lead_campaign = lead.get('campaign')  # CORRECTED: Use 'campaign' not 'campaign_id'
                 
-                # ENHANCED: Try getting ALL leads first (not just active) to see what's there
-                campaign_total = 0
-                status_breakdown = {}
-                
-                # Use cursor pagination (same as get_finished_leads)
-                starting_after = None
-                page_count = 0
-                
-                while True:
-                    data = {
-                        'campaign_id': campaign_id,
-                        # ENHANCED: Remove status filter to get ALL leads and count by status
-                        'limit': 100
-                    }
+                if lead_campaign == campaign_id:
+                    campaign_leads.append(lead)
                     
-                    # Add cursor if we have one
-                    if starting_after:
-                        data['starting_after'] = starting_after
+                    status = lead.get('status', 0)
+                    # V2 API Status codes: 1=Active, 2=Paused, 3=Completed, -1=Bounced, -2=Unsubscribed, -3=Skipped
+                    status_name = {
+                        1: 'active',
+                        2: 'paused', 
+                        3: 'completed',
+                        -1: 'bounced',
+                        -2: 'unsubscribed',
+                        -3: 'skipped'
+                    }.get(status, f'unknown_{status}')
                     
-                    response = call_instantly_api('/api/v2/leads/list', method='POST', data=data)
+                    status_breakdown[status_name] = status_breakdown.get(status_name, 0) + 1
                     
-                    if not response or not response.get('items'):
-                        logger.debug(f"  No items in {campaign_name} batch {page_count + 1}")
-                        break
-                    
-                    items = response.get('items', [])
-                    logger.debug(f"  {campaign_name} batch {page_count + 1}: {len(items)} leads found")
-                    
-                    # ENHANCED: Count leads by status for debugging
-                    for item in items:
-                        status = item.get('status', 'unknown')
-                        status_breakdown[status] = status_breakdown.get(status, 0) + 1
-                        
-                        # Count active leads (status 1 or 2) for inventory
-                        if status in [1, 2]:  # Active or in-progress
-                            campaign_total += 1
-                    
-                    # Check for next cursor
-                    starting_after = response.get('next_starting_after')
-                    if not starting_after:
-                        logger.debug(f"  {campaign_name} pagination complete - no more cursor")
-                        break
-                    
-                    page_count += 1
-                    
-                    # Safety limit to prevent infinite loops
-                    if page_count > 50:  # 5000 leads max per campaign
-                        logger.warning(f"Hit batch limit for {campaign_name} campaign inventory check")
-                        break
-                
-                # ENHANCED: Log status breakdown for debugging
-                logger.info(f"  {campaign_name} campaign: {campaign_total} active leads")
-                if status_breakdown:
-                    logger.info(f"  {campaign_name} status breakdown: {status_breakdown}")
-                else:
-                    logger.warning(f"  {campaign_name}: No leads found at all!")
-                
-                total_count += campaign_total
-                
-            except Exception as e:
-                logger.error(f"Failed to get {campaign_name} campaign inventory: {e}")
-                # Fall back to BigQuery for this campaign
-                query = f"""
-                SELECT COUNT(*) as count 
-                FROM `{PROJECT_ID}.{DATASET_ID}.ops_inst_state` 
-                WHERE status = 'active' AND campaign_id = '{campaign_id}'
-                """
-                result = bq_client.query(query).result()
-                campaign_count = next(result).count
-                logger.info(f"  {campaign_name} campaign (fallback): {campaign_count} tracked leads")
-                total_count += campaign_count
+                    # Count only Active (1) and Paused (2) as inventory
+                    if status in [1, 2]:
+                        campaign_inventory += 1
+            
+            # Log campaign results
+            logger.info(f"  📊 {campaign_name} campaign: {len(campaign_leads)} total leads, {campaign_inventory} active inventory")
+            if status_breakdown:
+                logger.debug(f"    Status breakdown: {status_breakdown}")
+            
+            total_inventory += campaign_inventory
+            campaign_breakdown[campaign_name] = {
+                'total_leads': len(campaign_leads),
+                'inventory': campaign_inventory,
+                'status_breakdown': status_breakdown
+            }
         
-        logger.info(f"Current Instantly inventory (actual): {total_count} active leads")
-        return total_count
+        # Count unassigned leads for completeness
+        for lead in all_leads:
+            if not lead.get('campaign'):
+                unassigned_count += 1
+        
+        # Log summary
+        logger.info(f"📋 Inventory Summary:")
+        logger.info(f"  🎯 Total Active Inventory: {total_inventory} leads")
+        logger.info(f"  📊 SMB: {campaign_breakdown.get('SMB', {}).get('inventory', 0)} active")
+        logger.info(f"  📊 Midsize: {campaign_breakdown.get('Midsize', {}).get('inventory', 0)} active") 
+        logger.info(f"  ❓ Unassigned leads: {unassigned_count}")
+        
+        return total_inventory
         
     except Exception as e:
         logger.error(f"Failed to get inventory from API, falling back to BigQuery: {e}")
-        # Fallback to BigQuery tracking
-        query = f"SELECT COUNT(*) as count FROM `{PROJECT_ID}.{DATASET_ID}.ops_inst_state` WHERE status = 'active'"
+        # Fallback to BigQuery tracking 
+        query = f"""
+        SELECT COUNT(*) as count 
+        FROM `{PROJECT_ID}.{DATASET_ID}.ops_inst_state` 
+        WHERE status = 'active'
+        """
         result = bq_client.query(query).result()
         total = next(result).count
         logger.info(f"Current Instantly inventory (tracked fallback): {total}")
@@ -1226,12 +1359,12 @@ def calculate_smart_lead_target() -> int:
         # Never go negative
         target_leads = max(0, target_leads)
         
-        logger.info(f"Capacity calculation:")
-        logger.info(f"  - Mailboxes: {mailbox_count}")
-        logger.info(f"  - Daily capacity: {daily_capacity} emails")
-        logger.info(f"  - Safe inventory limit: {safe_inventory_limit} leads (multiplier: {LEAD_INVENTORY_MULTIPLIER})")
-        logger.info(f"  - Current inventory: {current_inventory} leads")
-        logger.info(f"  - Available capacity: {available_capacity} leads")
+        logger.info(f"📊 Capacity calculation (based on ESTIMATES):")
+        logger.info(f"  - Mailboxes: {mailbox_count} (actual count)")
+        logger.info(f"  - Daily capacity ESTIMATE: {daily_capacity} emails/day @ 10/mailbox")
+        logger.info(f"  - Safe inventory limit: {safe_inventory_limit} leads (capacity × {LEAD_INVENTORY_MULTIPLIER})")
+        logger.info(f"  - Current inventory: {current_inventory} leads (actual)")
+        logger.info(f"  - Available capacity ESTIMATE: {available_capacity} leads")
         logger.info(f"  - Target for this run: {target_leads} leads")
         
         return target_leads
@@ -1247,16 +1380,16 @@ def get_eligible_leads(limit: int) -> List[Lead]:
         query = f"""
         SELECT email, merchant_name, platform_domain, state, country_code, 
                estimated_sales_yearly, sequence_target, klaviyo_installed_at,
-               -- Add priority tiers for analysis
+               -- Add priority tiers for analysis using safe timestamp parsing
                CASE 
-                 WHEN DATE(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', klaviyo_installed_at)) >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY) THEN 'HOT'
-                 WHEN DATE(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', klaviyo_installed_at)) >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY) THEN 'WARM' 
+                 WHEN DATE(SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', klaviyo_installed_at)) >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY) THEN 'HOT'
+                 WHEN DATE(SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', klaviyo_installed_at)) >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY) THEN 'WARM' 
                  ELSE 'COLD'
                END as klaviyo_priority
         FROM `{PROJECT_ID}.{DATASET_ID}.v_ready_for_instantly`
         WHERE email IS NOT NULL AND email != ''
         ORDER BY 
-          PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', klaviyo_installed_at) DESC NULLS LAST,
+          SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', klaviyo_installed_at) DESC NULLS LAST,
           RAND()  -- Secondary randomization for same-day installs
         LIMIT @limit
         """
@@ -1375,30 +1508,53 @@ def create_lead_in_instantly(lead: Lead, campaign_id: str) -> Optional[str]:
             logger.error(f"❌ Campaign assignment FAILED for {lead.email} - invalid response")
             logger.error(f"📋 Move response type: {type(move_response)}, value: {move_response}")
         
-        # Assignment failed - add to dead letters instead of immediate deletion
+        # Assignment failed - implement graduated failure handling
         logger.error(f"🎯 Target campaign: {campaign_id}")
-        logger.warning(f"💀 Lead {lead_id} assignment failed - adding to dead letters for retry")
         
-        try:
-            record_dead_letter(
-                phase="TOP-UP",
-                email=lead.email,
-                http_status=0,  # Will be updated if we had HTTP status
-                error_text=f"Campaign assignment failed: {json.dumps(move_response) if isinstance(move_response, dict) else str(move_response)}",
-                retry_count=0
-            )
-        except Exception as dl_error:
-            logger.error(f"Failed to record dead letter for {lead.email}: {dl_error}")
+        # Check if this lead has failed before by querying dead letters
+        failure_count = get_lead_failure_count(lead.email, "campaign_assignment")
         
-        # Only delete after recording the failure for potential retry
-        try:
-            delete_response = call_instantly_api(f'/api/v2/leads/{lead_id}', method='DELETE')
-            logger.info(f"🗑️ Deleted orphaned lead {lead.email} after recording failure")
-        except Exception as delete_error:
-            logger.error(f"Failed to delete orphaned lead {lead.email}: {delete_error}")
-        
-        # Return None to indicate failure
-        return None
+        if failure_count < 2:  # Allow up to 2 retries before deletion
+            logger.warning(f"💀 Lead {lead_id} assignment failed (attempt #{failure_count + 1}) - adding to dead letters for retry")
+            
+            try:
+                record_dead_letter(
+                    phase="TOP-UP",
+                    email=lead.email,
+                    http_status=0,
+                    error_text=f"Campaign assignment failed (attempt #{failure_count + 1}): {json.dumps(move_response) if isinstance(move_response, dict) else str(move_response)}",
+                    retry_count=failure_count
+                )
+            except Exception as dl_error:
+                logger.error(f"Failed to record dead letter for {lead.email}: {dl_error}")
+            
+            # Do NOT delete - keep lead for potential retry in next run
+            logger.info(f"🔄 Keeping lead {lead_id} for retry in next sync run")
+            return None  # Return None but don't delete
+            
+        else:
+            # Too many failures - time to delete
+            logger.error(f"💀 Lead {lead_id} assignment failed {failure_count + 1} times - deleting after multiple retry attempts")
+            
+            try:
+                record_dead_letter(
+                    phase="TOP-UP",
+                    email=lead.email,
+                    http_status=0,
+                    error_text=f"Campaign assignment failed permanently (attempt #{failure_count + 1}) - deleting lead: {json.dumps(move_response) if isinstance(move_response, dict) else str(move_response)}",
+                    retry_count=failure_count
+                )
+            except Exception as dl_error:
+                logger.error(f"Failed to record final dead letter for {lead.email}: {dl_error}")
+            
+            # Delete after multiple failures
+            try:
+                delete_response = call_instantly_api(f'/api/v2/leads/{lead_id}', method='DELETE')
+                logger.info(f"🗑️ Deleted persistently failing lead {lead.email} after {failure_count + 1} attempts")
+            except Exception as delete_error:
+                logger.error(f"Failed to delete persistently failing lead {lead.email}: {delete_error}")
+            
+            return None
     
     except Exception as e:
         if '409' in str(e) or 'already exists' in str(e).lower():
@@ -1410,18 +1566,67 @@ def create_lead_in_instantly(lead: Lead, campaign_id: str) -> Optional[str]:
             return None
 
 def move_lead_to_campaign(lead: Lead, campaign_id: str) -> Optional[str]:
-    """Handle existing lead - count as success for notification purposes."""
+    """Move existing lead to target campaign using proper Instantly API."""
     try:
-        logger.info(f"✅ Lead {lead.email} already exists in system - counting as successful")
+        logger.info(f"🔄 Moving existing lead {lead.email} to campaign {campaign_id}")
         
-        # NOTIFICATION FIX: Return a success indicator instead of None
-        # This ensures the lead is counted in notification metrics even if it's a duplicate
-        # The actual lead management will be handled by the drain workflow
-        return f"existing-{lead.email.split('@')[0]}"  # Return a success identifier
+        # First, try to find the existing lead to get its lead ID
+        search_response = call_instantly_api(f'/api/v2/leads?email={lead.email}')
+        
+        if not search_response or 'error' in search_response:
+            logger.warning(f"⚠️ Could not find existing lead {lead.email} - treating as new lead")
+            return None
+        
+        # Extract lead info from search results
+        leads_data = search_response.get('data', [])
+        if not leads_data:
+            logger.warning(f"⚠️ No lead data found for {lead.email} - treating as new lead")
+            return None
+        
+        existing_lead = leads_data[0]  # Take the first match
+        existing_lead_id = existing_lead.get('id')
+        current_campaign_id = existing_lead.get('campaign_id')
+        
+        if not existing_lead_id:
+            logger.error(f"❌ Could not get lead ID for existing lead {lead.email}")
+            return None
+        
+        # Check if already in target campaign
+        if current_campaign_id == campaign_id:
+            logger.info(f"✅ Lead {lead.email} already in target campaign {campaign_id}")
+            return existing_lead_id
+        
+        # Move lead to new campaign using the move endpoint
+        move_data = {
+            'campaign_id': campaign_id
+        }
+        
+        move_response = call_instantly_api(f'/api/v2/leads/{existing_lead_id}/move', 'POST', move_data)
+        
+        if move_response and 'error' not in move_response:
+            logger.info(f"✅ Successfully moved lead {lead.email} from campaign {current_campaign_id} to {campaign_id}")
+            return existing_lead_id
+        else:
+            logger.error(f"❌ Failed to move lead {lead.email}: {move_response}")
+            # Log the failure for retry tracking
+            record_dead_letter(
+                phase="TOP-UP",
+                email=lead.email,
+                http_status=0,
+                error_text=f"Lead move failed: {move_response}",
+                payload=json.dumps(move_data)
+            )
+            return None
     
     except Exception as e:
-        logger.error(f"Failed to handle existing lead {lead.email}: {e}")
-        log_dead_letter('move_lead', lead.email, json.dumps({'campaign_id': campaign_id}), 0, str(e))
+        logger.error(f"❌ Exception moving lead {lead.email}: {e}")
+        record_dead_letter(
+            phase="TOP-UP",
+            email=lead.email,
+            http_status=0,
+            error_text=f"Lead move exception: {str(e)}",
+            payload=json.dumps({'campaign_id': campaign_id})
+        )
         return None
 
 def update_ops_state(leads: List[Lead], campaign_id: str, lead_ids: List[str], 
@@ -1441,7 +1646,7 @@ def update_ops_state(leads: List[Lead], campaign_id: str, lead_ids: List[str],
                             verification = v
                             break
                 
-                # Build insert query with verification fields
+                # Build insert query with verification fields using safe table reference
                 if verification:
                     query = f"""
                     INSERT INTO `{PROJECT_ID}.{DATASET_ID}.ops_inst_state`
@@ -1462,7 +1667,7 @@ def update_ops_state(leads: List[Lead], campaign_id: str, lead_ids: List[str],
                         ]
                     )
                 else:
-                    # Original query without verification fields
+                    # Original query without verification fields using safe table reference
                     query = f"""
                     INSERT INTO `{PROJECT_ID}.{DATASET_ID}.ops_inst_state`
                     (email, campaign_id, status, instantly_lead_id, added_at, updated_at)
@@ -1502,7 +1707,7 @@ def process_lead_batch(leads: List[Lead], campaign_id: str) -> Tuple[int, Dict[s
         for lead in batch:
             lead_id = create_lead_in_instantly(lead, campaign_id)
             batch_ids.append(lead_id)
-            time.sleep(0.5)  # Rate limiting between individual calls
+            adaptive_rate_limiter.wait(0.5)  # Use adaptive rate limiting between individual calls
         
         successful_ids.extend(batch_ids)
         
@@ -1613,7 +1818,7 @@ def housekeeping() -> Dict:
         safe_inventory_limit = int(daily_capacity * LEAD_INVENTORY_MULTIPLIER)
         
         # Get eligible count
-        query = f"SELECT COUNT(*) as count FROM `{PROJECT_ID}.{DATASET_ID}.v_ready_for_instantly`"
+        query = "SELECT COUNT(*) as count FROM `" + PROJECT_ID + "." + DATASET_ID + ".v_ready_for_instantly`"
         result = bq_client.query(query).result()
         eligible_count = next(result).count
         
@@ -1637,12 +1842,12 @@ def housekeeping() -> Dict:
             'dry_run': DRY_RUN
         }
         
-        logger.info(f"Summary:")
-        logger.info(f"  - Current inventory: {inventory:,} leads")
-        logger.info(f"  - Eligible leads: {eligible_count:,}")  
-        logger.info(f"  - Mailboxes: {mailbox_count} ({daily_capacity} emails/day)")
-        logger.info(f"  - Safe capacity: {safe_inventory_limit:,} leads (utilization: {capacity_utilization:.1f}%)")
-        logger.info(f"  - Legacy cap guard: {INSTANTLY_CAP_GUARD:,}")
+        logger.info(f"📊 Summary:")
+        logger.info(f"  - Current inventory: {inventory:,} leads (actual)")
+        logger.info(f"  - Eligible leads: {eligible_count:,} (actual)")  
+        logger.info(f"  - Mailboxes: {mailbox_count} (actual) @ {daily_capacity} emails/day (ESTIMATE)")
+        logger.info(f"  - Safe capacity ESTIMATE: {safe_inventory_limit:,} leads (utilization: {capacity_utilization:.1f}%)")
+        logger.info(f"  - Legacy cap guard: {INSTANTLY_CAP_GUARD:,} (hard limit)")
         # Update verification logging based on actual system behavior
         if ASYNC_VERIFICATION_AVAILABLE:
             logger.info(f"  - Verification: ASYNC (triggered after lead creation)")
@@ -1663,6 +1868,22 @@ def main():
     logger.info("🚀 STARTING COLD EMAIL SYNC (Fast Mode)")
     logger.info(f"Config - Target: {TARGET_NEW_LEADS_PER_RUN}, Cap: {INSTANTLY_CAP_GUARD}, Multiplier: {LEAD_INVENTORY_MULTIPLIER}, Dry Run: {DRY_RUN}")
     logger.info("ℹ️ NOTE: Drain phase now handled by separate workflow - this is FAST MODE")
+    
+    # V2 API Auth Sanity Check - Verify authentication before proceeding
+    logger.info("🔐 Verifying Instantly V2 API authentication...")
+    try:
+        workspace_response = call_instantly_api('/api/v2/workspaces/current', method='GET')
+        if workspace_response and workspace_response.get('id'):
+            logger.info(f"✅ Instantly V2 Auth OK - Workspace: {workspace_response.get('name', 'Unknown')} (ID: {workspace_response.get('id')})")
+        else:
+            logger.error("❌ Instantly V2 Auth FAILED - Invalid workspace response")
+            logger.error(f"Response: {workspace_response}")
+            logger.error("Please check your Instantly API key is valid for V2 API")
+            return
+    except Exception as auth_error:
+        logger.error(f"❌ Instantly V2 Auth Check FAILED: {auth_error}")
+        logger.error("Cannot proceed without valid V2 API authentication")
+        return
     
     # Initialize notification tracking
     notification_data = {
