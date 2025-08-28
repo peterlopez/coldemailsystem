@@ -176,12 +176,10 @@ def trigger_verification_for_new_leads(lead_data: List[Dict], campaign_id: str) 
                                    (DELETE_RISKY and verification_status == "risky"))
                     
                     if should_delete:
-                        logger.info(f"🗑️ Email {lead['email']} is {verification_status}, triggering deletion")
-                        deletion_success = delete_invalid_lead(lead['email'], lead['instantly_lead_id'])
-                        if deletion_success:
-                            # Update status to show it was deleted
-                            update_verification_status(lead['email'], 'invalid_deleted', response)
-                            logger.info(f"✅ Deleted and DNC'd invalid email: {lead['email']}")
+                        logger.info(f"🗑️ Email {lead['email']} is {verification_status}, queueing for deletion")
+                        # Queue for deletion instead of deleting immediately
+                        queue_for_deletion(lead['email'], lead['instantly_lead_id'])
+                        logger.info(f"📋 Queued {lead['email']} for deletion")
                     elif verification_status == "risky":
                         logger.info(f"⚠️ Email {lead['email']} is risky - kept in campaign (set DELETE_RISKY=true to delete risky emails)")
                 else:
@@ -199,6 +197,35 @@ def trigger_verification_for_new_leads(lead_data: List[Dict], campaign_id: str) 
     except Exception as e:
         logger.error(f"❌ Verification trigger failed: {e}")
         return False
+
+def queue_for_deletion(email: str, instantly_lead_id: str):
+    """Queue a lead for deletion by updating deletion_status"""
+    if not bq_client or DRY_RUN:
+        logger.info(f"🔍 DEBUG: Skipping queue_for_deletion - DRY_RUN: {DRY_RUN}")
+        return
+    
+    try:
+        query = """
+        UPDATE `{}.{}.ops_inst_state`
+        SET deletion_status = 'queued',
+            deletion_attempts = 0,
+            updated_at = CURRENT_TIMESTAMP()
+        WHERE email = @email
+          AND instantly_lead_id = @instantly_lead_id
+        """.format(PROJECT_ID, DATASET_ID)
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("email", "STRING", email),
+                bigquery.ScalarQueryParameter("instantly_lead_id", "STRING", instantly_lead_id)
+            ]
+        )
+        
+        bq_client.query(query, job_config=job_config).result()
+        logger.debug(f"✅ Queued {email} for deletion")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to queue {email} for deletion: {e}")
 
 def should_skip_verification(email: str) -> bool:
     """✅ Check 24-hour guard against duplicate triggers"""
@@ -305,14 +332,14 @@ def store_verification_job(email: str, instantly_lead_id: str, campaign_id: str,
 
 def poll_verification_results() -> Dict[str, int]:
     """
-    Re-verify pending emails using POST endpoint only (no GET support)
+    Process deletion queue and re-verify stale pending emails
     
     Returns:
-        Dict with counts of processed verifications
+        Dict with counts of processed operations
     """
     if DRY_RUN:
-        logger.info("🔄 DRY RUN: Would poll verification results")
-        return {'checked': 0, 'verified': 0, 'invalid_deleted': 0}
+        logger.info("🔄 DRY RUN: Would poll verification results and process deletions")
+        return {'deletes_processed': 0, 'verifications_checked': 0, 'errors': 0}
     
     # Check for API key availability
     api_key = os.getenv('INSTANTLY_API_KEY')
@@ -325,76 +352,336 @@ def poll_verification_results() -> Dict[str, int]:
     
     if not api_key or not bq_client:
         logger.info("📴 API key or BigQuery not available - skipping polling")
-        return {'checked': 0, 'verified': 0, 'invalid_deleted': 0}
+        return {'deletes_processed': 0, 'verifications_checked': 0, 'errors': 0}
     
-    # Get pending verifications (24+ hours old to avoid double spend)
-    pending_verifications = get_pending_verifications()
+    results = {'deletes_processed': 0, 'verifications_checked': 0, 'errors': 0}
     
-    if not pending_verifications:
-        logger.info("ℹ️ No pending verifications to re-check")
-        return {'checked': 0, 'verified': 0, 'invalid_deleted': 0}
+    # Process deletion queue first
+    deletion_results = process_deletion_queue()
+    results['deletes_processed'] = deletion_results.get('processed', 0)
+    results['errors'] += deletion_results.get('errors', 0)
     
-    logger.info(f"🔍 Re-verifying {len(pending_verifications)} pending emails")
+    # Then re-verify stale pending emails
+    verification_results = process_stale_verifications()
+    results['verifications_checked'] = verification_results.get('checked', 0)
+    results['errors'] += verification_results.get('errors', 0)
     
-    results = {'checked': 0, 'verified': 0, 'invalid_deleted': 0, 'errors': 0}
+    logger.info(f"📊 Polling complete: deletions={results['deletes_processed']}, verifications={results['verifications_checked']}, errors={results['errors']}")
+    return results
+
+def process_deletion_queue() -> Dict[str, int]:
+    """Process queued deletions with retry logic"""
+    if not bq_client:
+        return {'processed': 0, 'errors': 0}
     
-    for verification in pending_verifications:
-        email = verification['email']
-        instantly_lead_id = verification['instantly_lead_id']
+    try:
+        # Get up to 50 queued deletions
+        query = """
+        SELECT email, instantly_lead_id, deletion_attempts
+        FROM `{}.{}.ops_inst_state`
+        WHERE deletion_status = 'queued'
+          AND deletion_attempts < 3
+        ORDER BY updated_at ASC
+        LIMIT 50
+        """.format(PROJECT_ID, DATASET_ID)
         
-        try:
-            # Re-POST verification request (no GET endpoint available)
-            response = call_instantly_api('/api/v2/email-verification', method='POST', data={"email": email})
+        results = list(bq_client.query(query).result())
+        
+        if not results:
+            logger.debug("ℹ️ No queued deletions to process")
+            return {'processed': 0, 'errors': 0}
+        
+        logger.info(f"🗑️ Processing {len(results)} queued deletions")
+        
+        processed = 0
+        errors = 0
+        
+        for row in results:
+            email = row.email
+            instantly_lead_id = row.instantly_lead_id
+            attempts = row.deletion_attempts
             
-            if not response:
-                logger.warning(f"⚠️ No response for verification: {email}")
-                results['errors'] += 1
-                continue
-            
-            status = response.get('verification_status', '')
-            credits_used = response.get('credits_used', 0.25)
-            results['checked'] += 1
-            
-            # Handle empty string as 'unknown'
-            if not status or status.strip() == '':
-                status = 'unknown'
-            
-            # Update verification data
-            store_verification_job(
-                email=email,
-                instantly_lead_id=instantly_lead_id,
-                campaign_id=verification['campaign_id'],
-                verification_status=status,
-                credits_used=credits_used
-            )
-            
-            if status == 'verified':
-                results['verified'] += 1
-                logger.info(f"✅ Verified: {email}")
+            try:
+                # Attempt deletion
+                response = call_instantly_api(f'/api/v2/leads/{instantly_lead_id}', method='DELETE')
                 
-            elif status in ['invalid', 'risky']:
-                # Delete invalid/risky leads
-                DELETE_RISKY = os.getenv("DELETE_RISKY", "false").lower() == "true"
-                if status == 'invalid' or (status == 'risky' and DELETE_RISKY):
-                    deletion_success = delete_invalid_lead(email, instantly_lead_id)
-                    if deletion_success:
-                        update_verification_status(email, f'{status}_deleted', response)
-                        results['invalid_deleted'] += 1
-                        logger.info(f"🗑️ Deleted {status} lead: {email}")
-                    else:
-                        results['errors'] += 1
+                # Check if deletion was successful
+                success = response is not None and (
+                    response.get('success', False) or 
+                    response.get('status') == 'success'
+                )
+                
+                if success:
+                    # Mark as done and add to DNC
+                    mark_deletion_complete(email, instantly_lead_id)
+                    add_to_dnc_list(email, 'invalid_verification')
+                    logger.info(f"✅ Successfully deleted: {email}")
+                    processed += 1
                 else:
-                    logger.info(f"⚠️ Lead is risky but kept (DELETE_RISKY=false): {email}")
+                    # Log response body and increment attempts
+                    logger.warning(f"⚠️ DELETE failed for {email}: {response}")
+                    increment_deletion_attempts(email, instantly_lead_id, str(response))
+                    errors += 1
+                    
+            except Exception as e:
+                # Handle 404 as success (already deleted)
+                if '404' in str(e):
+                    mark_deletion_complete(email, instantly_lead_id)
+                    add_to_dnc_list(email, 'invalid_verification')
+                    logger.info(f"✅ Lead already deleted (404): {email}")
+                    processed += 1
+                else:
+                    # Log error and increment attempts
+                    logger.error(f"❌ DELETE error for {email}: {e}")
+                    increment_deletion_attempts(email, instantly_lead_id, str(e))
+                    errors += 1
+            
+            # Rate limiting between deletions
+            time.sleep(0.5)
+        
+        return {'processed': processed, 'errors': errors}
+        
+    except Exception as e:
+        logger.error(f"❌ Error processing deletion queue: {e}")
+        return {'processed': 0, 'errors': 1}
+
+def process_stale_verifications() -> Dict[str, int]:
+    """Re-verify stale pending emails with attempt limits"""
+    if not bq_client:
+        return {'checked': 0, 'errors': 0}
+    
+    try:
+        # Get up to 100 stale pending verifications
+        query = """
+        SELECT email, instantly_lead_id, campaign_id, verification_attempts
+        FROM `{}.{}.ops_inst_state`
+        WHERE verification_status IN ('', 'pending')
+          AND verification_triggered_at <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 20 MINUTE)
+          AND COALESCE(verification_attempts, 0) < 2
+        ORDER BY verification_triggered_at ASC
+        LIMIT 100
+        """.format(PROJECT_ID, DATASET_ID)
+        
+        results = list(bq_client.query(query).result())
+        
+        if not results:
+            logger.debug("ℹ️ No stale verifications to process")
+            return {'checked': 0, 'errors': 0}
+        
+        logger.info(f"🔍 Re-verifying {len(results)} stale pending emails")
+        
+        checked = 0
+        errors = 0
+        
+        for row in results:
+            email = row.email
+            instantly_lead_id = row.instantly_lead_id
+            campaign_id = row.campaign_id
+            attempts = row.verification_attempts or 0
+            
+            try:
+                # Re-POST verification
+                response = call_instantly_api('/api/v2/email-verification', method='POST', data={"email": email})
+                
+                if not response:
+                    errors += 1
+                    continue
+                
+                status = response.get('verification_status', '')
+                credits_used = response.get('credits_used', 0.25)
+                
+                # Handle empty string results
+                if not status or status.strip() == '':
+                    # After 2 attempts with empty results, mark as unknown
+                    if attempts >= 1:
+                        status = 'unknown'
+                        logger.info(f"🤷 Marking {email} as unknown after {attempts + 1} attempts")
+                    else:
+                        status = 'pending'
+                
+                # Store verification result and increment attempts
+                store_verification_with_attempts(
+                    email=email,
+                    instantly_lead_id=instantly_lead_id,
+                    campaign_id=campaign_id,
+                    verification_status=status,
+                    credits_used=credits_used,
+                    attempts=attempts + 1
+                )
+                
+                # Queue for deletion if invalid/risky
+                if status in ['invalid', 'risky']:
+                    DELETE_RISKY = os.getenv("DELETE_RISKY", "false").lower() == "true"
+                    if status == 'invalid' or (status == 'risky' and DELETE_RISKY):
+                        queue_for_deletion(email, instantly_lead_id)
+                        logger.info(f"🗑️ Queued {status} email for deletion: {email}")
+                
+                checked += 1
+                
+            except Exception as e:
+                logger.error(f"❌ Re-verification error for {email}: {e}")
+                errors += 1
             
             # Rate limiting
             time.sleep(0.5)
-            
-        except Exception as e:
-            logger.error(f"❌ Polling error for {email}: {e}")
-            results['errors'] += 1
+        
+        return {'checked': checked, 'errors': errors}
+        
+    except Exception as e:
+        logger.error(f"❌ Error processing stale verifications: {e}")
+        return {'checked': 0, 'errors': 1}
+
+def mark_deletion_complete(email: str, instantly_lead_id: str):
+    """Mark deletion as complete in BigQuery"""
+    if not bq_client:
+        return
     
-    logger.info(f"📊 Polling complete: checked={results['checked']}, verified={results['verified']}, deleted={results['invalid_deleted']}, errors={results['errors']}")
-    return results
+    try:
+        query = """
+        UPDATE `{}.{}.ops_inst_state`
+        SET deletion_status = 'done',
+            status = 'deleted',
+            updated_at = CURRENT_TIMESTAMP()
+        WHERE email = @email
+          AND instantly_lead_id = @instantly_lead_id
+        """.format(PROJECT_ID, DATASET_ID)
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("email", "STRING", email),
+                bigquery.ScalarQueryParameter("instantly_lead_id", "STRING", instantly_lead_id)
+            ]
+        )
+        
+        bq_client.query(query, job_config=job_config).result()
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to mark deletion complete for {email}: {e}")
+
+def increment_deletion_attempts(email: str, instantly_lead_id: str, error_message: str):
+    """Increment deletion attempts and set to failed after 3 attempts"""
+    if not bq_client:
+        return
+    
+    try:
+        # First get current attempts
+        query = """
+        SELECT deletion_attempts
+        FROM `{}.{}.ops_inst_state`
+        WHERE email = @email
+          AND instantly_lead_id = @instantly_lead_id
+        """.format(PROJECT_ID, DATASET_ID)
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("email", "STRING", email),
+                bigquery.ScalarQueryParameter("instantly_lead_id", "STRING", instantly_lead_id)
+            ]
+        )
+        
+        results = list(bq_client.query(query, job_config=job_config).result())
+        current_attempts = results[0].deletion_attempts if results else 0
+        new_attempts = current_attempts + 1
+        
+        # Update attempts and status
+        if new_attempts >= 3:
+            # Mark as failed after 3 attempts
+            update_query = """
+            UPDATE `{}.{}.ops_inst_state`
+            SET deletion_attempts = @new_attempts,
+                deletion_status = 'failed',
+                updated_at = CURRENT_TIMESTAMP()
+            WHERE email = @email
+              AND instantly_lead_id = @instantly_lead_id
+            """.format(PROJECT_ID, DATASET_ID)
+            logger.warning(f"⚠️ Marking {email} as deletion failed after {new_attempts} attempts")
+        else:
+            # Just increment attempts
+            update_query = """
+            UPDATE `{}.{}.ops_inst_state`
+            SET deletion_attempts = @new_attempts,
+                updated_at = CURRENT_TIMESTAMP()
+            WHERE email = @email
+              AND instantly_lead_id = @instantly_lead_id
+            """.format(PROJECT_ID, DATASET_ID)
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("email", "STRING", email),
+                bigquery.ScalarQueryParameter("instantly_lead_id", "STRING", instantly_lead_id),
+                bigquery.ScalarQueryParameter("new_attempts", "INTEGER", new_attempts)
+            ]
+        )
+        
+        bq_client.query(update_query, job_config=job_config).result()
+        
+        # Log the error to dead letters
+        log_dead_letter('delete_lead', email, error_message, 0, error_message)
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to increment deletion attempts for {email}: {e}")
+
+def store_verification_with_attempts(email: str, instantly_lead_id: str, campaign_id: str, 
+                                   verification_status: str, credits_used: float, attempts: int):
+    """Store verification result and update attempt count"""
+    if not bq_client:
+        return
+    
+    try:
+        now = datetime.now(timezone.utc)
+        
+        query = """
+        UPDATE `{}.{}.ops_inst_state`
+        SET verification_status = @verification_status,
+            verification_credits_used = @credits_used,
+            verification_attempts = @attempts,
+            verified_at = @verified_at,
+            updated_at = @verified_at
+        WHERE email = @email
+          AND instantly_lead_id = @instantly_lead_id
+        """.format(PROJECT_ID, DATASET_ID)
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("email", "STRING", email),
+                bigquery.ScalarQueryParameter("instantly_lead_id", "STRING", instantly_lead_id),
+                bigquery.ScalarQueryParameter("verification_status", "STRING", verification_status),
+                bigquery.ScalarQueryParameter("credits_used", "FLOAT64", credits_used),
+                bigquery.ScalarQueryParameter("attempts", "INTEGER", attempts),
+                bigquery.ScalarQueryParameter("verified_at", "TIMESTAMP", now)
+            ]
+        )
+        
+        bq_client.query(query, job_config=job_config).result()
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to store verification with attempts for {email}: {e}")
+
+def log_dead_letter(phase: str, email: str, data: str, http_status: int, error_text: str):
+    """Log a dead letter entry for debugging"""
+    if not bq_client:
+        return
+    
+    try:
+        query = """
+        INSERT INTO `{}.{}.ops_dead_letters`
+        (occurred_at, phase, email, http_status, error_text, retry_count)
+        VALUES (CURRENT_TIMESTAMP(), @phase, @email, @http_status, @error_text, 1)
+        """.format(PROJECT_ID, DATASET_ID)
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("phase", "STRING", phase),
+                bigquery.ScalarQueryParameter("email", "STRING", email or ""),
+                bigquery.ScalarQueryParameter("http_status", "INTEGER", http_status),
+                bigquery.ScalarQueryParameter("error_text", "STRING", error_text[:1000])  # Truncate long errors
+            ]
+        )
+        
+        bq_client.query(query, job_config=job_config).result()
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to log dead letter: {e}")
 
 def get_pending_verifications() -> List[Dict]:
     """Get pending verifications older than 24 hours to avoid double spend"""
