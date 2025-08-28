@@ -167,7 +167,7 @@ jobs:
           BATCH_SLEEP_SECONDS: '10'
           LEAD_INVENTORY_MULTIPLIER: '10'  # Increased from 3.5 to allow testing with higher inventory
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
-          SKIP_SYNC_VERIFICATION: 'true'  # Skip verification during sync, let poller handle it
+          SKIP_SYNC_VERIFICATION: 'false'  # Enable marking leads for verification
           
           # Notification settings
           SLACK_NOTIFICATION_CHANNEL: ${{ secrets.SLACK_NOTIFICATION_CHANNEL }}
