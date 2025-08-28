@@ -147,10 +147,14 @@ def trigger_verification_for_new_leads(lead_data: List[Dict], campaign_id: str) 
                 
                 response = call_instantly_api('/api/v2/email-verification', method='POST', data=verification_data)
                 
+                logger.info(f"🔍 DEBUG: API response for {lead['email']}: {response}")
+                
                 if response and response.get('status') == 'success':
                     # ✅ Store verification result immediately (API returns immediate results)
                     verification_status = response.get('verification_status', 'pending')
                     credits_used = response.get('credits_used', 0.25)
+                    
+                    logger.info(f"🔍 DEBUG: Storing verification - Email: {lead['email']}, Status: {verification_status}, Credits: {credits_used}")
                     
                     store_verification_job(
                         email=lead['email'],
@@ -160,7 +164,7 @@ def trigger_verification_for_new_leads(lead_data: List[Dict], campaign_id: str) 
                         credits_used=credits_used
                     )
                     successful_triggers += 1
-                    logger.debug(f"✅ Verification completed: {lead['email']} -> {verification_status}")
+                    logger.info(f"✅ Verification completed and stored: {lead['email']} -> {verification_status}")
                     
                     # ✅ Conservative deletion: only invalid by default, risky only if flag set
                     DELETE_RISKY = os.getenv("DELETE_RISKY", "false").lower() == "true"
@@ -246,7 +250,10 @@ def store_verification_job(email: str, instantly_lead_id: str, campaign_id: str,
                           verification_status: str, credits_used: int):
     """✅ Store verification job with instantly_lead_id for deletion"""
     if not bq_client or DRY_RUN:
+        logger.info(f"🔍 DEBUG: Skipping store_verification_job - DRY_RUN: {DRY_RUN}, bq_client: {bq_client is not None}")
         return
+    
+    logger.info(f"🔍 DEBUG: store_verification_job called - Email: {email}, Status: {verification_status}, Credits: {credits_used}")
     
     try:
         now = datetime.now(timezone.utc)
@@ -285,9 +292,12 @@ def store_verification_job(email: str, instantly_lead_id: str, campaign_id: str,
         )
         
         bq_client.query(query, job_config=job_config).result()
+        logger.info(f"✅ DEBUG: BigQuery write successful for {email}")
         
     except Exception as e:
-        logger.error(f"Failed to store verification job for {email}: {e}")
+        logger.error(f"❌ DEBUG: Failed to store verification job for {email}: {e}")
+        import traceback
+        logger.error(f"❌ DEBUG: Full traceback: {traceback.format_exc()}")
 
 def poll_verification_results() -> Dict[str, int]:
     """
