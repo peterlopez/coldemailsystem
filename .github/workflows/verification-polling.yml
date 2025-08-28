@@ -1,0 +1,138 @@
+name: Email Verification Polling
+
+# Poll for async email verification results from Instantly.ai
+# Runs every 2 hours to check verification statuses and update BigQuery
+
+on:
+  schedule:
+    # Run every 2 hours during business hours (8 AM - 8 PM EST)
+    - cron: '0 8,10,12,14,16,18,20 * * 1-5'  # Business hours weekdays  
+    # Run every 4 hours on weekends
+    - cron: '0 8,12,16,20 * * 0,6'  # Weekends
+  workflow_dispatch:  # Allow manual triggers
+    inputs:
+      max_leads:
+        description: 'Maximum number of leads to check'
+        required: false
+        default: '500'
+      show_stats:
+        description: 'Show statistics instead of polling'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      stats_hours:
+        description: 'Hours back for statistics (when showing stats)'
+        required: false
+        default: '24'
+
+permissions:
+  contents: read
+
+jobs:
+  verification-polling:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          echo "📦 Installing dependencies..."
+          pip install --upgrade pip
+          
+          # Install from requirements.txt to ensure all dependencies are included
+          if [ -f requirements.txt ]; then
+            echo "📦 Installing from requirements.txt..."
+            pip install -r requirements.txt
+          else
+            echo "⚠️ requirements.txt not found, installing minimal dependencies..."
+            pip install google-cloud-bigquery requests tenacity
+          fi
+          
+          echo "✅ Dependencies installed"
+      
+      - name: Create credentials file
+        env:
+          BIGQUERY_CREDS: ${{ secrets.BIGQUERY_CREDENTIALS_JSON }}
+          INSTANTLY_KEY: ${{ secrets.INSTANTLY_API_KEY }}
+        run: |
+          echo "📁 Creating directory structure..."
+          mkdir -p config/secrets
+          
+          # Check if secrets are available
+          if [ -z "${BIGQUERY_CREDS}" ]; then
+            echo "❌ ERROR: BIGQUERY_CREDENTIALS_JSON secret not set"
+            exit 1
+          fi
+          
+          if [ -z "${INSTANTLY_KEY}" ]; then
+            echo "❌ ERROR: INSTANTLY_API_KEY secret not set"
+            exit 1
+          fi
+          
+          # Create credentials file
+          printf '%s' "${BIGQUERY_CREDS}" > config/secrets/bigquery-credentials.json
+          chmod 600 config/secrets/bigquery-credentials.json
+          
+          # Validate JSON format
+          if python -m json.tool config/secrets/bigquery-credentials.json > /dev/null 2>&1; then
+            echo "✅ Credentials file is valid JSON"
+          else
+            echo "❌ ERROR: Credentials file is not valid JSON"
+            exit 1
+          fi
+          
+      - name: Run verification polling
+        env:
+          INSTANTLY_API_KEY: ${{ secrets.INSTANTLY_API_KEY }}
+          PYTHONPATH: .
+        run: |
+          echo "🔍 Starting Email Verification Polling"
+          echo "Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          
+          # Build command arguments
+          ARGS=""
+          
+          # Set max leads
+          MAX_LEADS="${{ github.event.inputs.max_leads || '500' }}"
+          ARGS="$ARGS --max-leads $MAX_LEADS"
+          
+          # Check if we should show stats
+          SHOW_STATS="${{ github.event.inputs.show_stats || 'false' }}"
+          if [ "$SHOW_STATS" = "true" ]; then
+            ARGS="$ARGS --stats"
+            STATS_HOURS="${{ github.event.inputs.stats_hours || '24' }}"
+            ARGS="$ARGS --hours $STATS_HOURS"
+            echo "📊 Running in statistics mode (last $STATS_HOURS hours)"
+          else
+            echo "🔍 Running verification polling (max $MAX_LEADS leads)"
+          fi
+          
+          # Run the verification polling script
+          python poll_verification_results.py $ARGS
+          
+      - name: Cleanup credentials
+        if: always()
+        run: |
+          rm -f config/secrets/bigquery-credentials.json
+          
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-polling-logs-${{ github.run_number }}
+          path: |
+            *.log
+          if-no-files-found: warn
+          retention-days: 7

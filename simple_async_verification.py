@@ -305,7 +305,7 @@ def store_verification_job(email: str, instantly_lead_id: str, campaign_id: str,
 
 def poll_verification_results() -> Dict[str, int]:
     """
-    ✅ Poll only 'pending' verifications with simple delete path
+    Re-verify pending emails using POST endpoint only (no GET support)
     
     Returns:
         Dict with counts of processed verifications
@@ -314,7 +314,7 @@ def poll_verification_results() -> Dict[str, int]:
         logger.info("🔄 DRY RUN: Would poll verification results")
         return {'checked': 0, 'verified': 0, 'invalid_deleted': 0}
     
-    # Check for API key availability (same logic as call_instantly_api)
+    # Check for API key availability
     api_key = os.getenv('INSTANTLY_API_KEY')
     if not api_key:
         try:
@@ -327,14 +327,14 @@ def poll_verification_results() -> Dict[str, int]:
         logger.info("📴 API key or BigQuery not available - skipping polling")
         return {'checked': 0, 'verified': 0, 'invalid_deleted': 0}
     
-    # ✅ Get only pending verifications
+    # Get pending verifications (24+ hours old to avoid double spend)
     pending_verifications = get_pending_verifications()
     
     if not pending_verifications:
-        logger.info("ℹ️ No pending verifications to check")
+        logger.info("ℹ️ No pending verifications to re-check")
         return {'checked': 0, 'verified': 0, 'invalid_deleted': 0}
     
-    logger.info(f"🔍 Polling {len(pending_verifications)} pending verifications")
+    logger.info(f"🔍 Re-verifying {len(pending_verifications)} pending emails")
     
     results = {'checked': 0, 'verified': 0, 'invalid_deleted': 0, 'errors': 0}
     
@@ -343,41 +343,50 @@ def poll_verification_results() -> Dict[str, int]:
         instantly_lead_id = verification['instantly_lead_id']
         
         try:
-            # ✅ Endpoint sanity check: GET /api/v2/email-verification/{email}
-            response = call_instantly_api(f'/api/v2/email-verification/{email}', method='GET')
+            # Re-POST verification request (no GET endpoint available)
+            response = call_instantly_api('/api/v2/email-verification', method='POST', data={"email": email})
             
             if not response:
-                logger.warning(f"⚠️ No response for verification check: {email}")
+                logger.warning(f"⚠️ No response for verification: {email}")
                 results['errors'] += 1
                 continue
             
-            status = response.get('verification_status')
+            status = response.get('verification_status', '')
+            credits_used = response.get('credits_used', 0.25)
             results['checked'] += 1
             
+            # Handle empty string as 'unknown'
+            if not status or status.strip() == '':
+                status = 'unknown'
+            
+            # Update verification data
+            store_verification_job(
+                email=email,
+                instantly_lead_id=instantly_lead_id,
+                campaign_id=verification['campaign_id'],
+                verification_status=status,
+                credits_used=credits_used
+            )
+            
             if status == 'verified':
-                # Update to verified status
-                update_verification_status(email, 'verified', response)
                 results['verified'] += 1
-                logger.debug(f"✅ Verified: {email}")
+                logger.info(f"✅ Verified: {email}")
                 
-            elif status == 'invalid':
-                # ✅ Simple delete path
-                deletion_success = delete_invalid_lead(email, instantly_lead_id)
-                if deletion_success:
-                    update_verification_status(email, 'invalid_deleted', response)
-                    results['invalid_deleted'] += 1
-                    logger.info(f"🗑️ Deleted invalid lead: {email}")
+            elif status in ['invalid', 'risky']:
+                # Delete invalid/risky leads
+                DELETE_RISKY = os.getenv("DELETE_RISKY", "false").lower() == "true"
+                if status == 'invalid' or (status == 'risky' and DELETE_RISKY):
+                    deletion_success = delete_invalid_lead(email, instantly_lead_id)
+                    if deletion_success:
+                        update_verification_status(email, f'{status}_deleted', response)
+                        results['invalid_deleted'] += 1
+                        logger.info(f"🗑️ Deleted {status} lead: {email}")
+                    else:
+                        results['errors'] += 1
                 else:
-                    results['errors'] += 1
+                    logger.info(f"⚠️ Lead is risky but kept (DELETE_RISKY=false): {email}")
             
-            elif status == 'pending':
-                # Still pending - leave for next poll
-                logger.debug(f"⏳ Still pending: {email}")
-            
-            else:
-                logger.debug(f"❓ Unknown status '{status}' for {email}")
-            
-            # ✅ Simple rate limiting
+            # Rate limiting
             time.sleep(0.5)
             
         except Exception as e:
@@ -388,19 +397,19 @@ def poll_verification_results() -> Dict[str, int]:
     return results
 
 def get_pending_verifications() -> List[Dict]:
-    """✅ Get only 'pending' verifications (not already deleted)"""
+    """Get pending verifications older than 24 hours to avoid double spend"""
     if not bq_client:
         return []
     
     try:
         query = """
-        SELECT email, instantly_lead_id, campaign_id, updated_at
+        SELECT email, instantly_lead_id, campaign_id, verification_triggered_at
         FROM `{}.{}.ops_inst_state`
-        WHERE verification_status = 'pending'
+        WHERE verification_status IN ('pending', 'unknown')
           AND status != 'deleted'
           AND instantly_lead_id IS NOT NULL
-          AND updated_at > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
-        ORDER BY updated_at ASC
+          AND verification_triggered_at <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+        ORDER BY verification_triggered_at ASC
         LIMIT 100
         """.format(PROJECT_ID, DATASET_ID)
         
@@ -412,7 +421,7 @@ def get_pending_verifications() -> List[Dict]:
                 'email': row.email,
                 'instantly_lead_id': row.instantly_lead_id,
                 'campaign_id': row.campaign_id,
-                'updated_at': row.updated_at
+                'verification_triggered_at': row.verification_triggered_at
             })
         
         return pending_verifications
