@@ -55,9 +55,12 @@ def call_instantly_api(endpoint: str, method: str = 'GET', data: Optional[Dict] 
     
     url = f"https://api.instantly.ai{endpoint}"
     headers = {
-        'Authorization': f"Bearer {api_key}",
-        'Content-Type': 'application/json'
+        'Authorization': f"Bearer {api_key}"
     }
+    
+    # Only add Content-Type for requests with body data
+    if method in ['POST', 'PUT', 'PATCH'] and data is not None:
+        headers['Content-Type'] = 'application/json'
     
     if DRY_RUN:
         logger.info(f"DRY RUN: Would call {method} {url}")
