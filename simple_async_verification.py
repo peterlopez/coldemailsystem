@@ -162,14 +162,20 @@ def trigger_verification_for_new_leads(lead_data: List[Dict], campaign_id: str) 
                     successful_triggers += 1
                     logger.debug(f"✅ Verification completed: {lead['email']} -> {verification_status}")
                     
-                    # ✅ If email is invalid, trigger deletion immediately
-                    if verification_status in ['invalid', 'risky']:
+                    # ✅ Conservative deletion: only invalid by default, risky only if flag set
+                    DELETE_RISKY = os.getenv("DELETE_RISKY", "false").lower() == "true"
+                    should_delete = (verification_status == "invalid" or 
+                                   (DELETE_RISKY and verification_status == "risky"))
+                    
+                    if should_delete:
                         logger.info(f"🗑️ Email {lead['email']} is {verification_status}, triggering deletion")
                         deletion_success = delete_invalid_lead(lead['email'], lead['instantly_lead_id'])
                         if deletion_success:
                             # Update status to show it was deleted
                             update_verification_status(lead['email'], 'invalid_deleted', response)
                             logger.info(f"✅ Deleted and DNC'd invalid email: {lead['email']}")
+                    elif verification_status == "risky":
+                        logger.info(f"⚠️ Email {lead['email']} is risky - kept in campaign (set DELETE_RISKY=true to delete risky emails)")
                 else:
                     logger.warning(f"⚠️ Verification failed: {lead['email']}")
                 
@@ -193,10 +199,10 @@ def should_skip_verification(email: str) -> bool:
     
     try:
         query = """
-        SELECT verification_status, updated_at
+        SELECT verification_status, verification_triggered_at, verified_at
         FROM `{}.{}.ops_inst_state`
         WHERE email = @email
-        ORDER BY updated_at DESC
+        ORDER BY COALESCE(verification_triggered_at, verified_at, updated_at) DESC
         LIMIT 1
         """.format(PROJECT_ID, DATASET_ID)
         
@@ -213,14 +219,20 @@ def should_skip_verification(email: str) -> bool:
         
         row = results[0]
         
-        # ✅ Skip if already terminal state
+        # ✅ Skip if already in finished states (avoid double charges)
         if row.verification_status in ['verified', 'invalid', 'invalid_deleted']:
             return True
         
-        # ✅ Skip if verification was attempted within 24 hours
-        # Only skip if there was an actual verification attempt (not just lead creation)
-        if row.verification_status and row.updated_at:
-            hours_ago = (datetime.now(timezone.utc) - row.updated_at).total_seconds() / 3600
+        # ✅ Skip if verification was triggered within 24 hours (avoid double charges)
+        if row.verification_triggered_at:
+            hours_ago = (datetime.now(timezone.utc) - row.verification_triggered_at).total_seconds() / 3600
+            if hours_ago < 24:
+                return True
+        
+        # ✅ Fallback: Skip if any verification activity within 24 hours
+        most_recent_activity = row.verification_triggered_at or row.verified_at
+        if most_recent_activity:
+            hours_ago = (datetime.now(timezone.utc) - most_recent_activity).total_seconds() / 3600
             if hours_ago < 24:
                 return True
         
@@ -239,7 +251,7 @@ def store_verification_job(email: str, instantly_lead_id: str, campaign_id: str,
     try:
         now = datetime.now(timezone.utc)
         
-        # Update or insert verification data (using existing schema)
+        # Update or insert verification data with proper timestamp tracking
         query = """
         MERGE `{}.{}.ops_inst_state` AS target
         USING (
@@ -250,12 +262,14 @@ def store_verification_job(email: str, instantly_lead_id: str, campaign_id: str,
             UPDATE SET
                 verification_status = @verification_status,
                 verification_credits_used = @credits_used,
+                verification_triggered_at = @triggered_at,
+                verified_at = @completed_at,
                 updated_at = @triggered_at
         WHEN NOT MATCHED THEN
             INSERT (email, instantly_lead_id, campaign_id, status, verification_status, 
-                   verification_credits_used, added_at, updated_at)
+                   verification_credits_used, verification_triggered_at, verified_at, added_at, updated_at)
             VALUES (@email, @instantly_lead_id, @campaign_id, 'active', @verification_status,
-                   @credits_used, @triggered_at, @triggered_at)
+                   @credits_used, @triggered_at, @completed_at, @triggered_at, @triggered_at)
         """.format(PROJECT_ID, DATASET_ID)
         
         job_config = bigquery.QueryJobConfig(
@@ -265,6 +279,7 @@ def store_verification_job(email: str, instantly_lead_id: str, campaign_id: str,
                 bigquery.ScalarQueryParameter("campaign_id", "STRING", campaign_id),
                 bigquery.ScalarQueryParameter("verification_status", "STRING", verification_status),
                 bigquery.ScalarQueryParameter("triggered_at", "TIMESTAMP", now),
+                bigquery.ScalarQueryParameter("completed_at", "TIMESTAMP", now),  # Same time for immediate results
                 bigquery.ScalarQueryParameter("credits_used", "FLOAT64", credits_used)
             ]
         )
