@@ -429,7 +429,14 @@ def poll_verification_results() -> Dict[str, int]:
     """
     if DRY_RUN:
         logger.info("🔄 DRY RUN: Would poll verification results and process deletions")
-        return {'deletes_processed': 0, 'verifications_checked': 0, 'errors': 0}
+        return {
+            'deletes_processed': 0, 
+            'verifications_checked': 0, 
+            'errors': 0,
+            'checked': 0,
+            'verified': 0,
+            'invalid_deleted': 0
+        }
     
     # Check for API key availability
     api_key = os.getenv('INSTANTLY_API_KEY')
@@ -442,7 +449,14 @@ def poll_verification_results() -> Dict[str, int]:
     
     if not api_key or not bq_client:
         logger.info("📴 API key or BigQuery not available - skipping polling")
-        return {'deletes_processed': 0, 'verifications_checked': 0, 'errors': 0}
+        return {
+            'deletes_processed': 0, 
+            'verifications_checked': 0, 
+            'errors': 0,
+            'checked': 0,
+            'verified': 0,
+            'invalid_deleted': 0
+        }
     
     results = {'deletes_processed': 0, 'verifications_checked': 0, 'errors': 0}
     
@@ -455,6 +469,11 @@ def poll_verification_results() -> Dict[str, int]:
     deletion_results = process_deletion_queue()
     results['deletes_processed'] = deletion_results.get('processed', 0)
     results['errors'] += deletion_results.get('errors', 0)
+    
+    # Add backward compatibility keys for the workflow
+    results['checked'] = results['verifications_checked']
+    results['verified'] = results['verifications_checked']
+    results['invalid_deleted'] = results['deletes_processed']
     
     logger.info(f"📊 Polling complete: verifications={results['verifications_checked']}, deletions={results['deletes_processed']}, errors={results['errors']}")
     return results
