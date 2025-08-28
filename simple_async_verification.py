@@ -154,6 +154,10 @@ def trigger_verification_for_new_leads(lead_data: List[Dict], campaign_id: str) 
                     verification_status = response.get('verification_status', 'pending')
                     credits_used = response.get('credits_used', 0.25)
                     
+                    # ✅ Handle empty string responses (treat as pending)
+                    if not verification_status or verification_status.strip() == '':
+                        verification_status = 'pending'
+                    
                     logger.info(f"🔍 DEBUG: Storing verification - Email: {lead['email']}, Status: {verification_status}, Credits: {credits_used}")
                     
                     store_verification_job(
