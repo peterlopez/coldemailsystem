@@ -208,7 +208,12 @@ jobs:
             exit $exit_code
           }
           
-          echo "✅ Lead creation complete (no sync verification; async verifier disabled)" | tee -a workflow.log
+          # Dynamic footer message based on actual verification system status
+          if python3 -c "from simple_async_verification import trigger_verification_for_new_leads; print('simple async available')" 2>/dev/null; then
+            echo "✅ Lead creation complete (simple async verification system active)" | tee -a workflow.log
+          else
+            echo "✅ Lead creation complete (async verification system not available)" | tee -a workflow.log
+          fi
       
       - name: Send logs to external service
         if: always()
