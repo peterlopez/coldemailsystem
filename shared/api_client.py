@@ -136,9 +136,9 @@ def get_finished_leads() -> List[InstantlyLead]:
         
         while True:
             try:
-                # Get ALL leads from this campaign to analyze their status
+                # CORRECTED: Can't filter by campaign in API - get all leads and filter client-side
+                # The 'campaign_id' filter doesn't work in V2 API
                 data = {
-                    'campaign_id': campaign_id,
                     'page': page,
                     'per_page': 100
                 }
@@ -153,6 +153,11 @@ def get_finished_leads() -> List[InstantlyLead]:
                 
                 # Analyze each lead to see if it should be drained
                 for item in leads_on_page:
+                    # CORRECTED: Filter by campaign field (not campaign_id) - client-side filtering
+                    lead_campaign = item.get('campaign')
+                    if lead_campaign != campaign_id:
+                        continue  # Skip leads not in this campaign
+                    
                     lead = InstantlyLead(
                         id=item.get('id'),
                         email=item.get('email'),

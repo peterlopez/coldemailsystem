@@ -1597,8 +1597,9 @@ def move_lead_to_campaign(lead: Lead, campaign_id: str) -> Optional[str]:
             return existing_lead_id
         
         # Move lead to new campaign using the move endpoint
+        # CORRECTED: Use 'campaign' field, not 'campaign_id' (V2 API pattern)
         move_data = {
-            'campaign_id': campaign_id
+            'campaign': campaign_id
         }
         
         move_response = call_instantly_api(f'/api/v2/leads/{existing_lead_id}/move', 'POST', move_data)

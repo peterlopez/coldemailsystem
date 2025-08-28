@@ -40,9 +40,8 @@ def get_all_instantly_leads():
         
         while True:
             try:
-                # Get ALL leads, not just active
+                # CORRECTED: Can't filter by campaign in API - get all leads and filter client-side
                 data = {
-                    'campaign_id': campaign_id,
                     'page': page,
                     'per_page': 100
                 }
@@ -54,6 +53,11 @@ def get_all_instantly_leads():
                 
                 items = response.get('items', [])
                 for item in items:
+                    # CORRECTED: Filter by campaign field (not campaign_id) - client-side filtering
+                    lead_campaign = item.get('campaign')
+                    if lead_campaign != campaign_id:
+                        continue  # Skip leads not in this campaign
+                    
                     lead_data = {
                         'email': item.get('email'),
                         'campaign_id': campaign_id,
