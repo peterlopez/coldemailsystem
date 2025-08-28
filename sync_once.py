@@ -1508,15 +1508,15 @@ def move_lead_to_campaign(lead: Lead, campaign_id: str) -> Optional[str]:
             logger.warning(f"⚠️ Could not find existing lead {lead.email} - treating as new lead")
             return None
         
-        # Extract lead info from search results
-        leads_data = search_response.get('data', [])
+        # Extract lead info from search results - CORRECTED API response structure
+        leads_data = search_response.get('items', [])  # ✅ V2 API uses 'items' not 'data'
         if not leads_data:
             logger.warning(f"⚠️ No lead data found for {lead.email} - treating as new lead")
             return None
         
         existing_lead = leads_data[0]  # Take the first match
         existing_lead_id = existing_lead.get('id')
-        current_campaign_id = existing_lead.get('campaign_id')
+        current_campaign_id = existing_lead.get('campaign')  # ✅ CORRECTED: 'campaign' not 'campaign_id'
         
         if not existing_lead_id:
             logger.error(f"❌ Could not get lead ID for existing lead {lead.email}")
@@ -1536,7 +1536,7 @@ def move_lead_to_campaign(lead: Lead, campaign_id: str) -> Optional[str]:
         move_response = call_instantly_api(f'/api/v2/leads/{existing_lead_id}/move', 'POST', move_data)
         
         if move_response and 'error' not in move_response:
-            logger.info(f"✅ Successfully moved lead {lead.email} from campaign {current_campaign_id} to {campaign_id}")
+            logger.info(f"✅ Lead {lead.email} moved from campaign {current_campaign_id} to {campaign_id}")
             return existing_lead_id
         else:
             logger.error(f"❌ Failed to move lead {lead.email}: {move_response}")
