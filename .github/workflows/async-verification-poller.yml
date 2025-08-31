@@ -7,11 +7,10 @@ concurrency:
 
 on:
   schedule:
-    # Run every 5 minutes during business hours (9 AM - 6 PM EST, Mon-Fri)
-    - cron: '*/5 9-18 * * 1-5'
-    # Run every 30 minutes during weekends and off-hours
-    - cron: '*/30 * * * 0,6'
-    - cron: '*/30 0-8,19-23 * * 1-5'
+    # Run 10 minutes after cold email sync during extended business hours (3 AM - 9 PM EST, Mon-Fri)
+    - cron: '10 7-23,0-1 * * 1-5'  # UTC times for EST business hours (3:10am-9:10pm EST = 7:10am-1:10am UTC)
+    # Run 10 minutes after cold email sync on weekends (every 2 hours)
+    - cron: '10 */2 * * 0,6'  # Weekends at :10 past every 2 hours
   
   workflow_dispatch:
     inputs:
@@ -96,12 +95,15 @@ jobs:
           INSTANTLY_API_KEY: ${{ secrets.INSTANTLY_API_KEY }}
           DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
           MAX_LEADS: ${{ inputs.max_leads || '500' }}
+          # Notification settings
+          SLACK_NOTIFICATION_CHANNEL: ${{ secrets.SLACK_NOTIFICATION_CHANNEL }}
+          SLACK_NOTIFICATIONS_ENABLED: ${{ secrets.SLACK_NOTIFICATIONS_ENABLED }}
         run: |
           echo "🔍 Polling async verification results..."
           echo "Max leads to check: $MAX_LEADS"
           echo "Dry run: $DRY_RUN"
           
-          # Run the verification polling
+          # Run the verification polling with notifications
           python3 -c "
           import os
           import sys
@@ -114,17 +116,24 @@ jobs:
           )
           
           sys.path.insert(0, '.')
-          from simple_async_verification import poll_verification_results
+          from simple_async_verification import poll_verification_results_with_notification
           
-          # Poll verification results
+          # Poll verification results with notification
           print('🔍 Starting verification polling...')
-          results = poll_verification_results()
+          results = poll_verification_results_with_notification()
           
           print('📊 Polling Results:')
           print(f'  Leads checked: {results.get(\"checked\", 0)}')
           print(f'  Verified: {results.get(\"verified\", 0)}')
           print(f'  Invalid/deleted: {results.get(\"invalid_deleted\", 0)}')
           print(f'  Errors: {results.get(\"errors\", 0)}')
+          
+          # Show detailed status breakdown if available
+          status_breakdown = results.get('status_breakdown', {})
+          if status_breakdown:
+              print('\\n📊 Status Breakdown:')
+              for status, count in status_breakdown.items():
+                  print(f'  {status}: {count}')
           
           if results.get('errors', 0) > 0:
               print('⚠️ Some errors occurred during polling')

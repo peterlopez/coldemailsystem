@@ -31,6 +31,15 @@ from shared_config import InstantlyConfig, PROJECT_ID, DATASET_ID, DRY_RUN
 
 logger = logging.getLogger(__name__)
 
+# Import notification system
+try:
+    from cold_email_notifier import notifier
+    NOTIFICATIONS_AVAILABLE = True
+    logger.info("📡 Notification system loaded for verification polling")
+except ImportError:
+    NOTIFICATIONS_AVAILABLE = False
+    logger.info("📴 Notification system not available for verification polling")
+
 def is_uuid4(s: str) -> bool:
     """Check if string is a valid UUID v4"""
     try:
@@ -435,7 +444,9 @@ def poll_verification_results() -> Dict[str, int]:
             'errors': 0,
             'checked': 0,
             'verified': 0,
-            'invalid_deleted': 0
+            'invalid_deleted': 0,
+            'status_breakdown': {},
+            'deletion_breakdown': {}
         }
     
     # Check for API key availability
@@ -455,7 +466,9 @@ def poll_verification_results() -> Dict[str, int]:
             'errors': 0,
             'checked': 0,
             'verified': 0,
-            'invalid_deleted': 0
+            'invalid_deleted': 0,
+            'status_breakdown': {},
+            'deletion_breakdown': {}
         }
     
     results = {'deletes_processed': 0, 'verifications_checked': 0, 'errors': 0}
@@ -464,11 +477,14 @@ def poll_verification_results() -> Dict[str, int]:
     verification_results = process_stale_verifications()
     results['verifications_checked'] = verification_results.get('checked', 0)
     results['errors'] += verification_results.get('errors', 0)
+    results['status_breakdown'] = verification_results.get('status_breakdown', {})
+    results['queued_for_deletion'] = verification_results.get('queued_for_deletion', 0)
     
     # Then process deletion queue with circuit breaker
     deletion_results = process_deletion_queue()
     results['deletes_processed'] = deletion_results.get('processed', 0)
     results['errors'] += deletion_results.get('errors', 0)
+    results['deletion_breakdown'] = deletion_results.get('campaign_breakdown', {})
     
     # Add backward compatibility keys for the workflow
     results['checked'] = results['verifications_checked']
@@ -481,12 +497,12 @@ def poll_verification_results() -> Dict[str, int]:
 def process_deletion_queue() -> Dict[str, int]:
     """Process queued deletions with UUID validation, capping, and circuit breaker"""
     if not bq_client:
-        return {'processed': 0, 'errors': 0}
+        return {'processed': 0, 'errors': 0, 'campaign_breakdown': {}}
     
     try:
-        # Get up to 30 queued deletions (capped to prevent starvation)
+        # Get up to 30 queued deletions with campaign info (capped to prevent starvation)
         query = """
-        SELECT email, instantly_lead_id, deletion_attempts
+        SELECT email, instantly_lead_id, deletion_attempts, campaign_id
         FROM `{}.{}.ops_inst_state`
         WHERE deletion_status = 'queued'
           AND deletion_attempts < 5
@@ -498,18 +514,23 @@ def process_deletion_queue() -> Dict[str, int]:
         
         if not results:
             logger.debug("ℹ️ No queued deletions to process")
-            return {'processed': 0, 'errors': 0}
+            return {'processed': 0, 'errors': 0, 'campaign_breakdown': {}}
         
         logger.info(f"🗑️ Processing {len(results)} queued deletions (capped at 30)")
         
         processed = 0
         errors = 0
         skipped_invalid_uuid = 0
+        campaign_breakdown = {
+            '8c46e0c9-c1f9-4201-a8d6-6221bafeada6': {'name': 'SMB', 'count': 0},
+            '5ffbe8c3-dc0e-41e4-9999-48f00d2015df': {'name': 'Midsize', 'count': 0}
+        }
         
         for row in results:
             email = row.email
             instantly_lead_id = row.instantly_lead_id
             attempts = row.deletion_attempts
+            campaign_id = row.campaign_id
             
             # UUID validation - skip invalid UUIDs
             if not is_uuid4(instantly_lead_id):
@@ -548,6 +569,10 @@ def process_deletion_queue() -> Dict[str, int]:
                     add_to_dnc_list(email, 'invalid_verification')
                     logger.info(f"✅ Successfully deleted: {email}")
                     processed += 1
+                    
+                    # Track campaign breakdown
+                    if campaign_id in campaign_breakdown:
+                        campaign_breakdown[campaign_id]['count'] += 1
                 else:
                     # Extract error details and increment attempts
                     error_message = response.get('text', str(response))[:1000]
@@ -577,16 +602,19 @@ def process_deletion_queue() -> Dict[str, int]:
         if skipped_invalid_uuid > 0:
             logger.info(f"⚠️ Skipped {skipped_invalid_uuid} deletions due to invalid UUIDs")
         
-        return {'processed': processed, 'errors': errors}
+        # Clean up campaign breakdown to only include campaigns with deletions
+        campaign_breakdown = {k: v for k, v in campaign_breakdown.items() if v['count'] > 0}
+        
+        return {'processed': processed, 'errors': errors, 'campaign_breakdown': campaign_breakdown}
         
     except Exception as e:
         logger.error(f"❌ Error processing deletion queue: {e}")
-        return {'processed': 0, 'errors': 1}
+        return {'processed': 0, 'errors': 1, 'campaign_breakdown': {}}
 
 def process_stale_verifications() -> Dict[str, int]:
     """Re-verify stale pending emails with attempt limits"""
     if not bq_client:
-        return {'checked': 0, 'errors': 0}
+        return {'checked': 0, 'errors': 0, 'status_breakdown': {}, 'queued_for_deletion': 0}
     
     try:
         # Get up to 100 stale pending verifications
@@ -604,12 +632,21 @@ def process_stale_verifications() -> Dict[str, int]:
         
         if not results:
             logger.debug("ℹ️ No stale verifications to process")
-            return {'checked': 0, 'errors': 0}
+            return {'checked': 0, 'errors': 0, 'status_breakdown': {}, 'queued_for_deletion': 0}
         
         logger.info(f"🔍 Re-verifying {len(results)} stale pending emails")
         
         checked = 0
         errors = 0
+        queued_for_deletion = 0
+        status_breakdown = {
+            'valid': 0,
+            'invalid': 0,
+            'risky': 0,
+            'pending': 0,
+            'no_result': 0,
+            'accept_all': 0
+        }
         
         for row in results:
             email = row.email
@@ -639,6 +676,12 @@ def process_stale_verifications() -> Dict[str, int]:
                     else:
                         status = 'pending'  # Keep as pending for retry
                 
+                # Track status in breakdown
+                if status in status_breakdown:
+                    status_breakdown[status] += 1
+                else:
+                    status_breakdown[status] = 1
+                
                 # Store verification result and increment attempts
                 store_verification_with_attempts(
                     email=email,
@@ -654,6 +697,7 @@ def process_stale_verifications() -> Dict[str, int]:
                     DELETE_RISKY = os.getenv("DELETE_RISKY", "false").lower() == "true"
                     if status == 'invalid' or (status == 'risky' and DELETE_RISKY):
                         queue_for_deletion(email, instantly_lead_id)
+                        queued_for_deletion += 1
                         logger.info(f"🗑️ Queued {status} email for deletion: {email}")
                 
                 checked += 1
@@ -665,11 +709,19 @@ def process_stale_verifications() -> Dict[str, int]:
             # Rate limiting
             time.sleep(0.5)
         
-        return {'checked': checked, 'errors': errors}
+        # Remove zero-count statuses from breakdown
+        status_breakdown = {k: v for k, v in status_breakdown.items() if v > 0}
+        
+        return {
+            'checked': checked, 
+            'errors': errors, 
+            'status_breakdown': status_breakdown,
+            'queued_for_deletion': queued_for_deletion
+        }
         
     except Exception as e:
         logger.error(f"❌ Error processing stale verifications: {e}")
-        return {'checked': 0, 'errors': 1}
+        return {'checked': 0, 'errors': 1, 'status_breakdown': {}, 'queued_for_deletion': 0}
 
 def mark_deletion_complete(email: str, instantly_lead_id: str):
     """Mark deletion as complete in BigQuery"""
@@ -1040,6 +1092,49 @@ def test_verification_endpoints() -> bool:
     except Exception as e:
         logger.error(f"❌ Endpoint test failed: {e}")
         return False
+
+def poll_verification_results_with_notification() -> Dict[str, int]:
+    """
+    Wrapper function that polls verification results and sends notification
+    Used by GitHub Actions workflow
+    """
+    start_time = time.time()
+    
+    # Poll verification results
+    results = poll_verification_results()
+    
+    # Calculate duration
+    end_time = time.time()
+    duration = end_time - start_time
+    
+    # Prepare notification data
+    notification_data = {
+        'timestamp': datetime.utcnow().isoformat() + 'Z',
+        'duration_seconds': duration,
+        'verifications_checked': results.get('verifications_checked', 0),
+        'status_breakdown': results.get('status_breakdown', {}),
+        'queued_for_deletion': results.get('queued_for_deletion', 0),
+        'deletes_processed': results.get('deletes_processed', 0),
+        'deletion_breakdown': results.get('deletion_breakdown', {}),
+        'errors': results.get('errors', 0),
+        'github_run_url': f"{os.getenv('GITHUB_SERVER_URL', '')}/{os.getenv('GITHUB_REPOSITORY', '')}/actions/runs/{os.getenv('GITHUB_RUN_ID', '')}"
+    }
+    
+    # Send notification if available and there was activity
+    if NOTIFICATIONS_AVAILABLE and (results.get('verifications_checked', 0) > 0 or results.get('deletes_processed', 0) > 0):
+        try:
+            logger.info("📤 Sending verification polling notification...")
+            success = notifier.send_verification_polling_notification(notification_data)
+            if success:
+                logger.info("✅ Notification sent successfully")
+            else:
+                logger.warning("⚠️ Failed to send notification")
+        except Exception as e:
+            logger.warning(f"⚠️ Error sending notification: {e}")
+    elif results.get('verifications_checked', 0) == 0 and results.get('deletes_processed', 0) == 0:
+        logger.info("📴 No activity to report - skipping notification")
+    
+    return results
 
 if __name__ == "__main__":
     print("🧪 Simple Async Verification - Test Mode")

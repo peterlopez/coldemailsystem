@@ -205,6 +205,32 @@ class ColdEmailNotifier:
             logger.error(f"❌ Error sending drain notification: {e}")
             return False
     
+    def send_verification_polling_notification(self, polling_data: Dict[str, Any]) -> bool:
+        """Send Async Verification Polling completion notification"""
+        if not self.config.notifications_enabled:
+            logger.info("📴 Verification polling notifications disabled, skipping")
+            return True
+        
+        try:
+            # Format notification content
+            title = f"Async Verification Polling Complete - {self._format_timestamp(polling_data.get('timestamp', ''))}"
+            content = self._format_verification_polling_content(polling_data)
+            recipients = [self.config.slack_channel]
+            
+            # Send via Echo
+            success = self.echo_client.create_and_send_message(title, content, recipients)
+            
+            if success:
+                logger.info("✅ Verification polling notification sent successfully")
+            else:
+                logger.error("❌ Failed to send verification polling notification")
+                
+            return success
+            
+        except Exception as e:
+            logger.error(f"❌ Error sending verification polling notification: {e}")
+            return False
+    
     def _format_sync_content(self, data: Dict[str, Any]) -> str:
         """Format sync notification content for Slack"""
         try:
@@ -398,6 +424,96 @@ class ColdEmailNotifier:
                 return f"{hours}h {mins}m"
         except:
             return "N/A"
+    
+    def _format_verification_polling_content(self, data: Dict[str, Any]) -> str:
+        """Format verification polling notification content for Slack"""
+        try:
+            # Extract data with safe defaults
+            verifications = data.get('verifications_checked', 0)
+            status_breakdown = data.get('status_breakdown', {})
+            queued_for_deletion = data.get('queued_for_deletion', 0)
+            deletions = data.get('deletes_processed', 0)
+            deletion_breakdown = data.get('deletion_breakdown', {})
+            errors = data.get('errors', 0)
+            duration = data.get('duration_seconds', 0)
+            
+            # Calculate percentages for status breakdown
+            total_checked = verifications
+            status_lines = []
+            
+            # Order statuses for display
+            status_order = ['valid', 'invalid', 'pending', 'no_result', 'risky', 'accept_all']
+            status_emojis = {
+                'valid': '✅',
+                'invalid': '❌',
+                'pending': '⏳',
+                'no_result': '🤷',
+                'risky': '⚠️',
+                'accept_all': '📮'
+            }
+            
+            for status in status_order:
+                if status in status_breakdown and status_breakdown[status] > 0:
+                    count = status_breakdown[status]
+                    percentage = (count / max(total_checked, 1)) * 100
+                    emoji = status_emojis.get(status, '•')
+                    
+                    # Special formatting for invalid (since they're deleted)
+                    if status == 'invalid':
+                        status_lines.append(f"{emoji} Invalid: {count} ({percentage:.1f}%) → Deleted")
+                    else:
+                        status_lines.append(f"{emoji} {status.replace('_', ' ').title()}: {count} ({percentage:.1f}%)")
+            
+            # Build formatted message
+            content = f"""🔍 **Async Verification Polling Complete** | {self._format_timestamp(data.get('timestamp', ''))}
+
+📧 **Verification Results** ({verifications} checked)"""
+            
+            if status_lines:
+                for line in status_lines:
+                    content += f"\n• {line}"
+            else:
+                content += "\n• No verifications processed"
+            
+            # Add deletion section if any deletions occurred
+            if deletions > 0:
+                content += f"""
+
+🗑️ **Deletion Activity**
+• Successfully deleted: {deletions}/{queued_for_deletion} ({(deletions/max(queued_for_deletion, 1)*100):.0f}%)
+• Added to DNC: {deletions} emails"""
+                
+                # Add campaign breakdown if available
+                if deletion_breakdown:
+                    content += "\n• Campaign impact:"
+                    for campaign_id, details in deletion_breakdown.items():
+                        campaign_name = details.get('name', 'Unknown')
+                        count = details.get('count', 0)
+                        content += f"\n  - {campaign_name}: {count} removed"
+            
+            # Performance section
+            if duration > 0:
+                processing_rate = (verifications / duration * 60) if verifications > 0 else 0
+                content += f"""
+
+⚡ **Performance**
+• Duration: {self._format_duration(duration)}
+• Processing rate: {processing_rate:.1f} emails/min"""
+            
+            # Add error section if any
+            if errors > 0:
+                content += f"\n\n⚠️ **Issues**: {errors} errors occurred"
+            
+            # Add GitHub link if available
+            github_url = data.get('github_run_url')
+            if github_url:
+                content += f"\n\n🔗 [View Logs]({github_url})"
+            
+            return content
+            
+        except Exception as e:
+            logger.error(f"Error formatting verification polling content: {e}")
+            return f"🔍 Async Verification Polling Complete - Error formatting details: {str(e)}"
 
 # Initialize global notifier instance
 notifier = ColdEmailNotifier()
