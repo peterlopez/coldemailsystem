@@ -664,8 +664,32 @@ def process_stale_verifications() -> Dict[str, int]:
                 
                 # Extract from JSON response if available
                 response_data = response.get('json', response) if isinstance(response, dict) and 'json' in response else response
-                status = response_data.get('verification_status', '') if response_data else ''
+                raw_status = response_data.get('verification_status', '') if response_data else ''
                 credits_used = response_data.get('credits_used', 0.25) if response_data else 0.25
+                
+                # Map API status to our internal status terms
+                status_mapping = {
+                    'verified': 'valid',    # Instantly API returns 'verified' for good emails
+                    'valid': 'valid',       # Keep existing mapping
+                    'invalid': 'invalid',   # Direct mapping
+                    'risky': 'risky',       # Direct mapping
+                    'pending': 'pending',   # Direct mapping
+                    'accept_all': 'accept_all',  # Direct mapping
+                }
+                
+                status = status_mapping.get(raw_status, raw_status) if raw_status else ''
+                
+                # Log the status mapping for debugging
+                if raw_status and raw_status != status:
+                    logger.info(f"🔄 Status mapped: {email} {raw_status} → {status}")
+                elif raw_status:
+                    logger.debug(f"✅ Status verified: {email} → {status}")
+                
+                # Validate status against expected values
+                expected_statuses = {'valid', 'invalid', 'risky', 'pending', 'accept_all', 'no_result'}
+                if status and status not in expected_statuses:
+                    logger.warning(f"⚠️ Unexpected status for {email}: '{status}' (raw: '{raw_status}')")
+                    # Keep the status but log it for investigation
                 
                 # Handle empty string results
                 if not status or status.strip() == '':
@@ -711,6 +735,10 @@ def process_stale_verifications() -> Dict[str, int]:
         
         # Remove zero-count statuses from breakdown
         status_breakdown = {k: v for k, v in status_breakdown.items() if v > 0}
+        
+        # Log final status breakdown for debugging
+        if status_breakdown:
+            logger.info(f"📊 Final status breakdown: {', '.join([f'{k}:{v}' for k, v in status_breakdown.items()])}")
         
         return {
             'checked': checked, 
@@ -1113,8 +1141,8 @@ def poll_verification_results_with_notification() -> Dict[str, int]:
         'duration_seconds': duration,
         'verifications_checked': results.get('verifications_checked', 0),
         'status_breakdown': results.get('status_breakdown', {}),
-        'queued_for_deletion': results.get('queued_for_deletion', 0),
-        'deletes_processed': results.get('deletes_processed', 0),
+        'queued_for_deletion': results.get('queued_for_deletion', 0),  # New items queued this run
+        'deletes_processed': results.get('deletes_processed', 0),      # Total items deleted (includes old queue)
         'deletion_breakdown': results.get('deletion_breakdown', {}),
         'errors': results.get('errors', 0),
         'github_run_url': f"{os.getenv('GITHUB_SERVER_URL', '')}/{os.getenv('GITHUB_REPOSITORY', '')}/actions/runs/{os.getenv('GITHUB_RUN_ID', '')}"

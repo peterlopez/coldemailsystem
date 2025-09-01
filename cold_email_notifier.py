@@ -487,12 +487,23 @@ class ColdEmailNotifier:
                 content += "\n• No verifications processed"
             
             # Add deletion section if any deletions occurred
-            if deletions > 0:
+            if deletions > 0 or queued_for_deletion > 0:
                 content += f"""
 
-🗑️ **Deletion Activity**
-• Successfully deleted: {deletions}/{queued_for_deletion} ({(deletions/max(queued_for_deletion, 1)*100):.0f}%)
-• Added to DNC: {deletions} emails"""
+🗑️ **Deletion Activity**"""
+                
+                if queued_for_deletion > 0:
+                    content += f"\n• Queued for deletion this run: {queued_for_deletion} emails"
+                
+                if deletions > 0:
+                    content += f"\n• Total processed from queue: {deletions} emails"
+                    content += f"\n• Added to DNC: {deletions} emails"
+                    
+                    # Show relationship between queued and deleted if both exist
+                    if queued_for_deletion > 0 and deletions != queued_for_deletion:
+                        old_queue = deletions - queued_for_deletion
+                        if old_queue > 0:
+                            content += f"\n• Processed {queued_for_deletion} new + {old_queue} from previous runs"
                 
                 # Add campaign breakdown if available
                 if deletion_breakdown:
