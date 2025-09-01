@@ -441,8 +441,9 @@ class ColdEmailNotifier:
             total_checked = verifications
             status_lines = []
             
-            # Order statuses for display
-            status_order = ['valid', 'invalid', 'pending', 'no_result', 'risky', 'accept_all']
+            # Order statuses for display - prioritize valid, invalid, pending
+            priority_statuses = ['valid', 'invalid', 'pending']
+            other_statuses = ['no_result', 'risky', 'accept_all']
             status_emojis = {
                 'valid': '✅',
                 'invalid': '❌',
@@ -452,17 +453,27 @@ class ColdEmailNotifier:
                 'accept_all': '📮'
             }
             
-            for status in status_order:
+            # Always show valid, invalid, and pending (even if 0)
+            for status in priority_statuses:
+                count = status_breakdown.get(status, 0)
+                percentage = (count / max(total_checked, 1)) * 100 if total_checked > 0 else 0
+                emoji = status_emojis.get(status, '•')
+                
+                # Special formatting based on status
+                if status == 'valid':
+                    status_lines.append(f"{emoji} Valid: {count} ({percentage:.1f}%) → Kept active")
+                elif status == 'invalid':
+                    status_lines.append(f"{emoji} Invalid: {count} ({percentage:.1f}%) → Deleted")
+                elif status == 'pending':
+                    status_lines.append(f"{emoji} Pending: {count} ({percentage:.1f}%) → Awaiting results")
+            
+            # Show other statuses only if they have counts > 0
+            for status in other_statuses:
                 if status in status_breakdown and status_breakdown[status] > 0:
                     count = status_breakdown[status]
                     percentage = (count / max(total_checked, 1)) * 100
                     emoji = status_emojis.get(status, '•')
-                    
-                    # Special formatting for invalid (since they're deleted)
-                    if status == 'invalid':
-                        status_lines.append(f"{emoji} Invalid: {count} ({percentage:.1f}%) → Deleted")
-                    else:
-                        status_lines.append(f"{emoji} {status.replace('_', ' ').title()}: {count} ({percentage:.1f}%)")
+                    status_lines.append(f"{emoji} {status.replace('_', ' ').title()}: {count} ({percentage:.1f}%)")
             
             # Build formatted message
             content = f"""🔍 **Async Verification Polling Complete** | {self._format_timestamp(data.get('timestamp', ''))}
