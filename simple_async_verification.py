@@ -664,8 +664,11 @@ def process_stale_verifications() -> Dict[str, int]:
                 
                 # Extract from JSON response if available
                 response_data = response.get('json', response) if isinstance(response, dict) and 'json' in response else response
-                status = response_data.get('verification_status', '') if response_data else ''
+                raw_status = response_data.get('verification_status', '') if response_data else ''
                 credits_used = response_data.get('credits_used', 0.25) if response_data else 0.25
+                
+                # Map API status to internal status (Instantly API returns 'verified' but we expect 'valid')
+                status = 'valid' if raw_status == 'verified' else raw_status
                 
                 # Handle empty string results
                 if not status or status.strip() == '':
