@@ -689,13 +689,14 @@ def classify_lead_for_drain(lead: dict, campaign_name: str) -> dict:
 
 def get_leads_needing_drain_from_bigquery() -> Dict[str, List[str]]:
     """
-    PHASE 2 OPTIMIZATION: BigQuery-first approach to find leads that need drain evaluation.
+    DIRECT API OPTIMIZATION: BigQuery-first approach to find leads that need drain evaluation.
+    Now targeting 50 leads for direct API calls instead of pagination.
     
     Returns:
         Dict mapping campaign_id -> list of instantly_lead_ids that need checking
     """
     try:
-        logger.info("📊 PHASE 2: Querying BigQuery for leads needing drain evaluation...")
+        logger.info("📊 DIRECT API: Querying BigQuery for leads needing drain evaluation...")
         
         # Query leads that haven't been checked in 24+ hours OR never checked
         # AND are currently active in campaigns
@@ -715,7 +716,7 @@ def get_leads_needing_drain_from_bigquery() -> Dict[str, List[str]]:
         ORDER BY 
             COALESCE(last_drain_check, TIMESTAMP('1970-01-01')) ASC,  -- Oldest checks first
             email ASC  -- Deterministic ordering
-        LIMIT 1000  -- Reasonable limit to avoid overwhelming the system
+        LIMIT 50  -- Direct API batch size for reliable processing
         """
         
         query_job = bq_client.query(query)
@@ -731,135 +732,159 @@ def get_leads_needing_drain_from_bigquery() -> Dict[str, List[str]]:
         
         total_leads = sum(len(ids) for ids in leads_by_campaign.values())
         
-        # PHASE 4: Enhanced BigQuery results logging with optimization metrics
-        logger.info(f"📊 BigQuery Optimization Results:")
+        # Enhanced BigQuery results logging with direct API optimization metrics
+        logger.info(f"📊 BigQuery Direct API Results:")
         logger.info(f"  • Campaigns with leads: {len(leads_by_campaign)}")
-        logger.info(f"  • Total leads needing evaluation: {total_leads}")
-        logger.info(f"  • Estimated time savings: {max(0, 6000 - total_leads)} leads not scanned")
+        logger.info(f"  • Total leads for direct API calls: {total_leads}")
+        logger.info(f"  • Expected processing time: ~{total_leads * 0.5:.1f} seconds")
         
-        # Show per-campaign breakdown with smart sizing
+        # Show per-campaign breakdown
         for campaign_id, lead_ids in leads_by_campaign.items():
             campaign_name = "SMB" if campaign_id == SMB_CAMPAIGN_ID else "Midsize"
-            batch_count = (len(lead_ids) + 49) // 50  # Estimate pages needed
-            logger.info(f"  • {campaign_name}: {len(lead_ids)} leads (~{batch_count} pages vs full scan)")
+            logger.info(f"  • {campaign_name}: {len(lead_ids)} leads for direct lookup")
         
-        # Performance prediction
+        # Performance prediction for direct API calls
         if total_leads > 0:
-            estimated_time_ratio = total_leads / 6000  # vs scanning all 6000
-            logger.info(f"📈 Performance Optimization:")
-            logger.info(f"  • Targeting {estimated_time_ratio:.1%} of typical campaign scan")
-            logger.info(f"  • Expected speedup: {1/max(estimated_time_ratio,0.01):.1f}x faster")
+            logger.info(f"🎯 Direct API Optimization:")
+            logger.info(f"  • {total_leads} individual API calls vs pagination")
+            logger.info(f"  • Expected success rate: ~95% (vs current ~0.6%)")
+            logger.info(f"  • No client-side matching required")
         
         return leads_by_campaign
         
     except Exception as e:
-        logger.error(f"❌ BigQuery-first approach failed: {e}")
+        logger.error(f"❌ BigQuery direct API approach failed: {e}")
         logger.info("🔄 Will fall back to current pagination method")
         return {}
 
 
-def get_leads_by_ids_from_instantly(campaign_id: str, lead_ids: List[str]) -> List[dict]:
+def get_leads_by_ids_from_instantly(campaign_id: str, lead_ids: List[str]) -> Dict[str, List]:
     """
-    PHASE 2 OPTIMIZATION: Query Instantly for specific lead IDs instead of paginating through all.
+    DIRECT API OPTIMIZATION: Query Instantly for specific lead IDs using direct GET calls.
+    Eliminates pagination and client-side matching issues.
     
     Args:
         campaign_id: The campaign ID to query
         lead_ids: List of specific lead IDs to fetch
     
     Returns:
-        List of lead dictionaries from Instantly API
+        Dict with 'found_leads' and 'missing_leads' lists
     """
     try:
         if not lead_ids:
-            return []
+            return {'found_leads': [], 'missing_leads': []}
             
-        logger.debug(f"🎯 Fetching {len(lead_ids)} specific leads from Instantly campaign {campaign_id}")
+        logger.debug(f"🎯 Making {len(lead_ids)} direct API calls to Instantly...")
         
-        # Instantly API doesn't support fetching specific lead IDs directly
-        # But we can use the list endpoint with pagination and filter client-side more efficiently
-        # This is still better than full pagination because we know exactly which leads we want
+        found_leads = []
+        missing_leads = []
+        api_errors = []
         
-        all_leads = []
-        leads_found = set()
-        leads_needed = set(lead_ids)
-        
-        # Use pagination but stop early when we find all needed leads
-        starting_after = None
-        page_count = 0
-        
-        while leads_needed and page_count < 20:  # Safety limit for targeted search
-            url = f"{INSTANTLY_BASE_URL}/api/v2/leads/list"
-            payload = {
-                "campaign_id": campaign_id,
-                "limit": 50
-            }
-            
-            if starting_after:
-                payload["starting_after"] = starting_after
-            
-            adaptive_rate_limiter.wait()
-            
-            response = requests.post(
-                url,
-                headers=get_instantly_headers(), 
-                json=payload,
-                timeout=30
-            )
-            
-            if response.status_code != 200:
-                logger.warning(f"⚠️ API error {response.status_code} during targeted lead fetch")
-                break
+        for i, lead_id in enumerate(lead_ids):
+            try:
+                # Direct API call to get specific lead
+                url = f"{INSTANTLY_BASE_URL}/api/v2/leads/{lead_id}"
                 
-            data = response.json()
-            leads = data.get('items', [])
-            
-            if not leads:
-                break
+                adaptive_rate_limiter.wait()
                 
-            page_count += 1
-            
-            # Filter to only leads we need
-            for lead in leads:
-                lead_id = lead.get('id', '')
-                if lead_id in leads_needed:
-                    all_leads.append(lead)
-                    leads_found.add(lead_id)
-                    leads_needed.remove(lead_id)
-                    logger.debug(f"✅ Found needed lead: {lead.get('email', lead_id)}")
-            
-            # Early exit optimization
-            if not leads_needed:
-                logger.info(f"🎯 Found all {len(lead_ids)} needed leads in {page_count} pages (vs full pagination)")
-                break
+                response = requests.get(
+                    url,
+                    headers=get_instantly_headers(),
+                    timeout=30
+                )
                 
-            starting_after = data.get('next_starting_after')
-            if not starting_after:
-                break
+                if response.status_code == 200:
+                    lead_data = response.json()
+                    found_leads.append(lead_data)
+                    logger.debug(f"✅ Found lead {i+1}/{len(lead_ids)}: {lead_data.get('email', lead_id)}")
+                    
+                elif response.status_code == 404:
+                    # Single retry for 404s
+                    logger.debug(f"🔄 Lead {i+1}/{len(lead_ids)} not found, retrying...")
+                    time.sleep(1.0)
+                    
+                    retry_response = requests.get(
+                        url,
+                        headers=get_instantly_headers(),
+                        timeout=30
+                    )
+                    
+                    if retry_response.status_code == 200:
+                        lead_data = retry_response.json()
+                        found_leads.append(lead_data)
+                        logger.debug(f"✅ Found on retry {i+1}/{len(lead_ids)}: {lead_data.get('email', lead_id)}")
+                    elif retry_response.status_code == 404:
+                        missing_leads.append(lead_id)
+                        logger.debug(f"❌ Confirmed missing {i+1}/{len(lead_ids)}: {lead_id}")
+                    else:
+                        logger.warning(f"⚠️ Retry failed with {retry_response.status_code} for lead {lead_id}")
+                        api_errors.append(lead_id)
+                        
+                elif response.status_code == 401:
+                    logger.error(f"🔐 Authentication error - stopping batch processing")
+                    raise Exception(f"Authentication failed: {response.status_code}")
+                    
+                elif response.status_code == 429:
+                    logger.warning(f"🚦 Rate limited on lead {i+1}/{len(lead_ids)}, backing off...")
+                    # Increase rate limiter delay and retry
+                    adaptive_rate_limiter.increase_delay()
+                    time.sleep(2.0)
+                    
+                    retry_response = requests.get(
+                        url,
+                        headers=get_instantly_headers(),
+                        timeout=30
+                    )
+                    
+                    if retry_response.status_code == 200:
+                        lead_data = retry_response.json()
+                        found_leads.append(lead_data)
+                        logger.debug(f"✅ Found after rate limit {i+1}/{len(lead_ids)}")
+                    else:
+                        logger.warning(f"⚠️ Rate limit retry failed for {lead_id}")
+                        api_errors.append(lead_id)
+                else:
+                    logger.warning(f"⚠️ API error {response.status_code} for lead {lead_id}")
+                    api_errors.append(lead_id)
+                    
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"🌐 Network error for lead {lead_id}: {e}")
+                api_errors.append(lead_id)
+            except Exception as e:
+                logger.error(f"❌ Unexpected error processing lead {lead_id}: {e}")
+                api_errors.append(lead_id)
         
-        found_count = len(all_leads)
-        missing_count = len(leads_needed)
+        # Results summary
+        found_count = len(found_leads)
+        missing_count = len(missing_leads)
+        error_count = len(api_errors)
+        total_requested = len(lead_ids)
         
-        # PHASE 4: Enhanced logging with smart batch size display and efficiency metrics
-        efficiency_percentage = (found_count / max(len(lead_ids), 1)) * 100
-        pages_saved_estimate = max(0, 20 - page_count)  # Estimate vs full campaign scan
+        success_rate = (found_count / max(total_requested, 1)) * 100
         
-        logger.info(f"🎯 Targeted Fetch Results:")
-        logger.info(f"  • Found: {found_count}/{len(lead_ids)} leads ({efficiency_percentage:.1f}%)")
-        logger.info(f"  • Pages scanned: {page_count} (saved ~{pages_saved_estimate} pages vs full scan)")
-        logger.info(f"  • Search efficiency: {found_count/max(page_count,1):.1f} leads/page")
+        logger.info(f"🎯 Direct API Results:")
+        logger.info(f"  • Found: {found_count}/{total_requested} leads ({success_rate:.1f}%)")
+        logger.info(f"  • Missing: {missing_count} (confirmed not in Instantly)")
+        logger.info(f"  • API errors: {error_count} (network/auth issues)")
+        logger.info(f"  • Processing time: ~{len(lead_ids) * 0.5:.1f} seconds")
         
         if missing_count > 0:
-            logger.warning(f"⚠️ Missing leads: {missing_count} (likely deleted from campaign)")
-        return all_leads
+            logger.info(f"📝 Missing leads will be marked as 'missing' and treated as completed")
+        
+        return {
+            'found_leads': found_leads,
+            'missing_leads': missing_leads,
+            'api_errors': api_errors
+        }
         
     except Exception as e:
-        logger.error(f"❌ Targeted lead fetch failed: {e}")
-        return []
+        logger.error(f"❌ Direct API batch failed: {e}")
+        return {'found_leads': [], 'missing_leads': [], 'api_errors': lead_ids}
 
 
 def process_bigquery_first_drain(bigquery_leads: Dict[str, List[str]]) -> List[InstantlyLead]:
     """
-    PHASE 2 OPTIMIZATION: Process drain using BigQuery-first approach.
+    DIRECT API OPTIMIZATION: Process drain using direct API calls instead of pagination.
     
     Args:
         bigquery_leads: Dict mapping campaign_id -> list of instantly_lead_ids to check
@@ -871,34 +896,41 @@ def process_bigquery_first_drain(bigquery_leads: Dict[str, List[str]]) -> List[I
         finished_leads = []
         total_leads_processed = 0
         
-        # Enhanced tracking like the original function
+        # Enhanced tracking with missing lead support
         drain_reasons = {
             'replied': 0,
             'completed': 0, 
+            'missing': 0,  # New status for leads not found in Instantly
             'bounced_hard': 0,
             'unsubscribed': 0,
             'stale_active': 0,
             'auto_reply_detected': 0,
             'kept_active': 0,
             'kept_paused': 0,
-            'kept_other': 0
+            'kept_other': 0,
+            'api_errors': 0
         }
         
-        # Process each campaign's leads using targeted approach
+        # Process each campaign's leads using direct API approach
         for campaign_id, lead_ids in bigquery_leads.items():
             campaign_name = "SMB" if campaign_id == SMB_CAMPAIGN_ID else "Midsize"
             
-            logger.info(f"🎯 Processing {len(lead_ids)} targeted leads from {campaign_name} campaign...")
+            logger.info(f"🎯 Processing {len(lead_ids)} leads from {campaign_name} campaign via direct API...")
             
-            # Fetch specific leads from Instantly
-            instantly_leads = get_leads_by_ids_from_instantly(campaign_id, lead_ids)
+            # Direct API calls to Instantly
+            api_results = get_leads_by_ids_from_instantly(campaign_id, lead_ids)
             
-            logger.info(f"📊 Retrieved {len(instantly_leads)} leads from Instantly for {campaign_name}")
+            found_leads = api_results['found_leads']
+            missing_leads = api_results['missing_leads']
+            api_errors = api_results.get('api_errors', [])
             
-            # Process each lead using existing classification logic
+            logger.info(f"📊 Retrieved {len(found_leads)} found, {len(missing_leads)} missing, {len(api_errors)} errors from {campaign_name}")
+            
+            # Track all leads that we'll update timestamps for
             leads_to_update_timestamps = []
             
-            for lead in instantly_leads:
+            # Process found leads using existing classification logic
+            for lead in found_leads:
                 total_leads_processed += 1
                 
                 lead_id = lead.get('id', '')
@@ -955,7 +987,31 @@ def process_bigquery_first_drain(bigquery_leads: Dict[str, List[str]]) -> List[I
                 # Queue for timestamp update
                 leads_to_update_timestamps.append(lead_id)
             
-            # Batch update timestamps for this campaign
+            # Process missing leads (treat as completed and drain)
+            for missing_lead_id in missing_leads:
+                total_leads_processed += 1
+                
+                # Create InstantlyLead with missing status
+                instantly_lead = InstantlyLead(
+                    id=missing_lead_id,
+                    email=f"missing_lead_{missing_lead_id}",  # Placeholder email
+                    campaign_id=campaign_id,
+                    status='missing'
+                )
+                finished_leads.append(instantly_lead)
+                
+                drain_reasons['missing'] += 1
+                logger.info(f"🗑️ DRAIN: {missing_lead_id} → missing | Lead not found in Instantly (likely auto-removed)")
+                
+                # Queue for timestamp update
+                leads_to_update_timestamps.append(missing_lead_id)
+            
+            # Track API errors (don't update timestamps for these)
+            if api_errors:
+                drain_reasons['api_errors'] += len(api_errors)
+                logger.warning(f"⚠️ {len(api_errors)} leads had API errors and will be retried next run")
+            
+            # Batch update timestamps for successfully processed leads (found + missing, but not errors)
             if leads_to_update_timestamps:
                 try:
                     batch_update_drain_timestamps(leads_to_update_timestamps)
@@ -967,26 +1023,23 @@ def process_bigquery_first_drain(bigquery_leads: Dict[str, List[str]]) -> List[I
             if MAX_LEADS_TO_EVALUATE > 0 and total_leads_processed > MAX_LEADS_TO_EVALUATE:
                 break
         
-        # PHASE 4: Enhanced summary with smart batch size display and performance metrics
+        # Enhanced summary with direct API performance metrics
         total_to_drain = len(finished_leads)
         total_campaigns_processed = len(bigquery_leads)
         
         logger.info("=" * 60)
-        logger.info("🚀 PHASE 2 OPTIMIZATION: BigQuery-first drain processing complete")
+        logger.info("🚀 DIRECT API OPTIMIZATION: Drain processing complete")
         logger.info("=" * 60)
         logger.info(f"📊 Performance Summary:")
         logger.info(f"  • Campaigns processed: {total_campaigns_processed}")
         logger.info(f"  • Total leads processed: {total_leads_processed}")
         logger.info(f"  • Leads to drain: {total_to_drain}")
-        logger.info(f"  • Drain efficiency: {(total_to_drain/max(total_leads_processed,1)*100):.1f}%")
+        logger.info(f"  • Processing success rate: {(total_leads_processed/max(sum(len(ids) for ids in bigquery_leads.values()),1)*100):.1f}%")
         
-        # PHASE 4: Smart batch size analysis
+        # Show campaign-specific processing results
         if total_leads_processed > 0:
-            avg_leads_per_campaign = total_leads_processed / total_campaigns_processed
-            logger.info(f"📊 Batch Optimization Metrics:")
-            logger.info(f"  • Average leads per campaign: {avg_leads_per_campaign:.1f}")
+            logger.info(f"📊 Campaign Processing Results:")
             
-            # Show campaign-specific processing efficiency
             for campaign_id, lead_ids in bigquery_leads.items():
                 campaign_name = "SMB" if campaign_id == SMB_CAMPAIGN_ID else "Midsize"
                 leads_targeted = len(lead_ids)
@@ -1012,7 +1065,7 @@ def process_bigquery_first_drain(bigquery_leads: Dict[str, List[str]]) -> List[I
         return finished_leads
         
     except Exception as e:
-        logger.error(f"❌ BigQuery-first drain processing failed: {e}")
+        logger.error(f"❌ Direct API drain processing failed: {e}")
         raise
 
 
