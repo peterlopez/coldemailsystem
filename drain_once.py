@@ -399,7 +399,16 @@ def main():
     drain_start_time = time.time()
     
     logger.info("🧹 STARTING LEAD DRAIN PROCESS (Enhanced Mode)")
-    logger.info(f"Config - Dry Run: {DRY_RUN}")
+    
+    # Import batch size from sync_once
+    try:
+        from sync_once import DRAIN_BATCH_SIZE
+        logger.info(f"Config - Dry Run: {DRY_RUN}, Batch Size: {DRAIN_BATCH_SIZE}")
+        if DRAIN_BATCH_SIZE != 50:
+            logger.info(f"🚀 CUSTOM BATCH SIZE: {DRAIN_BATCH_SIZE} (default: 50) - {'CATCH-UP MODE' if DRAIN_BATCH_SIZE > 50 else 'REDUCED MODE'}")
+    except ImportError:
+        logger.info(f"Config - Dry Run: {DRY_RUN}, Batch Size: 50 (default)")
+    
     logger.info(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     # Environment diagnostics

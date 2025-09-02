@@ -72,6 +72,9 @@ MAX_LEADS_TO_EVALUATE = int(os.getenv('MAX_LEADS_TO_EVALUATE', '0'))  # 0 = no l
 MAX_PAGES_TO_PROCESS = int(os.getenv('MAX_PAGES_TO_PROCESS', '0'))  # 0 = no limit, set to 2 for testing
 FORCE_DRAIN_CHECK = os.getenv('FORCE_DRAIN_CHECK', 'false').lower() == 'true'  # Skip 24hr check for testing
 
+# Direct API batch size configuration
+DRAIN_BATCH_SIZE = int(os.getenv('DRAIN_BATCH_SIZE', '50'))  # Default 50, can be increased for catch-up runs
+
 # OPTIMIZED: API configuration handled by shared_config
 INSTANTLY_API_KEY = config.api.instantly_api_key
 INSTANTLY_BASE_URL = config.api.instantly_base_url
@@ -700,13 +703,13 @@ def classify_lead_for_drain(lead: dict, campaign_name: str) -> dict:
 def get_leads_needing_drain_from_bigquery() -> Dict[str, List[str]]:
     """
     DIRECT API OPTIMIZATION: BigQuery-first approach to find leads that need drain evaluation.
-    Now targeting 50 leads for direct API calls instead of pagination.
+    Uses configurable batch size via DRAIN_BATCH_SIZE environment variable.
     
     Returns:
         Dict mapping campaign_id -> list of instantly_lead_ids that need checking
     """
     try:
-        logger.info("📊 DIRECT API: Querying BigQuery for leads needing drain evaluation...")
+        logger.info(f"📊 DIRECT API: Querying BigQuery for leads needing drain evaluation (batch size: {DRAIN_BATCH_SIZE})...")
         
         # Query leads that haven't been checked in 24+ hours OR never checked
         # AND are currently active in campaigns
@@ -726,7 +729,7 @@ def get_leads_needing_drain_from_bigquery() -> Dict[str, List[str]]:
         ORDER BY 
             COALESCE(last_drain_check, TIMESTAMP('1970-01-01')) ASC,  -- Oldest checks first
             email ASC  -- Deterministic ordering
-        LIMIT 50  -- Direct API batch size for reliable processing
+        LIMIT {DRAIN_BATCH_SIZE}  -- Configurable batch size (default 50)
         """
         
         query_job = bq_client.query(query)
@@ -744,6 +747,7 @@ def get_leads_needing_drain_from_bigquery() -> Dict[str, List[str]]:
         
         # Enhanced BigQuery results logging with direct API optimization metrics
         logger.info(f"📊 BigQuery Direct API Results:")
+        logger.info(f"  • Batch size configured: {DRAIN_BATCH_SIZE}")
         logger.info(f"  • Campaigns with leads: {len(leads_by_campaign)}")
         logger.info(f"  • Total leads for direct API calls: {total_leads}")
         logger.info(f"  • Expected processing time: ~{total_leads * 0.5:.1f} seconds")
@@ -759,6 +763,12 @@ def get_leads_needing_drain_from_bigquery() -> Dict[str, List[str]]:
             logger.info(f"  • {total_leads} individual API calls vs pagination")
             logger.info(f"  • Expected success rate: ~95% (vs current ~0.6%)")
             logger.info(f"  • No client-side matching required")
+            
+            # Show batch efficiency info
+            if DRAIN_BATCH_SIZE != 50:
+                logger.info(f"  • Custom batch size: {DRAIN_BATCH_SIZE} (default: 50)")
+                if DRAIN_BATCH_SIZE > 50:
+                    logger.info(f"  • 🚀 CATCH-UP MODE: Processing {DRAIN_BATCH_SIZE - 50} extra leads")
         
         return leads_by_campaign
         
