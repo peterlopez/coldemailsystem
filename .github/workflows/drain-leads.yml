@@ -24,6 +24,11 @@ on:
         options:
           - 'true'
           - 'false'
+      batch_size:
+        description: 'Number of leads to process per batch (default: 50, max: 500)'
+        required: false
+        default: '50'
+        type: string
 
 permissions:
   contents: read
@@ -159,6 +164,7 @@ jobs:
           
           # Drain-specific configuration
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          DRAIN_BATCH_SIZE: ${{ github.event.inputs.batch_size || '50' }}
           
           # Production configuration - full processing with efficiency optimizations
           MAX_LEADS_TO_EVALUATE: 0  # Process all leads (0 = no limit)
@@ -176,6 +182,7 @@ jobs:
         run: |
           echo "🧹 Starting Enhanced Lead Drain Process" | tee -a drain-workflow.log
           echo "Dry run: $DRY_RUN" | tee -a drain-workflow.log
+          echo "Batch size: $DRAIN_BATCH_SIZE" | tee -a drain-workflow.log
           echo "Testing limits: $MAX_LEADS_TO_EVALUATE leads, $MAX_PAGES_TO_PROCESS pages, force_check: $FORCE_DRAIN_CHECK" | tee -a drain-workflow.log
           echo "Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" | tee -a drain-workflow.log
           echo "" | tee -a drain-workflow.log
