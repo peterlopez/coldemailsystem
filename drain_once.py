@@ -464,8 +464,33 @@ def main():
         notification_data["analysis_summary"]["leads_eligible_for_drain"] = total_leads_found
         notification_data["drain_classifications"]["total_identified"] = total_leads_found
         
-        # For now, classify all as "completed" - you can enhance this with actual classification logic
-        notification_data["drain_classifications"]["completed"] = total_leads_found
+        # Try to get direct API metrics from sync_once.py if available
+        try:
+            from sync_once import LAST_DRAIN_METRICS
+            if LAST_DRAIN_METRICS and LAST_DRAIN_METRICS.get('api_calls_made', 0) > 0:
+                # Use actual drain classifications from direct API
+                drain_classifications = LAST_DRAIN_METRICS.get('drain_classifications', {})
+                for key, value in drain_classifications.items():
+                    if key in notification_data["drain_classifications"]:
+                        notification_data["drain_classifications"][key] = value
+                
+                # Add direct API metrics
+                notification_data["direct_api_metrics"] = {
+                    'api_calls_made': LAST_DRAIN_METRICS.get('api_calls_made', 0),
+                    'api_success_rate': LAST_DRAIN_METRICS.get('api_success_rate', 0),
+                    'leads_found': LAST_DRAIN_METRICS.get('leads_found', 0),
+                    'leads_missing': LAST_DRAIN_METRICS.get('leads_missing', 0),
+                    'api_errors': LAST_DRAIN_METRICS.get('api_errors', 0)
+                }
+                logger.info(f"📊 Using direct API metrics: {LAST_DRAIN_METRICS['api_calls_made']} calls, {LAST_DRAIN_METRICS['api_success_rate']:.1f}% success")
+            else:
+                # Fallback for legacy pagination mode
+                notification_data["drain_classifications"]["completed"] = total_leads_found
+                logger.info("📊 Using legacy classification (direct API metrics not available)")
+        except ImportError:
+            # Fallback if LAST_DRAIN_METRICS not available
+            notification_data["drain_classifications"]["completed"] = total_leads_found
+            logger.info("📊 Using fallback classification (LAST_DRAIN_METRICS not available)")
         
         # Enhanced drain with aggressive rate limiting (pass fetched leads to avoid double-fetch)
         drained, circuit_breaker_info = drain_finished_leads_enhanced(finished_leads)

@@ -313,7 +313,7 @@ class ColdEmailNotifier:
             return f"🔄 Cold Email Sync Complete - Error formatting details: {str(e)}"
     
     def _format_drain_content(self, data: Dict[str, Any]) -> str:
-        """Format drain notification content for Slack"""
+        """Format drain notification content for Slack with direct API support"""
         try:
             # Extract data with safe defaults
             analysis = data.get('analysis_summary', {})
@@ -322,6 +322,7 @@ class ColdEmailNotifier:
             dnc = data.get('dnc_updates', {})
             inventory = data.get('inventory_impact', {})
             performance = data.get('performance', {})
+            direct_api = data.get('direct_api_metrics', {})
             errors = data.get('errors', [])
             
             # Calculate key metrics
@@ -334,6 +335,7 @@ class ColdEmailNotifier:
             bounced = classifications.get('bounced_hard', 0)
             unsubscribed = classifications.get('unsubscribed', 0)
             stale = classifications.get('stale_active', 0)
+            missing = classifications.get('missing', 0)  # New status for direct API
             total_identified = classifications.get('total_identified', 0)
             
             attempted = deletions.get('attempted_deletions', 0)
@@ -351,8 +353,40 @@ class ColdEmailNotifier:
             processing_rate = performance.get('processing_rate_per_minute', 0)
             classification_accuracy = performance.get('classification_accuracy', 0)
             
-            # Build formatted message
-            content = f"""🧹 **Cold Email Drain Complete** | {self._format_timestamp(data.get('timestamp', ''))}
+            # Direct API metrics
+            api_calls_made = direct_api.get('api_calls_made', 0)
+            api_success_rate = direct_api.get('api_success_rate', 0)
+            leads_found = direct_api.get('leads_found', 0)
+            leads_missing = direct_api.get('leads_missing', 0)
+            api_errors = direct_api.get('api_errors', 0)
+            
+            # Build formatted message with direct API context
+            if api_calls_made > 0:
+                # Direct API mode
+                content = f"""🧹 **Cold Email Drain Complete** | {self._format_timestamp(data.get('timestamp', ''))}
+
+🎯 **Direct API Results** 
+• API calls made: {api_calls_made} (direct lookup)
+• Found in Instantly: {leads_found} ({api_success_rate:.1f}%)
+• Missing from Instantly: {leads_missing} 
+• API errors: {api_errors}
+• Identified for removal: {total_identified:,} leads
+
+📋 **Drain Classifications**
+• ✅ Completed sequences: {completed}
+• 💬 Replied: {replied}  
+• ❓ Missing from API: {missing}
+• ⚠️ Hard bounced: {bounced}
+• 🚫 Unsubscribed: {unsubscribed}
+• 🕐 Stale (90+ days): {stale}
+
+✅ **Deletion Results**
+• Success: {successful}/{attempted} ({success_rate:.1f}%) 
+• Failed: {failed} → Logged for retry
+• New inventory: {new_inventory:,} active leads"""
+            else:
+                # Fallback to legacy pagination format
+                content = f"""🧹 **Cold Email Drain Complete** | {self._format_timestamp(data.get('timestamp', ''))}
 
 🔍 **Analysis Summary**
 • Total analyzed: {total_analyzed:,} leads
@@ -370,34 +404,50 @@ class ColdEmailNotifier:
 ✅ **Deletion Results**
 • Success: {successful}/{attempted} ({success_rate:.1f}%) 
 • Failed: {failed} → Logged for retry
-• New inventory: {new_inventory:,} active leads
+• New inventory: {new_inventory:,} active leads"""
+
+            # Add DNC Protection section
+            content += f"""
 
 🔒 **DNC Protection**
 • Added {new_dnc} new unsubscribes
-• Total protected: {total_dnc:,} contacts
+• Total protected: {total_dnc:,} contacts"""
+
+            # Add Performance section
+            content += f"""
 
 ⚡ **Performance**
 • Duration: {self._format_duration(duration)}
-• Rate: {processing_rate:.1f} leads/min
+• Rate: {processing_rate:.1f} leads/min"""
+            
+            if api_calls_made > 0:
+                content += f"""
+• Direct API efficiency: {api_success_rate:.1f}% success rate"""
+            else:
+                content += f"""
 • Classification accuracy: {classification_accuracy:.1f}%"""
 
             # Add errors if any
             if errors:
-                content += f"\n\n⚠️ **Issues**: {len(errors)} errors logged"
+                content += f"""
+
+⚠️ **Issues**: {len(errors)} errors logged"""
                 for error in errors[:2]:  # Show first 2 errors
-                    content += f"\n• {str(error)[:100]}..."
+                    content += f"""
+• {str(error)[:100]}..."""
             
             # Add GitHub link if available
             github_url = data.get('github_run_url')
             if github_url:
-                content += f"\n\n🔗 [View Logs]({github_url})"
+                content += f"""
+
+🔗 [View Logs]({github_url})"""
             
             return content
             
         except Exception as e:
             logger.error(f"Error formatting drain content: {e}")
-            return f"🧹 Cold Email Drain Complete - Error formatting details: {str(e)}"
-    
+            return f"🧹 Cold Email Drain Complete - Error formatting details: {str(e)}"    
     def _format_timestamp(self, timestamp_str: str) -> str:
         """Format timestamp for display"""
         try:

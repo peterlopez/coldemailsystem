@@ -113,6 +113,16 @@ class InstantlyLead:
     campaign_id: str
     status: str
 
+# Global variable to store last drain metrics for notification system
+LAST_DRAIN_METRICS = {
+    'api_calls_made': 0,
+    'leads_found': 0,
+    'leads_missing': 0,
+    'api_errors': 0,
+    'api_success_rate': 0.0,
+    'drain_classifications': {}
+}
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=60))
 def call_instantly_api(endpoint: str, method: str = 'GET', data: Optional[Dict] = None) -> Dict:
     """Call Instantly API with automatic retry and backoff."""
@@ -911,6 +921,17 @@ def process_bigquery_first_drain(bigquery_leads: Dict[str, List[str]]) -> List[I
             'api_errors': 0
         }
         
+        # Direct API metrics tracking (for notifications)
+        global LAST_DRAIN_METRICS
+        LAST_DRAIN_METRICS = {
+            'api_calls_made': 0,
+            'leads_found': 0,
+            'leads_missing': 0,
+            'api_errors': 0,
+            'api_success_rate': 0.0,
+            'drain_classifications': drain_reasons
+        }
+        
         # Process each campaign's leads using direct API approach
         for campaign_id, lead_ids in bigquery_leads.items():
             campaign_name = "SMB" if campaign_id == SMB_CAMPAIGN_ID else "Midsize"
@@ -923,6 +944,12 @@ def process_bigquery_first_drain(bigquery_leads: Dict[str, List[str]]) -> List[I
             found_leads = api_results['found_leads']
             missing_leads = api_results['missing_leads']
             api_errors = api_results.get('api_errors', [])
+            
+            # Update direct API metrics
+            LAST_DRAIN_METRICS['api_calls_made'] += len(lead_ids)
+            LAST_DRAIN_METRICS['leads_found'] += len(found_leads)
+            LAST_DRAIN_METRICS['leads_missing'] += len(missing_leads)
+            LAST_DRAIN_METRICS['api_errors'] += len(api_errors)
             
             logger.info(f"📊 Retrieved {len(found_leads)} found, {len(missing_leads)} missing, {len(api_errors)} errors from {campaign_name}")
             
@@ -1023,6 +1050,13 @@ def process_bigquery_first_drain(bigquery_leads: Dict[str, List[str]]) -> List[I
             if MAX_LEADS_TO_EVALUATE > 0 and total_leads_processed > MAX_LEADS_TO_EVALUATE:
                 break
         
+        # Calculate API success rate
+        if LAST_DRAIN_METRICS['api_calls_made'] > 0:
+            LAST_DRAIN_METRICS['api_success_rate'] = (LAST_DRAIN_METRICS['leads_found'] / LAST_DRAIN_METRICS['api_calls_made']) * 100
+        
+        # Update metrics with latest drain classifications
+        LAST_DRAIN_METRICS['drain_classifications'] = drain_reasons
+        
         # Enhanced summary with direct API performance metrics
         total_to_drain = len(finished_leads)
         total_campaigns_processed = len(bigquery_leads)
@@ -1035,6 +1069,7 @@ def process_bigquery_first_drain(bigquery_leads: Dict[str, List[str]]) -> List[I
         logger.info(f"  • Total leads processed: {total_leads_processed}")
         logger.info(f"  • Leads to drain: {total_to_drain}")
         logger.info(f"  • Processing success rate: {(total_leads_processed/max(sum(len(ids) for ids in bigquery_leads.values()),1)*100):.1f}%")
+        logger.info(f"  • Direct API success rate: {LAST_DRAIN_METRICS['api_success_rate']:.1f}%")
         
         # Show campaign-specific processing results
         if total_leads_processed > 0:
