@@ -164,7 +164,7 @@ jobs:
           
           # Drain-specific configuration
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
-          DRAIN_BATCH_SIZE: ${{ github.event.inputs.batch_size || '50' }}
+          DRAIN_BATCH_SIZE: ${{ github.event.inputs.batch_size || '300' }}
           
           # Production configuration - full processing with efficiency optimizations
           MAX_LEADS_TO_EVALUATE: 0  # Process all leads (0 = no limit)
