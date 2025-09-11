@@ -1377,10 +1377,14 @@ def get_finished_leads() -> List[InstantlyLead]:
                         logger.info(f"🧪 TESTING LIMIT: Reached {MAX_PAGES_TO_PROCESS} pages for {campaign_name} (processed {total_leads_accessed} leads)")
                         break
                     
-                    # Safety check to prevent infinite loops (configurable, reduced for drain efficiency)
-                    max_pages_limit = int(os.getenv('DRAIN_MAX_PAGES_PER_CAMPAIGN', 20))  # Reduced from 60 to 20
-                    if page_count >= max_pages_limit:
-                        logger.warning(f"⚠️ Reached safety limit of {max_pages_limit} pages for {campaign_name} (processed {total_leads_accessed} leads)")
+                    # Optional progress logging for large drain operations  
+                    if page_count % 20 == 0:
+                        logger.info(f"📄 Drain progress: {page_count} pages fetched, {total_leads_accessed} leads processed for {campaign_name}...")
+                    
+                    # Generous safety check to prevent infinite loops (same as inventory)
+                    if page_count > 1000:  # Very generous limit, same as inventory fix
+                        logger.warning(f"⚠️ Reached generous safety limit of 1000 pages for {campaign_name} drain (processed {total_leads_accessed} leads)")
+                        logger.warning("This suggests either a very large inventory or a pagination issue")
                         break
                 
                 elif response.status_code == 401:
@@ -1732,45 +1736,46 @@ def get_mailbox_capacity() -> Tuple[int, int]:
         return 68, 680  # Conservative fallback estimate
 
 def get_current_instantly_inventory() -> int:
-    """Get current lead count in Instantly using real API data - CORRECTED to use proper campaign field."""
+    """Get current lead count in Instantly using optimized cursor-based pagination."""
     try:
-        # CORRECTED: Get ALL leads first, then filter by campaign field (not campaign_id filter)
-        # This is because the API's campaign_id filter doesn't work - it returns all leads regardless
+        # Import the new pagination utility
+        from shared.pagination_utils import fetch_all_leads
         
         logger.info("📊 Fetching all leads to calculate accurate inventory...")
         
-        # Step 1: Fetch all leads from Instantly (only once, not per campaign)
-        all_leads = []
-        starting_after = None
-        page_count = 0
+        # Use optimized pagination with caching
+        all_leads, pagination_stats = fetch_all_leads(
+            api_call_func=call_instantly_api,
+            campaign_filter=None,  # Get all leads first, then filter client-side
+            batch_size=200,  # Increased batch size for better performance
+            use_cache=True   # Cache for 5 minutes to avoid repeated calls
+        )
         
-        while True:
-            data = {'limit': 100}  # No campaign filter - get all leads
-            
-            if starting_after:
-                data['starting_after'] = starting_after
-            
-            response = call_instantly_api('/api/v2/leads/list', method='POST', data=data)
-            
-            if not response or not response.get('items'):
-                break
-            
-            items = response.get('items', [])
-            page_count += 1
-            all_leads.extend(items)
-            logger.debug(f"  Page {page_count}: {len(items)} leads fetched")
-            
-            # Check for next page
-            starting_after = response.get('next_starting_after')
-            if not starting_after:
-                break
-            
-            # Safety limit
-            if page_count > 50:
-                logger.warning(f"Hit page limit at {page_count} pages while fetching inventory")
-                break
+        # Log pagination performance with enhanced metrics
+        cache_status = "from cache" if pagination_stats.cache_hit else "fetched live"
+        logger.info(f"📊 Inventory {cache_status}: {pagination_stats.total_items} leads in {pagination_stats.total_pages} pages ({pagination_stats.duration_seconds:.1f}s)")
         
-        logger.info(f"📄 Total leads fetched: {len(all_leads)}")
+        if pagination_stats.avg_items_per_page > 0 and not pagination_stats.cache_hit:
+            rate = pagination_stats.total_items / pagination_stats.duration_seconds if pagination_stats.duration_seconds > 0 else 0
+            logger.info(f"   📈 Performance: {pagination_stats.avg_items_per_page:.1f} leads/page, {rate:.1f} leads/sec")
+            
+            # Performance warnings and recommendations
+            if pagination_stats.total_pages > 100:
+                logger.warning(f"   ⚠️  Large inventory ({pagination_stats.total_pages} pages) - consider enabling permanent caching")
+            if pagination_stats.duration_seconds > 30:
+                logger.warning(f"   🐌 Slow fetch ({pagination_stats.duration_seconds:.1f}s) - consider increasing batch size")
+            if rate < 50:
+                logger.warning(f"   📶 Low throughput ({rate:.1f} leads/sec) - check API performance")
+        
+        # Store performance metrics for notification system
+        pagination_performance = {
+            'total_leads': pagination_stats.total_items,
+            'total_pages': pagination_stats.total_pages,
+            'duration_seconds': pagination_stats.duration_seconds,
+            'cache_hit': pagination_stats.cache_hit,
+            'avg_items_per_page': pagination_stats.avg_items_per_page,
+            'throughput_leads_per_sec': pagination_stats.total_items / pagination_stats.duration_seconds if pagination_stats.duration_seconds > 0 else 0
+        }
         
         # Step 2: Filter and count by campaign using the correct 'campaign' field
         total_inventory = 0

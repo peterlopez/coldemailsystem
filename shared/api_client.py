@@ -128,68 +128,53 @@ def get_finished_leads() -> List[InstantlyLead]:
         ("Midsize", MIDSIZE_CAMPAIGN_ID)
     ]
     
+    # Use optimized pagination to get all leads once, then filter by campaign
+    from .pagination_utils import fetch_all_leads
+    
+    logger.info(f"🔍 Fetching all leads to check for finished leads across campaigns...")
+    
+    # Fetch all leads using optimized cursor pagination
+    all_leads, pagination_stats = fetch_all_leads(
+        api_call_func=call_instantly_api,
+        campaign_filter=None,  # Get all leads, filter client-side
+        batch_size=200,        # Larger batches for better performance
+        use_cache=False        # Don't cache drain operations (need fresh data)
+    )
+    
+    logger.info(f"📊 Drain analysis: {pagination_stats.total_items} leads fetched in {pagination_stats.total_pages} pages ({pagination_stats.duration_seconds:.1f}s)")
+    
+    # Process leads for each campaign
     for campaign_name, campaign_id in campaigns:
-        logger.info(f"🔍 Checking {campaign_name} campaign for finished leads...")
+        logger.info(f"🔍 Analyzing {campaign_name} campaign for finished leads...")
         
-        page = 1
         campaign_finished = []
+        campaign_lead_count = 0
         
-        while True:
-            try:
-                # CORRECTED: Can't filter by campaign in API - get all leads and filter client-side
-                # The 'campaign_id' filter doesn't work in V2 API
-                data = {
-                    'page': page,
-                    'per_page': 100
-                }
-                
-                response = call_instantly_api('/api/v2/leads/list', method='POST', data=data)
-                
-                if not response or not response.get('items'):
-                    break
-                
-                leads_on_page = response['items']
-                logger.debug(f"  Page {page}: {len(leads_on_page)} leads found")
-                
-                # Analyze each lead to see if it should be drained
-                for item in leads_on_page:
-                    # CORRECTED: Filter by campaign field (not campaign_id) - client-side filtering
-                    lead_campaign = item.get('campaign')
-                    if lead_campaign != campaign_id:
-                        continue  # Skip leads not in this campaign
-                    
-                    lead = InstantlyLead(
-                        id=item.get('id'),
-                        email=item.get('email'),
-                        status=item.get('status', 1),
-                        campaign_id=campaign_id,
-                        email_reply_count=item.get('email_reply_count', 0),
-                        created_at=item.get('created_at')
-                    )
-                    
-                    # Check if this lead should be drained
-                    decision = should_drain_lead(lead, item)
-                    if decision['should_drain']:
-                        campaign_finished.append(lead)
-                        logger.debug(f"  ✅ Will drain {lead.email}: {decision['drain_reason']}")
-                
-                # Check if we should continue to next page
-                if len(leads_on_page) < 100:
-                    break
-                
-                page += 1
-                time.sleep(1.0)  # Rate limiting between pages
-                
-                # Safety limit
-                if page > 100:
-                    logger.warning(f"Hit page limit for {campaign_name} campaign")
-                    break
-                    
-            except Exception as e:
-                logger.error(f"Error fetching page {page} for {campaign_name}: {e}")
-                break
+        # Filter and analyze leads for this campaign
+        for item in all_leads:
+            # Filter by campaign field (client-side filtering)
+            lead_campaign = item.get('campaign')
+            if lead_campaign != campaign_id:
+                continue  # Skip leads not in this campaign
+            
+            campaign_lead_count += 1
+            
+            lead = InstantlyLead(
+                id=item.get('id'),
+                email=item.get('email'),
+                status=item.get('status', 1),
+                campaign_id=campaign_id,
+                email_reply_count=item.get('email_reply_count', 0),
+                created_at=item.get('created_at')
+            )
+            
+            # Check if this lead should be drained
+            decision = should_drain_lead(lead, item)
+            if decision['should_drain']:
+                campaign_finished.append(lead)
+                logger.debug(f"  ✅ Will drain {lead.email}: {decision['drain_reason']}")
         
-        logger.info(f"  {campaign_name}: {len(campaign_finished)} finished leads found")
+        logger.info(f"  📊 {campaign_name}: {campaign_lead_count} total leads, {len(campaign_finished)} to be drained")
         all_finished_leads.extend(campaign_finished)
     
     logger.info(f"📋 Total finished leads across campaigns: {len(all_finished_leads)}")
