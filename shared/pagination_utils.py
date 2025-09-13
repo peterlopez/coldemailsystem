@@ -73,7 +73,7 @@ class CursorPaginator:
         Args:
             endpoint: API endpoint to call
             base_params: Base parameters for the API call
-            batch_size: Items per page (100-500 recommended)
+            batch_size: Items per page (max 100 per Instantly API)
             max_retries: Retries per failed request
             progress_interval: Log progress every N pages
             max_safety_pages: Safety limit to prevent infinite loops
@@ -101,11 +101,13 @@ class CursorPaginator:
         starting_after = None
         page_count = 0
         consecutive_failures = 0
+        encountered_error = False
         
         while True:
             # Prepare request parameters
             params = base_params.copy()
-            params['limit'] = batch_size
+            # Clamp to API max (100) to avoid 400s
+            params['limit'] = min(int(batch_size or 100), 100)
             
             if starting_after:
                 params['starting_after'] = starting_after
@@ -150,6 +152,7 @@ class CursorPaginator:
                 
             except Exception as e:
                 consecutive_failures += 1
+                encountered_error = True
                 logger.warning(f"⚠️ Pagination API error (attempt {consecutive_failures}/{max_retries}): {e}")
                 
                 if consecutive_failures >= max_retries:
@@ -170,8 +173,8 @@ class CursorPaginator:
         
         logger.info(f"📊 Pagination complete: {len(all_items)} items in {page_count} pages ({duration:.1f}s)")
         
-        # Cache results if caching enabled
-        if self.cache_ttl_minutes > 0:
+        # Cache results if caching enabled and no errors occurred during fetch
+        if self.cache_ttl_minutes > 0 and not encountered_error:
             self._cache[cache_key] = CachedResult(
                 data=all_items.copy(),
                 timestamp=datetime.utcnow(),
@@ -221,7 +224,7 @@ def get_paginator(api_call_func: Callable, cache_ttl_minutes: int = 5) -> Cursor
     
     return _global_paginator
 
-def fetch_all_leads(api_call_func: Callable, campaign_filter: Optional[str] = None, 
+def fetch_all_leads(api_call_func: Callable, campaign_filter: Optional[str] = None,
                    batch_size: int = 100, use_cache: bool = True) -> tuple[List[Dict[str, Any]], PaginationStats]:
     """
     Convenience function to fetch all leads with optimized settings
@@ -235,68 +238,28 @@ def fetch_all_leads(api_call_func: Callable, campaign_filter: Optional[str] = No
     Returns:
         Tuple of (leads, stats)
     """
-    # Import campaign IDs here to avoid circular imports
-    from shared.api_client import SMB_CAMPAIGN_ID, MIDSIZE_CAMPAIGN_ID
-    
     cache_ttl = 5 if use_cache else 0
     paginator = get_paginator(api_call_func, cache_ttl)
-    
-    # The Instantly API requires campaign_id for the /api/v2/leads/list endpoint
+
+    # Always fetch without server-side campaign filter; filter client-side using 'campaign'
+    logger.info("📊 Fetching leads from all campaigns...")
+    all_items, stats = paginator.fetch_all(
+        endpoint='/api/v2/leads/list',
+        base_params={},
+        batch_size=min(int(batch_size or 100), 100),
+        progress_interval=25,
+        max_safety_pages=2000
+    )
+
     if campaign_filter:
-        # Single campaign mode
-        params = {'campaign_id': campaign_filter}  # Note: 'campaign_id' not 'campaign' for list endpoint
-        return paginator.fetch_all(
-            endpoint='/api/v2/leads/list',
-            base_params=params,
-            batch_size=batch_size,
-            progress_interval=25,
-            max_safety_pages=2000
+        filtered = [item for item in all_items if item.get('campaign') == campaign_filter]
+        filtered_stats = PaginationStats(
+            total_pages=stats.total_pages,
+            total_items=len(filtered),
+            duration_seconds=stats.duration_seconds,
+            cache_hit=stats.cache_hit
         )
-    else:
-        # Multi-campaign mode - fetch from both campaigns and combine
-        logger.info("📊 Fetching leads from all campaigns...")
-        all_leads = []
-        total_duration = 0.0
-        total_pages = 0
-        cache_hits = 0
-        
-        campaigns = [
-            ("SMB", SMB_CAMPAIGN_ID),
-            ("Midsize", MIDSIZE_CAMPAIGN_ID)
-        ]
-        
-        for campaign_name, campaign_id in campaigns:
-            logger.info(f"🔍 Fetching {campaign_name} campaign leads...")
-            params = {'campaign_id': campaign_id}
-            
-            campaign_leads, campaign_stats = paginator.fetch_all(
-                endpoint='/api/v2/leads/list',
-                base_params=params,
-                batch_size=batch_size,
-                progress_interval=25,
-                max_safety_pages=2000
-            )
-            
-            # Add campaign field to each lead for identification
-            for lead in campaign_leads:
-                lead['_fetched_from_campaign'] = campaign_id
-            
-            all_leads.extend(campaign_leads)
-            total_duration += campaign_stats.duration_seconds
-            total_pages += campaign_stats.total_pages
-            if campaign_stats.cache_hit:
-                cache_hits += 1
-            
-            logger.info(f"   ✅ {campaign_name}: {len(campaign_leads)} leads in {campaign_stats.total_pages} pages")
-        
-        # Create combined stats
-        combined_stats = PaginationStats(
-            total_pages=total_pages,
-            total_items=len(all_leads),
-            duration_seconds=total_duration,
-            cache_hit=(cache_hits == len(campaigns))  # All campaigns were cached
-        )
-        
-        logger.info(f"📊 Combined: {len(all_leads)} total leads from {len(campaigns)} campaigns")
-        
-        return all_leads, combined_stats
+        logger.info(f"   ✅ Filtered campaign {campaign_filter}: {len(filtered)} leads from {stats.total_pages} pages")
+        return filtered, filtered_stats
+
+    return all_items, stats

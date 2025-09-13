@@ -67,7 +67,13 @@ def call_instantly_api(endpoint: str, method: str = 'GET', data: Optional[Dict] 
         return response.json()
     
     except requests.exceptions.RequestException as e:
-        logger.error(f"API call failed: {e}")
+        # Include response status/body when available for faster diagnostics
+        status = getattr(getattr(e, 'response', None), 'status_code', None)
+        body = getattr(getattr(e, 'response', None), 'text', '')
+        if status:
+            logger.error(f"API call failed: {e} (status={status}, body={body[:800]})")
+        else:
+            logger.error(f"API call failed: {e}")
         # Don't log to dead letters here to avoid BigQuery dependency
         raise
 
