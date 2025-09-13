@@ -222,14 +222,14 @@ def get_paginator(api_call_func: Callable, cache_ttl_minutes: int = 5) -> Cursor
     return _global_paginator
 
 def fetch_all_leads(api_call_func: Callable, campaign_filter: Optional[str] = None, 
-                   batch_size: int = 200, use_cache: bool = True) -> tuple[List[Dict[str, Any]], PaginationStats]:
+                   batch_size: int = 100, use_cache: bool = True) -> tuple[List[Dict[str, Any]], PaginationStats]:
     """
     Convenience function to fetch all leads with optimized settings
     
     Args:
         api_call_func: API calling function
         campaign_filter: Optional campaign ID to filter by (if None, fetches from all campaigns)
-        batch_size: Items per page (200 recommended for inventory)
+        batch_size: Items per page (100 max for Instantly API)
         use_cache: Whether to use caching
         
     Returns:
