@@ -228,24 +228,75 @@ def fetch_all_leads(api_call_func: Callable, campaign_filter: Optional[str] = No
     
     Args:
         api_call_func: API calling function
-        campaign_filter: Optional campaign ID to filter by
+        campaign_filter: Optional campaign ID to filter by (if None, fetches from all campaigns)
         batch_size: Items per page (200 recommended for inventory)
         use_cache: Whether to use caching
         
     Returns:
         Tuple of (leads, stats)
     """
+    # Import campaign IDs here to avoid circular imports
+    from shared.api_client import SMB_CAMPAIGN_ID, MIDSIZE_CAMPAIGN_ID
+    
     cache_ttl = 5 if use_cache else 0
     paginator = get_paginator(api_call_func, cache_ttl)
     
-    params = {}
+    # The Instantly API requires campaign_id for the /api/v2/leads/list endpoint
     if campaign_filter:
-        params['campaign'] = campaign_filter
-    
-    return paginator.fetch_all(
-        endpoint='/api/v2/leads/list',
-        base_params=params,
-        batch_size=batch_size,
-        progress_interval=25,  # Progress every 25 pages for large inventories
-        max_safety_pages=2000  # Higher limit for very large accounts
-    )
+        # Single campaign mode
+        params = {'campaign_id': campaign_filter}  # Note: 'campaign_id' not 'campaign' for list endpoint
+        return paginator.fetch_all(
+            endpoint='/api/v2/leads/list',
+            base_params=params,
+            batch_size=batch_size,
+            progress_interval=25,
+            max_safety_pages=2000
+        )
+    else:
+        # Multi-campaign mode - fetch from both campaigns and combine
+        logger.info("📊 Fetching leads from all campaigns...")
+        all_leads = []
+        total_duration = 0.0
+        total_pages = 0
+        cache_hits = 0
+        
+        campaigns = [
+            ("SMB", SMB_CAMPAIGN_ID),
+            ("Midsize", MIDSIZE_CAMPAIGN_ID)
+        ]
+        
+        for campaign_name, campaign_id in campaigns:
+            logger.info(f"🔍 Fetching {campaign_name} campaign leads...")
+            params = {'campaign_id': campaign_id}
+            
+            campaign_leads, campaign_stats = paginator.fetch_all(
+                endpoint='/api/v2/leads/list',
+                base_params=params,
+                batch_size=batch_size,
+                progress_interval=25,
+                max_safety_pages=2000
+            )
+            
+            # Add campaign field to each lead for identification
+            for lead in campaign_leads:
+                lead['_fetched_from_campaign'] = campaign_id
+            
+            all_leads.extend(campaign_leads)
+            total_duration += campaign_stats.duration_seconds
+            total_pages += campaign_stats.total_pages
+            if campaign_stats.cache_hit:
+                cache_hits += 1
+            
+            logger.info(f"   ✅ {campaign_name}: {len(campaign_leads)} leads in {campaign_stats.total_pages} pages")
+        
+        # Create combined stats
+        combined_stats = PaginationStats(
+            total_pages=total_pages,
+            total_items=len(all_leads),
+            duration_seconds=total_duration,
+            cache_hit=(cache_hits == len(campaigns))  # All campaigns were cached
+        )
+        
+        logger.info(f"📊 Combined: {len(all_leads)} total leads from {len(campaigns)} campaigns")
+        
+        return all_leads, combined_stats
