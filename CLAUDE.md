@@ -60,10 +60,12 @@ This is a fully automated pipeline that synchronizes lead data between BigQuery 
 ## 🏗️ Technical Architecture
 
 ### **Modular Shared Components**
-The system now uses a shared component architecture:
-- **`shared/api_client.py`** - Centralized Instantly API operations
-- **`shared/bigquery_utils.py`** - BigQuery connection and query management  
-- **`shared/models.py`** - Data models and type definitions
+The system uses a shared component architecture with clear boundaries:
+- `shared/http.py` — Unified Instantly API client (GET/POST/DELETE) with structured responses
+- `shared/bq.py` — Centralized BigQuery writers for ops_inst_state, lead_history, and dnc_list
+- `shared/notify.py` — Re-exported notifier for consistent imports across modules
+- `shared/models.py` — Data models and type definitions (unchanged)
+- `shared_config.py` — Centralized configuration (source of truth)
 
 ### **BigQuery Tables Created**
 ```sql
@@ -161,15 +163,41 @@ v_ready_for_instantly -- Combines all filtering logic
 - **Secrets management:** Secure API key and credentials handling
 - **Comprehensive logging:** Full audit trails with artifact upload
 
-### **Configuration Files**
-- `config/secrets/instantly-config.json` - API configuration
-- `config/secrets/bigquery-credentials.json` - Service account credentials
-- `requirements.txt` - Python dependencies
-- `setup.py` - Initial table creation script
-- `sync_once.py` - Main sync script (1,991 lines)
-- `drain_once.py` - Dedicated drain script with enhanced rate limiting
-- `simple_async_verification.py` - Simple async verification system (1,066 lines)
-- `shared_config.py` - Centralized configuration management
+### **Configuration & Modules**
+- `config/secrets/instantly-config.json` — API configuration
+- `config/secrets/bigquery-credentials.json` — Service account credentials
+- `requirements.txt` — Python dependencies
+- `setup.py` — Initial table creation script
+- `sync_once.py` — Main sync entrypoint (orchestrates top-up and calls verify service)
+- `drain_once.py` — Dedicated drain entrypoint (rate-limited deletes, notifications)
+- `simple_async_verification.py` — Verification module and workflow entrypoint
+- `drain/service.py` — Drain discovery (BigQuery-first), classification, direct-API metrics
+- `verify/service.py` — Verification trigger + poll service interface
+- `shared/http.py` — Unified HTTP client used by all modules
+- `shared/bq.py` — Bulk BigQuery writers for state/history/DNC updates
+- `shared/notify.py` — Notifier re-export for consistent imports
+- `shared_config.py` — Centralized configuration management
+
+Note: The original pagination fallback remains in `sync_once.py` and is intentionally used as the fallback path. We do not use `shared/pagination_utils.py` for drain because it was not production-equivalent.
+
+## 🧩 Refactor Summary (Separation of Concerns)
+
+The pipeline was refactored to improve maintainability without changing business logic:
+
+- HTTP unification: All Instantly API calls go through `shared/http.py`. `sync_once` retains a wrapper to keep legacy return shapes (e.g., `{'success': True}` for DELETE).
+- Drain separation: `drain/service.py` owns BigQuery-first discovery, direct API lookups by lead ID, classification, and populates direct API metrics for notifications. Pagination fallback delegates to the proven implementation in `sync_once.py`.
+- BigQuery writers centralized: `shared/bq.py` implements the bulk MERGE/INSERT operations for ops_inst_state, ops_lead_history, and dnc_list (migrated from `sync_once.py`).
+- Verify decoupled: `verify/service.py` exposes trigger + poll interfaces; `sync_once.py` calls the service. The verification workflow continues to import `simple_async_verification.py` directly.
+- Notifications: `shared/notify.py` re-exports the existing notifier for uniform imports. Drain notifications include “Direct API Results” again via a safe accessor.
+
+Guardrails
+- No changes to classification logic, SQL, DNC/history rules, or delete semantics.
+- Entry points used by GitHub Actions remain unchanged.
+- Pagination fallback remains the original, known-good logic in `sync_once.py` (we did not adopt the shared pagination utility).
+
+Testing & DRY_RUN
+- Tests cover: classification, HTTP delete semantics, facade delegation, BigQuery update wiring, verify service, entrypoint importability.
+- Local DRY_RUN: Sync runs (auth logs failure with DRY_RUN stub but exits 0), Drain runs (BigQuery-first path executes, early-exit tuple fix applied), Verify poller runs (no-ops in DRY_RUN).
 
 ## 📧 Simple Async Email Verification System
 

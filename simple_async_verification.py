@@ -33,7 +33,8 @@ logger = logging.getLogger(__name__)
 
 # Import notification system
 try:
-    from cold_email_notifier import notifier
+    from shared.notify import get_notifier
+    notifier = get_notifier()
     NOTIFICATIONS_AVAILABLE = True
     logger.info("📡 Notification system loaded for verification polling")
 except ImportError:

@@ -42,21 +42,22 @@ logger = logging.getLogger(__name__)
 
 # Import notification system AFTER logger is configured
 try:
-    from cold_email_notifier import notifier
+    from shared.notify import get_notifier
+    notifier = get_notifier()
     NOTIFICATIONS_AVAILABLE = True
     logger.info("📡 Notification system loaded")
 except ImportError as e:
     NOTIFICATIONS_AVAILABLE = False
     logger.warning(f"📴 Notification system not available: {e}")
 
-# Import simple async verification system
+# Import verification service facade (decoupled from module internals)
 try:
-    from simple_async_verification import trigger_verification_for_new_leads
+    from verify.service import trigger_verification
     ASYNC_VERIFICATION_AVAILABLE = True
-    logger.info("🔍 Simple async verification system loaded")
+    logger.info("🔍 Verification service facade loaded")
 except ImportError as e:
     ASYNC_VERIFICATION_AVAILABLE = False
-    logger.warning(f"📴 Simple async verification system not available: {e}")
+    logger.warning(f"📴 Verification service not available: {e}")
 
 # OPTIMIZED: Use centralized configuration
 from shared_config import config, DRY_RUN, SMB_CAMPAIGN_ID, MIDSIZE_CAMPAIGN_ID, PROJECT_ID, DATASET_ID, TARGET_NEW_LEADS_PER_RUN
@@ -128,84 +129,115 @@ LAST_DRAIN_METRICS = {
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=60))
 def call_instantly_api(endpoint: str, method: str = 'GET', data: Optional[Dict] = None) -> Dict:
-    """Call Instantly API with automatic retry and backoff."""
+    """Call Instantly API via shared client with retry/backoff; keep legacy return shapes.
+
+    For GET/POST, return parsed JSON (as before). For DELETE, return {'success': True}
+    when appropriate (2xx/404), mirroring previous behavior.
+    """
     url = f"{INSTANTLY_BASE_URL}{endpoint}"
-    headers = {
-        'Authorization': f'Bearer {INSTANTLY_API_KEY}',
-        'Content-Type': 'application/json'
-    }
-    
     if DRY_RUN:
         logger.info(f"DRY RUN: Would call {method} {url} with data: {data}")
         return {'success': True, 'dry_run': True}
-    
+
     try:
-        if method == 'GET':
-            response = requests.get(url, headers=headers, timeout=30)
-        elif method == 'POST':
-            response = requests.post(url, headers=headers, json=data, timeout=30)
-        elif method == 'DELETE':
-            response = requests.delete(url, headers=headers, timeout=30)
-        else:
-            raise ValueError(f"Unsupported method: {method}")
-        
-        response.raise_for_status()
-        # Handle empty response for DELETE operations
-        if method == 'DELETE' and not response.content:
-            return {'success': True}
-        return response.json()
-    
+        try:
+            from shared.http import call_instantly_api as _client
+        except Exception:
+            _client = None
+
+        if _client is None:
+            # Fallback to direct requests if shared is unavailable
+            headers = {
+                'Authorization': f'Bearer {INSTANTLY_API_KEY}',
+                'Content-Type': 'application/json'
+            }
+            if method == 'GET':
+                response = requests.get(url, headers=headers, timeout=30)
+            elif method == 'POST':
+                response = requests.post(url, headers=headers, json=data, timeout=30)
+            elif method == 'DELETE':
+                response = requests.delete(url, headers=headers, timeout=30)
+            else:
+                raise ValueError(f"Unsupported method: {method}")
+            response.raise_for_status()
+            if method == 'DELETE':
+                return {'success': True}
+            return response.json()
+
+        resp = _client(endpoint, method=method, data=data)
+        # resp is structured: {status_code, text, json}
+        if method == 'DELETE':
+            sc = int(resp.get('status_code', 0))
+            if 200 <= sc < 300 or sc == 404:
+                return {'success': True}
+            # emulate previous raise behavior on HTTP errors
+            raise requests.HTTPError(f"DELETE failed: {sc} {resp.get('text','')}")
+        # GET/POST: return parsed JSON
+        if isinstance(resp, dict) and 'json' in resp and resp['json'] is not None:
+            return resp['json']
+        # No JSON body
+        return {}
     except requests.exceptions.RequestException as e:
         logger.error(f"API call failed: {e}")
-        # Log to dead letters
-        log_dead_letter('api_call', None, str(data), getattr(e.response, 'status_code', 0), str(e))
+        log_dead_letter('api_call', None, str(data), getattr(getattr(e, 'response', None), 'status_code', 0), str(e))
         raise
 
 def delete_lead_from_instantly(lead: 'InstantlyLead') -> bool:
     """
-    Delete a lead from Instantly using the official V2 DELETE endpoint.
-    Follows API best practices: treats 404 as idempotent success.
-    Simplified to avoid retry wrapper conflicts.
+    Delete a lead from Instantly using unified shared HTTP client.
+    Treats 2xx and 404 as idempotent success, 429 as retriable failure.
     """
     if DRY_RUN:
         logger.info(f"🧪 DRY RUN: Would delete lead {lead.email} (ID: {lead.id})")
         return True
-    
+
     try:
         logger.debug(f"🔄 Deleting lead {lead.email} via DELETE /api/v2/leads/{lead.id}")
-        
-        # Use direct requests to avoid any wrapper issues
-        headers = {
-            'Authorization': f'Bearer {INSTANTLY_API_KEY}',
-            'Accept': 'application/json'
-        }
-        
-        response = requests.delete(
-            f"{INSTANTLY_BASE_URL}/api/v2/leads/{lead.id}",
-            headers=headers,
-            timeout=30
-        )
-        
-        if response.status_code in [200, 204]:
+
+        # Use shared HTTP facade to keep behavior consistent across modules
+        try:
+            from shared.http import call_instantly_api as _http_delete
+        except Exception:
+            # Fallback to local requests if shared facade is unavailable
+            _http_delete = None
+
+        if _http_delete is not None:
+            resp = _http_delete(f"/api/v2/leads/{lead.id}", method="DELETE", data=None)
+            if not resp:
+                logger.error(f"❌ No response from DELETE API for {lead.email}")
+                log_dead_letter('delete_lead', lead.email, lead.id, 0, 'No response from API')
+                return False
+            status = int(resp.get('status_code', 0))
+            body = resp.get('text', '')
+        else:
+            headers = {
+                'Authorization': f'Bearer {INSTANTLY_API_KEY}',
+                'Accept': 'application/json'
+            }
+            response = requests.delete(
+                f"{INSTANTLY_BASE_URL}/api/v2/leads/{lead.id}",
+                headers=headers,
+                timeout=30
+            )
+            status = response.status_code
+            body = response.text
+
+        if 200 <= status < 300:
             logger.info(f"✅ Successfully deleted {lead.email} from Instantly")
             return True
-        elif response.status_code == 404:
-            # 404 means lead is already gone - treat as successful idempotent operation
+        if status == 404:
             logger.info(f"✅ Lead {lead.email} already deleted (404 = idempotent success)")
             return True
-        elif response.status_code == 429:
-            # 429 means rate limited - this is a recoverable error
+        if status == 429:
             logger.warning(f"⚠️ Rate limited deleting {lead.email} - API suggests slowing down")
-            log_dead_letter('delete_lead_rate_limit', lead.email, lead.id, 429, response.text)
+            log_dead_letter('delete_lead_rate_limit', lead.email, lead.id, 429, body)
             return False
-        else:
-            # Other HTTP errors are actual failures
-            logger.error(f"❌ HTTP error deleting {lead.email}: {response.status_code} - {response.text}")
-            log_dead_letter('delete_lead', lead.email, lead.id, response.status_code, response.text)
-            return False
-            
+
+        logger.error(f"❌ HTTP error deleting {lead.email}: {status} - {body}")
+        log_dead_letter('delete_lead', lead.email, lead.id, status, body)
+        return False
+
     except Exception as e:
-        # Non-HTTP errors (network, timeout, etc.)
         logger.error(f"❌ Delete error for {lead.email}: {e}")
         log_dead_letter('delete_lead', lead.email, lead.id, 0, str(e))
         return False

@@ -22,28 +22,27 @@ except ImportError:
     print("⚠️ Shared config not available, using environment fallback")
     config = None
 
-# Import core functions from sync_once (except the broken HTTP helper)
+# Import core functions from drain service (decoupled from sync_once)
 try:
-    from sync_once import (
-        get_finished_leads, update_bigquery_state, 
-        DRY_RUN, InstantlyLead,
-        log_dead_letter
+    from drain.service import (
+        get_finished_leads, update_bigquery_state,
+        DRY_RUN, InstantlyLead, log_dead_letter,
     )
-    print("✅ Successfully imported from sync_once")
+    print("✅ Drain service available")
     IMPORTS_AVAILABLE = True
 except ImportError as e:
-    print(f"❌ Failed to import from sync_once: {e}")
+    print(f"❌ Failed to import drain service: {e}")
     # Set minimal defaults to prevent total failure
     DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
     IMPORTS_AVAILABLE = False
 
-# Import the FIXED HTTP helper from verification poller (not the broken sync_once version)
+# Import the HTTP helper via shared facade (decouples from verification internals)
 try:
-    from simple_async_verification import call_instantly_api
-    print("✅ Successfully imported FIXED call_instantly_api from verification poller")
+    from shared.http import call_instantly_api
+    print("✅ HTTP helper available via shared.http facade")
     HTTP_HELPER_AVAILABLE = True
 except ImportError as e:
-    print(f"❌ Failed to import fixed HTTP helper: {e}")
+    print(f"❌ Failed to import shared HTTP helper: {e}")
     HTTP_HELPER_AVAILABLE = False
     
     # Fallback HTTP helper (minimal implementation)
@@ -73,7 +72,8 @@ except ImportError as e:
 
 # Import notification system
 try:
-    from cold_email_notifier import notifier
+    from shared.notify import get_notifier
+    notifier = get_notifier()
     NOTIFICATIONS_AVAILABLE = True
     print("📡 Drain notification system loaded")
 except ImportError as e:
@@ -340,7 +340,8 @@ def drain_finished_leads_enhanced(finished_leads: List[InstantlyLead] = None) ->
     
     if not finished_leads:
         logger.info("✅ No finished leads to drain")
-        return 0
+        # Return tuple to match caller expectation
+        return 0, {"activated": False, "reason": None, "leads_not_processed": 0}
     
     logger.info(f"📋 Found {len(finished_leads)} leads to drain")
     
@@ -400,13 +401,22 @@ def main():
     
     logger.info("🧹 STARTING LEAD DRAIN PROCESS (Enhanced Mode)")
     
-    # Import batch size from sync_once
+    # Log batch size without importing sync_once to avoid coupling
     try:
-        from sync_once import DRAIN_BATCH_SIZE
-        logger.info(f"Config - Dry Run: {DRY_RUN}, Batch Size: {DRAIN_BATCH_SIZE}")
-        if DRAIN_BATCH_SIZE != 50:
-            logger.info(f"🚀 CUSTOM BATCH SIZE: {DRAIN_BATCH_SIZE} (default: 50) - {'CATCH-UP MODE' if DRAIN_BATCH_SIZE > 50 else 'REDUCED MODE'}")
-    except ImportError:
+        env_bs = os.getenv("DRAIN_BATCH_SIZE")
+        if env_bs is not None:
+            bs = int(env_bs)
+        elif config and hasattr(config, "processing"):
+            bs = getattr(config.processing, "drain_batch_size", 50)
+        else:
+            bs = 50
+        logger.info(f"Config - Dry Run: {DRY_RUN}, Batch Size: {bs}")
+        if bs != 50:
+            logger.info(
+                f"🚀 CUSTOM BATCH SIZE: {bs} (default: 50) - "
+                f"{'CATCH-UP MODE' if bs > 50 else 'REDUCED MODE'}"
+            )
+    except Exception:
         logger.info(f"Config - Dry Run: {DRY_RUN}, Batch Size: 50 (default)")
     
     logger.info(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -473,33 +483,37 @@ def main():
         notification_data["analysis_summary"]["leads_eligible_for_drain"] = total_leads_found
         notification_data["drain_classifications"]["total_identified"] = total_leads_found
         
-        # Try to get direct API metrics from sync_once.py if available
+        # Populate metrics for notifications (prefer direct API metrics via drain service)
         try:
-            from sync_once import LAST_DRAIN_METRICS
-            if LAST_DRAIN_METRICS and LAST_DRAIN_METRICS.get('api_calls_made', 0) > 0:
-                # Use actual drain classifications from direct API
-                drain_classifications = LAST_DRAIN_METRICS.get('drain_classifications', {})
-                for key, value in drain_classifications.items():
+            from drain.service import get_direct_api_metrics
+            direct = get_direct_api_metrics()
+            if direct.get('api_calls_made', 0) > 0:
+                # Use detailed classifications when available
+                for key, value in (direct.get('drain_classifications') or {}).items():
                     if key in notification_data["drain_classifications"]:
                         notification_data["drain_classifications"][key] = value
-                
-                # Add direct API metrics
+                # Also propagate direct API metrics section
                 notification_data["direct_api_metrics"] = {
-                    'api_calls_made': LAST_DRAIN_METRICS.get('api_calls_made', 0),
-                    'api_success_rate': LAST_DRAIN_METRICS.get('api_success_rate', 0),
-                    'leads_found': LAST_DRAIN_METRICS.get('leads_found', 0),
-                    'leads_missing': LAST_DRAIN_METRICS.get('leads_missing', 0),
-                    'api_errors': LAST_DRAIN_METRICS.get('api_errors', 0)
+                    'api_calls_made': direct.get('api_calls_made', 0),
+                    'api_success_rate': direct.get('api_success_rate', 0.0),
+                    'leads_found': direct.get('leads_found', 0),
+                    'leads_missing': direct.get('leads_missing', 0),
+                    'api_errors': direct.get('api_errors', 0)
                 }
-                logger.info(f"📊 Using direct API metrics: {LAST_DRAIN_METRICS['api_calls_made']} calls, {LAST_DRAIN_METRICS['api_success_rate']:.1f}% success")
+                # Use direct leads_found if present
+                if direct.get('leads_found', 0) > 0:
+                    notification_data["analysis_summary"]["total_leads_analyzed"] = direct['leads_found']
+                logger.info(
+                    f"📊 Using direct API metrics: {notification_data['direct_api_metrics']['api_calls_made']} calls, "
+                    f"{notification_data['direct_api_metrics']['api_success_rate']:.1f}% success"
+                )
             else:
-                # Fallback for legacy pagination mode
+                # Fallback summary when direct metrics are not available
                 notification_data["drain_classifications"]["completed"] = total_leads_found
-                logger.info("📊 Using legacy classification (direct API metrics not available)")
-        except ImportError:
-            # Fallback if LAST_DRAIN_METRICS not available
+                logger.info("📊 Classification summary prepared (fallback mode)")
+        except Exception:
             notification_data["drain_classifications"]["completed"] = total_leads_found
-            logger.info("📊 Using fallback classification (LAST_DRAIN_METRICS not available)")
+            logger.info("📊 Classification summary prepared (fallback mode)")
         
         # Enhanced drain with aggressive rate limiting (pass fetched leads to avoid double-fetch)
         drained, circuit_breaker_info = drain_finished_leads_enhanced(finished_leads)
