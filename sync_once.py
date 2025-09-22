@@ -66,7 +66,9 @@ from shared_config import config, DRY_RUN, SMB_CAMPAIGN_ID, MIDSIZE_CAMPAIGN_ID,
 INSTANTLY_CAP_GUARD = config.processing.inventory_cap_guard
 BATCH_SIZE = config.processing.bigquery_batch_size
 BATCH_SLEEP_SECONDS = int(os.getenv('BATCH_SLEEP_SECONDS', '10'))  # Keep for backward compatibility
-LEAD_INVENTORY_MULTIPLIER = float(os.getenv('LEAD_INVENTORY_MULTIPLIER', '3.5'))  # Conservative start
+# Safe inventory multiplier (capacity × multiplier)
+# Uses env var if provided; defaults to 13.0 to loosen capacity as requested
+LEAD_INVENTORY_MULTIPLIER = float(os.getenv('LEAD_INVENTORY_MULTIPLIER', '13.0'))
 
 # Drain testing configuration - limit total leads processed for testing  
 MAX_LEADS_TO_EVALUATE = int(os.getenv('MAX_LEADS_TO_EVALUATE', '0'))  # 0 = no limit, set to 200 for testing
@@ -2363,7 +2365,9 @@ def main():
     logger.info("🔐 Verifying Instantly V2 API authentication...")
     try:
         workspace_response = call_instantly_api('/api/v2/workspaces/current', method='GET')
-        if workspace_response and workspace_response.get('id'):
+        if DRY_RUN and isinstance(workspace_response, dict) and workspace_response.get('dry_run'):
+            logger.info("DRY RUN: Skipping V2 auth check (stubbed response)")
+        elif workspace_response and workspace_response.get('id'):
             logger.info(f"✅ Instantly V2 Auth OK - Workspace: {workspace_response.get('name', 'Unknown')} (ID: {workspace_response.get('id')})")
         else:
             logger.error("❌ Instantly V2 Auth FAILED - Invalid workspace response")
@@ -2371,9 +2375,12 @@ def main():
             logger.error("Please check your Instantly API key is valid for V2 API")
             return
     except Exception as auth_error:
-        logger.error(f"❌ Instantly V2 Auth Check FAILED: {auth_error}")
-        logger.error("Cannot proceed without valid V2 API authentication")
-        return
+        if DRY_RUN:
+            logger.info(f"DRY RUN: Skipping V2 auth exception: {auth_error}")
+        else:
+            logger.error(f"❌ Instantly V2 Auth Check FAILED: {auth_error}")
+            logger.error("Cannot proceed without valid V2 API authentication")
+            return
     
     # Initialize notification tracking
     notification_data = {
