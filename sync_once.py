@@ -2217,7 +2217,8 @@ def process_lead_batch(leads: List[Lead], campaign_id: str) -> Tuple[int, Dict[s
         if successful_lead_data:
             logger.info(f"🔍 Triggering async verification for {len(successful_lead_data)} successfully created leads")
             try:
-                verification_triggered = trigger_verification_for_new_leads(successful_lead_data, campaign_id)
+                # Use verification facade to avoid direct dependency on implementation details
+                verification_triggered = trigger_verification(successful_lead_data, campaign_id)
                 verification_result = {
                     "verification_triggered": verification_triggered,
                     "verification_count": len(successful_lead_data)
