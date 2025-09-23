@@ -346,7 +346,18 @@ def drain_finished_leads_enhanced(finished_leads: List[InstantlyLead] = None) ->
     logger.info(f"📋 Found {len(finished_leads)} leads to drain")
     
     # Process in smaller batches with longer delays for DELETE operations
-    DRAIN_BATCH_SIZE = 5   # Smaller batches for DELETE (vs 50-100 for CREATE)
+    # Respect environment override or shared config; default to 5 for DELETE safety
+    try:
+        env_bs = os.getenv("DRAIN_BATCH_SIZE")
+        if env_bs is not None:
+            DRAIN_BATCH_SIZE = max(1, min(500, int(env_bs)))
+        elif config and hasattr(config, "processing"):
+            DRAIN_BATCH_SIZE = int(getattr(config.processing, "drain_batch_size", 5))
+        else:
+            DRAIN_BATCH_SIZE = 5
+    except Exception:
+        DRAIN_BATCH_SIZE = 5
+
     DRAIN_BATCH_DELAY = config.rate_limits.delete_batch_delay if config else 5.0  # OPTIMIZED: Use centralized config
     
     total_drained = 0
