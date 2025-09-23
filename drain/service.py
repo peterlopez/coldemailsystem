@@ -125,6 +125,13 @@ def get_leads_by_ids_from_instantly(campaign_id: str, lead_ids: List[str]) -> Di
     INSTANTLY_BASE_URL = getattr(sync, "INSTANTLY_BASE_URL")
     adaptive_rate_limiter = getattr(sync, "adaptive_rate_limiter")
     try:
+        # In DRY_RUN, skip actual direct API lookups to avoid noisy "API errors"
+        # and return a no-op result. The enhanced drain stage will handle
+        # reporting and notifications consistently.
+        if DRY_RUN:
+            logger.info("🧪 DRY RUN: Skipping direct API GETs for lead lookup (no-op)")
+            return {'found_leads': [], 'missing_leads': [], 'api_errors': []}
+
         if not lead_ids:
             return {'found_leads': [], 'missing_leads': [], 'api_errors': []}
 
@@ -136,8 +143,10 @@ def get_leads_by_ids_from_instantly(campaign_id: str, lead_ids: List[str]) -> Di
             try:
                 adaptive_rate_limiter.wait()
                 resp = call_instantly_api(f"/api/v2/leads/{lead_id}", method="GET")
-                if isinstance(resp, dict) and resp.get('id'):
-                    found_leads.append(resp)
+                # shared.http returns parsed JSON for GET in resp['json'] when available
+                payload = resp.get('json', resp) if isinstance(resp, dict) else resp
+                if isinstance(payload, dict) and payload.get('id'):
+                    found_leads.append(payload)
                     logger.debug(f"✅ Found lead {i+1}/{len(lead_ids)}: {resp.get('email', lead_id)}")
                 else:
                     # If structured client returns no json, fallback to missing retry behavior

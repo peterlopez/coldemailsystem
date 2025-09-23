@@ -90,6 +90,7 @@ drain_logger.setLevel(logging.INFO)
 
 # Remove any existing handlers to avoid conflicts
 drain_logger.handlers.clear()
+drain_logger.propagate = False  # Prevent duplicate logs via root logger
 
 # Add console handler
 console_handler = logging.StreamHandler(sys.stdout)
