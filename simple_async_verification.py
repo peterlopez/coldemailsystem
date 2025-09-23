@@ -76,8 +76,8 @@ def call_instantly_api(endpoint: str, method: str = 'GET', data: Optional[Dict] 
         logger.info(f"DRY RUN: Would call {method} {url}")
         return {'success': True, 'dry_run': True}
     
-    # Set timeout based on method (3s for DELETE, 30s for others)
-    timeout = (3, 3) if method == 'DELETE' else 30
+    # Set timeout based on method (slightly higher for DELETE to avoid read timeouts)
+    timeout = (5, 10) if method == 'DELETE' else 30
     
     try:
         if use_session and method == 'DELETE':

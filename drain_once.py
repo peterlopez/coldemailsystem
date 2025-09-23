@@ -171,7 +171,7 @@ def delete_single_lead_with_retry(lead: InstantlyLead, max_retries: int = 2) -> 
             logger.debug(f"🔄 Deleting lead {lead.email} via DELETE /api/v2/leads/{lead.id} (attempt {attempt + 1})")
             
             # ✅ Ensure no JSON body is passed (this was causing 400 errors)
-            response = call_instantly_api(f'/api/v2/leads/{lead.id}', method='DELETE', data=None)
+            response = call_instantly_api(f'/api/v2/leads/{lead.id}', method='DELETE', data=None, use_session=True)
             
             if not response:
                 logger.error(f"❌ No response from DELETE API for {lead.email}")

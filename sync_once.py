@@ -1576,33 +1576,35 @@ def _bulk_update_ops_inst_state(leads: List[InstantlyLead]) -> None:
     if not leads:
         return
         
-    # Build VALUES clause for all leads at once
-    values_rows = []
+    # Build ARRAY<STRUCT<...>> for UNNEST in BigQuery
+    struct_rows = []
     for lead in leads:
-        # Escape single quotes in email and use safe string formatting
+        # Escape single quotes in strings
         safe_email = lead.email.replace("'", "''")
-        safe_status = lead.status.replace("'", "''") 
+        safe_status = lead.status.replace("'", "''")
         safe_lead_id = lead.id.replace("'", "''") if lead.id else ''
-        
-        values_rows.append(f"('{safe_email}', '{lead.campaign_id}', '{safe_status}', '{safe_lead_id}')")
-    
-    values_clause = ",\n    ".join(values_rows)
-    
-    # Single MERGE query for all leads using safe table reference
+        safe_campaign = lead.campaign_id.replace("'", "''") if getattr(lead, 'campaign_id', None) else ''
+        struct_rows.append(
+            "STRUCT('" + safe_email + "' AS email, '" + safe_campaign + "' AS campaign_id, '" + safe_status + "' AS status, '" + safe_lead_id + "' AS instantly_lead_id)"
+        )
+
+    struct_clause = ",\n            ".join(struct_rows)
+
+    # Single MERGE query using a CTE with UNNEST over ARRAY<STRUCT>
     bulk_merge_query = f"""
+    WITH src AS (
+      SELECT * FROM UNNEST([
+            {struct_clause}
+      ])
+    )
     MERGE `{PROJECT_ID}.{DATASET_ID}.ops_inst_state` T
-    USING (
-        SELECT email, campaign_id, status, instantly_lead_id
-        FROM UNNEST([
-            {values_clause}
-        ]) AS S(email, campaign_id, status, instantly_lead_id)
-    ) S
+    USING src S
     ON LOWER(T.email) = LOWER(S.email) AND T.campaign_id = S.campaign_id
     WHEN MATCHED THEN
-        UPDATE SET status = S.status, updated_at = CURRENT_TIMESTAMP()
+      UPDATE SET status = S.status, updated_at = CURRENT_TIMESTAMP()
     WHEN NOT MATCHED THEN
-        INSERT (email, campaign_id, status, instantly_lead_id, added_at, updated_at)
-        VALUES (S.email, S.campaign_id, S.status, S.instantly_lead_id, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
+      INSERT (email, campaign_id, status, instantly_lead_id, added_at, updated_at)
+      VALUES (S.email, S.campaign_id, S.status, S.instantly_lead_id, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
     """
     
     bq_client.query(bulk_merge_query).result()
