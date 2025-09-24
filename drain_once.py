@@ -384,8 +384,11 @@ def drain_finished_leads_enhanced(finished_leads: List[InstantlyLead] = None) ->
         # Update BigQuery tracking ONLY for successful deletions (improved accuracy)
         if successfully_deleted_batch:
             try:
-                update_bigquery_state(successfully_deleted_batch)
-                logger.info(f"📊 Updated BigQuery tracking for {len(successfully_deleted_batch)} successfully deleted leads in batch {batch_num}")
+                ok = update_bigquery_state(successfully_deleted_batch)
+                if ok:
+                    logger.info(f"📊 Updated BigQuery tracking for {len(successfully_deleted_batch)} successfully deleted leads in batch {batch_num}")
+                else:
+                    logger.warning(f"⚠️ BigQuery tracking update reported failure for batch {batch_num}")
             except Exception as e:
                 logger.error(f"❌ Failed to update BigQuery for batch {batch_num}: {e}")
                 # Continue processing - don't fail entire batch for BigQuery issues

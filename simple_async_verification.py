@@ -164,7 +164,9 @@ def call_instantly_api(endpoint: str, method: str = 'GET', data: Optional[Dict] 
 # Initialize BigQuery client
 try:
     os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = 'config/secrets/bigquery-credentials.json'
-    bq_client = bigquery.Client(project=PROJECT_ID)
+    # Enforce Standard SQL globally so all queries (including MERGE/CTE) use Standard SQL
+    default_cfg = bigquery.QueryJobConfig(use_legacy_sql=False)
+    bq_client = bigquery.Client(project=PROJECT_ID, default_query_job_config=default_cfg)
 except Exception as e:
     logger.error(f"Failed to initialize BigQuery client: {e}")
     bq_client = None

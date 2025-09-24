@@ -22,7 +22,7 @@ def log_dead_letter(phase: str, email: Optional[str], payload: str, status_code:
     return _impl(phase, email, payload, status_code, error_text)
 
 
-def update_bigquery_state(leads: List[object]) -> None:
+def update_bigquery_state(leads: List[object]) -> bool:
     """Bulk update ops_inst_state, history, and DNC list for drained leads.
 
     Behavior mirrors the original implementation in sync_once.
@@ -33,7 +33,7 @@ def update_bigquery_state(leads: List[object]) -> None:
     bq_client = getattr(sync, "bq_client")
 
     if not leads or DRY_RUN:
-        return
+        return True
 
     try:
         logger.info(f"📊 Updating BigQuery state for {len(leads)} drained leads with bulk operations...")
@@ -56,6 +56,7 @@ def update_bigquery_state(leads: List[object]) -> None:
         logger.info("✅ Updated BigQuery state with bulk operations - Drain summary:")
         for reason, count in drain_reasons.items():
             logger.info(f"  - {reason}: {count} leads")
+        return True
 
     except Exception as e:
         logger.error(f"❌ Failed to update BigQuery state: {e}")
@@ -65,6 +66,7 @@ def update_bigquery_state(leads: List[object]) -> None:
         except Exception:
             payload = "[]"
         log_dead_letter("bigquery_update_drain", None, payload, 0, str(e))
+        return False
 
 
 def _bulk_update_ops_inst_state(leads: List[object]) -> None:

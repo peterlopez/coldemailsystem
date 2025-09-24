@@ -95,7 +95,9 @@ try:
         raise FileNotFoundError(f"Credentials file not found: {creds_path}")
     
     logger.info(f"Using credentials file: {creds_path}")
-    bq_client = bigquery.Client(project=PROJECT_ID)
+    # Enforce Standard SQL globally to ensure MERGE/CTE statements work in all environments
+    default_cfg = bigquery.QueryJobConfig(use_legacy_sql=False)
+    bq_client = bigquery.Client(project=PROJECT_ID, default_query_job_config=default_cfg)
     logger.info("✅ BigQuery client initialized successfully")
 except Exception as e:
     logger.error(f"Failed to initialize BigQuery client: {e}")
