@@ -101,6 +101,19 @@ def get_leads_needing_drain_from_bigquery() -> Dict[str, List[str]]:
         for row in results:
             leads_by_campaign.setdefault(row.campaign_id, []).append(row.instantly_lead_id)
 
+        # De-duplicate IDs per campaign while preserving order
+        for cid, ids in list(leads_by_campaign.items()):
+            seen = set()
+            deduped = []
+            for lid in ids:
+                if lid and lid not in seen:
+                    deduped.append(lid)
+                    seen.add(lid)
+            if len(deduped) != len(ids):
+                dupes = len(ids) - len(deduped)
+                logger.info(f"🔁 De-duplicated {dupes} lead IDs for campaign {cid}")
+            leads_by_campaign[cid] = deduped
+
         total_leads = sum(len(v) for v in leads_by_campaign.values())
         if total_leads > 0:
             logger.info("📊 BigQuery Direct API Results:")
@@ -293,9 +306,11 @@ def process_bigquery_first_drain(bigquery_leads: Dict[str, List[str]]) -> List[I
             logger.warning(f"⚠️ {len(api_errors)} leads had API errors and will be retried next run")
 
         if leads_to_update_timestamps:
+            # De-duplicate before batch timestamp update
+            unique_ids = list(dict.fromkeys([lid for lid in leads_to_update_timestamps if lid]))
             try:
-                batch_update_drain_timestamps(leads_to_update_timestamps)
-                logger.info(f"📊 Updated drain check timestamps for {len(leads_to_update_timestamps)} leads in {campaign_name}")
+                batch_update_drain_timestamps(unique_ids)
+                logger.info(f"📊 Updated drain check timestamps for {len(unique_ids)} leads in {campaign_name}")
             except Exception as e:
                 logger.warning(f"⚠️ Failed to update timestamps for {campaign_name}: {e}")
 

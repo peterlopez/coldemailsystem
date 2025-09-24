@@ -122,7 +122,8 @@ def _bulk_update_ops_inst_state(leads: List[object]) -> None:
             bigquery.ArrayQueryParameter("campaign_ids", "STRING", campaigns),
             bigquery.ArrayQueryParameter("statuses", "STRING", statuses),
             bigquery.ArrayQueryParameter("lead_ids", "STRING", lead_ids),
-        ]
+        ],
+        use_legacy_sql=False,
     )
 
     bq_client.query(sql, job_config=job_config).result()
@@ -153,7 +154,9 @@ def _bulk_insert_lead_history(leads: List[object]) -> None:
     VALUES
     {values_clause}
     """
-    bq_client.query(sql).result()
+    # Ensure Standard SQL for MERGE/CTE statements
+    job_config = bigquery.QueryJobConfig(use_legacy_sql=False)
+    bq_client.query(sql, job_config=job_config).result()
     logger.info(f"✅ Bulk inserted {len(leads)} leads to history (90-day cooldown)")
 
 
@@ -190,5 +193,6 @@ def _bulk_insert_dnc_list(leads: List[object]) -> None:
     VALUES
     {values_clause}
     """
-    bq_client.query(sql).result()
+    job_config = bigquery.QueryJobConfig(use_legacy_sql=False)
+    bq_client.query(sql, job_config=job_config).result()
     logger.info(f"🚫 Bulk added {len(leads)} unsubscribes to permanent DNC list")

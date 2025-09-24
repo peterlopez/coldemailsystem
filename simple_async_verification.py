@@ -569,7 +569,7 @@ def process_deletion_queue() -> Dict[str, int]:
                 
                 if success:
                     # Mark as done and add to DNC
-                    mark_deletion_complete(email, instantly_lead_id)
+                    mark_deletion_complete(email, instantly_lead_id, campaign_id)
                     add_to_dnc_list(email, 'invalid_verification')
                     logger.info(f"✅ Successfully deleted: {email}")
                     processed += 1
@@ -730,7 +730,7 @@ def process_stale_verifications() -> Dict[str, int]:
         logger.error(f"❌ Error processing stale verifications: {e}")
         return {'checked': 0, 'errors': 1, 'status_breakdown': {}, 'queued_for_deletion': 0}
 
-def mark_deletion_complete(email: str, instantly_lead_id: str):
+def mark_deletion_complete(email: str, instantly_lead_id: str, campaign_id: Optional[str] = None):
     """Mark deletion as complete in BigQuery"""
     if not bq_client:
         return
@@ -753,7 +753,30 @@ def mark_deletion_complete(email: str, instantly_lead_id: str):
             ]
         )
         
-        bq_client.query(query, job_config=job_config).result()
+        job = bq_client.query(query, job_config=job_config)
+        result = job.result()
+        # Fallback: if no rows updated (ID drift), try updating by email + campaign when available
+        try:
+            affected = getattr(job, 'num_dml_affected_rows', None)
+        except Exception:
+            affected = None
+        if (affected is None or affected == 0) and campaign_id:
+            fallback_query = """
+            UPDATE `{}.{}.{}`
+            SET deletion_status = 'done',
+                status = 'deleted',
+                last_deletion_attempt = CURRENT_TIMESTAMP(),
+                updated_at = CURRENT_TIMESTAMP()
+            WHERE email = @email
+              AND campaign_id = @campaign_id
+            """.format(PROJECT_ID, DATASET_ID, "ops_inst_state")
+            fb_job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("email", "STRING", email),
+                    bigquery.ScalarQueryParameter("campaign_id", "STRING", campaign_id),
+                ]
+            )
+            bq_client.query(fallback_query, job_config=fb_job_config).result()
         
     except Exception as e:
         logger.error(f"❌ Failed to mark deletion complete for {email}: {e}")

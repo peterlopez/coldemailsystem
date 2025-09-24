@@ -488,6 +488,17 @@ def main():
     try:
         # Get leads to drain for analysis
         finished_leads = get_finished_leads()
+        # De-duplicate by Instantly lead ID while preserving order
+        deduped: List[InstantlyLead] = []
+        seen_ids = set()
+        for l in finished_leads or []:
+            lid = getattr(l, 'id', None)
+            if lid and lid not in seen_ids:
+                deduped.append(l)
+                seen_ids.add(lid)
+        if finished_leads and len(deduped) != len(finished_leads):
+            logger.info(f"🔁 De-duplicated {len(finished_leads) - len(deduped)} leads before deletion")
+        finished_leads = deduped
         total_leads_found = len(finished_leads) if finished_leads else 0
         
         # Update notification data
