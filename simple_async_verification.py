@@ -80,8 +80,8 @@ def call_instantly_api(endpoint: str, method: str = 'GET', data: Optional[Dict] 
     timeout = (5, 10) if method == 'DELETE' else 30
     
     try:
-        if use_session and method == 'DELETE':
-            # Use session with retry adapter for DELETE operations
+        if use_session and method in ['GET', 'DELETE']:
+            # Use session with retry adapter for GET/DELETE operations
             session = requests.Session()
             session.headers.update(headers)
             
@@ -90,10 +90,13 @@ def call_instantly_api(endpoint: str, method: str = 'GET', data: Optional[Dict] 
                 total=2,
                 backoff_factor=0.5,
                 status_forcelist=[429, 500, 502, 503, 504],
-                allowed_methods=["DELETE"]
+                allowed_methods=["GET", "DELETE"]
             )
             session.mount("https://", HTTPAdapter(max_retries=retries))
-            response = session.delete(url, timeout=timeout)
+            if method == 'DELETE':
+                response = session.delete(url, timeout=timeout)
+            else:
+                response = session.get(url, timeout=timeout)
         else:
             # Standard requests for non-DELETE or when session not requested
             if method == 'GET':

@@ -11,6 +11,8 @@ from typing import List
 import logging
 from datetime import datetime
 from typing import Dict
+import os
+import time
 
 # Export DRY_RUN and InstantlyLead for compatibility
 from shared_config import DRY_RUN  # type: ignore
@@ -139,21 +141,51 @@ def get_leads_by_ids_from_instantly(campaign_id: str, lead_ids: List[str]) -> Di
         found_leads = []
         missing_leads = []
         api_errors = []
+        # Track error types for diagnostics
+        rate_limit_errors = 0
+        server_errors = 0
+        other_errors = 0
+        # Optional chunking to reduce rolling-window pressure
+        try:
+            chunk_size = max(0, int(os.getenv('DRAIN_LOOKUP_CHUNK', '0')))
+            chunk_pause = max(0.0, float(os.getenv('DRAIN_LOOKUP_CHUNK_PAUSE', '5.0')))
+        except Exception:
+            chunk_size = 0
+            chunk_pause = 5.0
         for i, lead_id in enumerate(lead_ids):
             try:
                 adaptive_rate_limiter.wait()
-                resp = call_instantly_api(f"/api/v2/leads/{lead_id}", method="GET")
-                # shared.http returns parsed JSON for GET in resp['json'] when available
+                resp = call_instantly_api(f"/api/v2/leads/{lead_id}", method="GET", use_session=True)
+                status_code = int(resp.get('status_code', 0)) if isinstance(resp, dict) else 0
                 payload = resp.get('json', resp) if isinstance(resp, dict) else resp
-                if isinstance(payload, dict) and payload.get('id'):
+                if 200 <= status_code < 300 and isinstance(payload, dict) and payload.get('id'):
                     found_leads.append(payload)
-                    logger.debug(f"✅ Found lead {i+1}/{len(lead_ids)}: {resp.get('email', lead_id)}")
+                    adaptive_rate_limiter.record_success()
+                    logger.debug(f"✅ Found lead {i+1}/{len(lead_ids)}: {payload.get('email', lead_id)}")
+                elif status_code == 404:
+                    # Treat not found as missing (likely already removed)
+                    missing_leads.append(lead_id)
+                    adaptive_rate_limiter.record_success()
                 else:
-                    # If structured client returns no json, fallback to missing retry behavior
+                    if status_code == 429:
+                        rate_limit_errors += 1
+                        adaptive_rate_limiter.record_failure(is_rate_limit=True)
+                    elif status_code >= 500:
+                        server_errors += 1
+                        adaptive_rate_limiter.record_failure(is_rate_limit=False)
+                    else:
+                        other_errors += 1
+                        adaptive_rate_limiter.record_failure(is_rate_limit=False)
                     api_errors.append(lead_id)
             except Exception as e:
                 logger.warning(f"🌐 Network/API error for lead {lead_id}: {e}")
+                other_errors += 1
+                adaptive_rate_limiter.record_failure(is_rate_limit=False)
                 api_errors.append(lead_id)
+            # Optional chunk pause between slices
+            if chunk_size and (i + 1) % chunk_size == 0 and (i + 1) < len(lead_ids):
+                logger.info(f"⏸️ Direct lookup chunk pause: processed {i+1}/{len(lead_ids)} — sleeping {chunk_pause:.1f}s")
+                time.sleep(chunk_pause)
         # Log summary
         found_count = len(found_leads)
         missing_count = len(missing_leads)
@@ -162,7 +194,7 @@ def get_leads_by_ids_from_instantly(campaign_id: str, lead_ids: List[str]) -> Di
         logger.info("🎯 Direct API Results:")
         logger.info(f"  • Found: {found_count}/{len(lead_ids)} leads ({success_rate:.1f}%)")
         logger.info(f"  • Missing: {missing_count} (confirmed not in Instantly)")
-        logger.info(f"  • API errors: {error_count} (network/auth issues)")
+        logger.info(f"  • API errors: {error_count} (429s: {rate_limit_errors}, 5xx: {server_errors}, other: {other_errors})")
         logger.info(f"  • Processing time: ~{len(lead_ids) * 0.5:.1f} seconds")
         return {'found_leads': found_leads, 'missing_leads': missing_leads, 'api_errors': api_errors}
     except Exception as e:
