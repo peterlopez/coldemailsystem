@@ -4,35 +4,32 @@
 This is a fully automated pipeline that synchronizes lead data between BigQuery and Instantly.ai for cold email campaigns. The system handles lead segmentation, campaign management, sequence tracking, and automated lead lifecycle management.
 
 ## 🎯 Current Status: **PRODUCTION READY**
-- ✅ **292,561 eligible leads** ready for processing
-- ✅ **Dual GitHub Actions workflows** (sync every 30 min, drain every 2 hours)
-- ✅ **Smart segmentation** (SMB < $1M, Midsize ≥ $1M)
-- ✅ **90-day cooldown system** prevents lead fatigue
-- ✅ **11,726 DNC entries** for compliance
-- ✅ **Email verification system** using Instantly API (filters invalid emails)
-- ✅ **Comprehensive error tracking** and logging
-- ✅ **Campaigns ACTIVE** - both SMB and Midsize campaigns running
-- ⚠️ **Schedule configuration needed** - campaigns active but no sending days configured
+- ✅ Dual workflows live (sync + drain)
+- ✅ Drain refactor merged to `main` (service facade + shared modules)
+- ✅ BigQuery-first drain with direct GET lookups by lead ID
+- ✅ Enhanced deletion with retry + circuit breaker (idempotent)
+- ✅ 90‑day cooldown + permanent DNC protection
+- ✅ Async verification with polling + safe deletes
+- ✅ Centralized HTTP/BigQuery/Notify facades
+- ✅ Comprehensive metrics + Slack notifications
 
 ## 🔄 How It Works
 
 ### **Dual-Workflow Architecture**
 
-#### **Main Sync Workflow (Every 30 Minutes)**
-- **Phase 1: TOP-UP** - Adds new verified leads to campaigns
-- **Phase 2: HOUSEKEEPING** - Updates tracking and reports metrics
-- **Runs:** Every 30 minutes during business hours (9 AM - 6 PM EST, Mon-Fri)
-- **Weekend schedule:** Every 2 hours
+#### **Main Sync Workflow (every 30 minutes)**
+- Phase 1: TOP‑UP — add new verified leads to campaigns
+- Phase 2: HOUSEKEEPING — update tracking and report metrics
+- Schedule: every 30 minutes (business hours), every 2 hours (weekends)
 
-#### **Dedicated Drain Workflow (Every 2 Hours)**  
-- **Intelligent Lead Classification:** Uses working POST `/api/v2/leads/list` endpoint
-- **Smart Decision Logic:** 8 scenarios including OOO handling, bounce grace periods
-- **Removes finished leads** to free inventory space (replied, completed, unsubscribed, stale)
-- **Trusts Instantly's OOO filtering** (stop_on_auto_reply=false configuration)
-- **Grace periods:** 7-day grace for hard bounces, keeps soft bounces for retry
-- **Automatic DNC management** for unsubscribes with enhanced tracking
-- **Enhanced BigQuery updates** with detailed drain reasons and history
-- **Runs:** Every 2 hours during business hours, every 4 hours weekends
+#### **Dedicated Drain Workflow (every 2 hours)**
+- BigQuery‑first candidate selection from `ops_inst_state` (24h+ or never checked)
+- Direct Instantly lookups: GET `/api/v2/leads/{id}` for classification (no pagination)
+- Smart decision logic (8 scenarios): reply/completed/unsubscribed/stale/bounce handling
+- Deletion: idempotent DELETEs with retry/backoff and circuit breaker (2xx/404 treated as success)
+- Updates: bulk MERGE `ops_inst_state`, history insertion, and DNC additions via shared BigQuery facade
+- Notifications: Slack via Echo API with direct‑API metrics (calls, success rate, breakdown)
+- Schedule: every 2 hours (business hours), every 4 hours (weekends)
 
 #### **Main Sync: TOP-UP Process**
 - Queries BigQuery for fresh eligible leads (default: 100 per run)
@@ -61,10 +58,12 @@ This is a fully automated pipeline that synchronizes lead data between BigQuery 
 
 ### **Modular Shared Components**
 The system uses a shared component architecture with clear boundaries:
-- `shared/http.py` — Unified Instantly API client (GET/POST/DELETE) with structured responses
-- `shared/bq.py` — Centralized BigQuery writers for ops_inst_state, lead_history, and dnc_list
-- `shared/notify.py` — Re-exported notifier for consistent imports across modules
-- `shared/models.py` — Data models and type definitions (unchanged)
+- `drain/service.py` — Drain service facade (BigQuery‑first selection, direct lookup, classification, metrics)
+- `shared/http.py` — Unified Instantly API client (structured responses, session support, retries)
+- `shared/bq.py` — Centralized BigQuery writers (bulk MERGE ops_inst_state, history, DNC)
+- `shared/notify.py` — Notifier facade for Slack via Echo API
+- `verify/service.py` — Verification facade (decouples verification internals)
+- `shared/models.py` — Data models and type definitions
 - `shared_config.py` — Centralized configuration (source of truth)
 
 ### **BigQuery Tables Created**
