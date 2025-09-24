@@ -68,6 +68,7 @@ def update_bigquery_state(leads: List[object]) -> None:
 
 
 def _bulk_update_ops_inst_state(leads: List[object]) -> None:
+    """Robust bulk MERGE using parameterized arrays (no string interpolation)."""
     if not leads:
         return
     sync = _sync_module()
@@ -76,32 +77,56 @@ def _bulk_update_ops_inst_state(leads: List[object]) -> None:
     DATASET_ID = getattr(sync, "DATASET_ID")
     logger = getattr(sync, "logger")
 
-    rows = []
-    for lead in leads:
-        safe_email = getattr(lead, "email").replace("'", "''")
-        safe_status = getattr(lead, "status").replace("'", "''")
-        lead_id = getattr(lead, "id", "") or ""
-        safe_lead_id = lead_id.replace("'", "''")
-        rows.append(f"('{safe_email}', '{getattr(lead, 'campaign_id')}', '{safe_status}', '{safe_lead_id}')")
+    # Prepare arrays for parameterized UNNEST zip by OFFSET
+    emails: List[str] = []
+    campaigns: List[str] = []
+    statuses: List[str] = []
+    lead_ids: List[str] = []
+    for l in leads:
+        emails.append((getattr(l, "email", "") or ""))
+        campaigns.append((getattr(l, "campaign_id", "") or ""))
+        statuses.append((getattr(l, "status", "") or ""))
+        lead_ids.append((getattr(l, "id", "") or ""))
 
-    values_clause = ",\n    ".join(rows)
     sql = f"""
+    WITH emails AS (
+      SELECT value AS email, OFFSET FROM UNNEST(@emails) WITH OFFSET
+    ), campaigns AS (
+      SELECT value AS campaign_id, OFFSET FROM UNNEST(@campaign_ids) WITH OFFSET
+    ), statuses AS (
+      SELECT value AS status, OFFSET FROM UNNEST(@statuses) WITH OFFSET
+    ), ids AS (
+      SELECT value AS instantly_lead_id, OFFSET FROM UNNEST(@lead_ids) WITH OFFSET
+    ), src AS (
+      SELECT emails.email, campaigns.campaign_id, statuses.status, ids.instantly_lead_id
+      FROM emails
+      JOIN campaigns USING (OFFSET)
+      JOIN statuses USING (OFFSET)
+      JOIN ids USING (OFFSET)
+    )
     MERGE `{PROJECT_ID}.{DATASET_ID}.ops_inst_state` T
-    USING (
-        SELECT email, campaign_id, status, instantly_lead_id
-        FROM UNNEST([
-            {values_clause}
-        ]) AS S(email, campaign_id, status, instantly_lead_id)
-    ) S
+    USING src S
     ON LOWER(T.email) = LOWER(S.email) AND T.campaign_id = S.campaign_id
     WHEN MATCHED THEN
-        UPDATE SET status = S.status, updated_at = CURRENT_TIMESTAMP()
+      UPDATE SET status = S.status, updated_at = CURRENT_TIMESTAMP()
     WHEN NOT MATCHED THEN
-        INSERT (email, campaign_id, status, instantly_lead_id, added_at, updated_at)
-        VALUES (S.email, S.campaign_id, S.status, S.instantly_lead_id, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
+      INSERT (email, campaign_id, status, instantly_lead_id, added_at, updated_at)
+      VALUES (S.email, S.campaign_id, S.status, S.instantly_lead_id, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())
     """
-    bq_client.query(sql).result()
-    logger.info(f"✅ Bulk updated {len(leads)} leads in ops_inst_state (single query vs {len(leads)} individual queries)")
+
+    # Build query parameters
+    from google.cloud import bigquery  # lazy import
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter("emails", "STRING", emails),
+            bigquery.ArrayQueryParameter("campaign_ids", "STRING", campaigns),
+            bigquery.ArrayQueryParameter("statuses", "STRING", statuses),
+            bigquery.ArrayQueryParameter("lead_ids", "STRING", lead_ids),
+        ]
+    )
+
+    bq_client.query(sql, job_config=job_config).result()
+    logger.info(f"✅ Bulk updated {len(leads)} leads in ops_inst_state (parameterized arrays)")
 
 
 def _bulk_insert_lead_history(leads: List[object]) -> None:
